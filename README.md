@@ -1,5 +1,5 @@
 # cs128H-final-project
-- Group name: Hold-It-IN Inc.
+- Group name: Hold-It-IN Inc. / The Soft Brown MATTER research institution
 - Group member name: Yichen Cai, Yuhao Lu, Yunqi Lou
 
 # Project name: Brownshock
