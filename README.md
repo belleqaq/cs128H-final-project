@@ -1,6 +1,6 @@
 # cs128H-final-project
-# Group name: Hold-It-IN Inc.
-# Group member name: Yichen Cai, Yuhao Lu, Yunqi Lou
+- Group name: Hold-It-IN Inc.
+- Group member name: Yichen Cai, Yuhao Lu, Yunqi Lou
 
 # Project name: Brownshock
 # Project Introduction:
@@ -9,14 +9,14 @@
 
 # Project Roadmap & Checkpoints:
 
-# Checkpoint 1: Complete the basic grid layout for the rooms/floors, implement player movement, and build the core mathematical logic for the QTE minigame (calculating click speed vs. the base failure probability).
+- Checkpoint 1: Complete the basic grid layout for the rooms/floors, implement player movement, and build the core mathematical logic for the QTE minigame (calculating click speed vs. the base failure probability).
 
-# Checkpoint 2: Introduce patrolling NPCs with line-of-sight (vision cone) detection, and implement the fail-state mechanics (getting caught and losing the game).
+- Checkpoint 2: Introduce patrolling NPCs with line-of-sight (vision cone) detection, and implement the fail-state mechanics (getting caught and losing the game).
 
-# Checkpoint 3: Finalize the UI rendering (visualizing the progress bar and the hit zone), add multi-floor transition mechanics, and balance the QTE difficulty.
+- Checkpoint 3: Finalize the UI rendering (visualizing the progress bar and the hit zone), add multi-floor transition mechanics, and balance the QTE difficulty.
 
 # Possible Challenges:
 
-# Line of Sight Algorithms: Implementing a fair and functional vision cone system for the NPCs so that the stealth mechanics feel accurate and don't unfairly punish the player through walls.
+- Line of Sight Algorithms: Implementing a fair and functional vision cone system for the NPCs so that the stealth mechanics feel accurate and don't unfairly punish the player through walls.
 
-Balancing the QTE Mechanics: Finding the right mathematical balance between the required mouse click speed and the base failure probability, ensuring the mechanic feels tense and frantic without being impossibly frustrating.
+- Balancing the QTE Mechanics: Finding the right mathematical balance between the required mouse click speed and the base failure probability, ensuring the mechanic feels tense and frantic without being impossibly frustrating.
