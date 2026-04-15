@@ -1,25 +1,18 @@
-# Dev-only image: Rust toolchain + WASM target + trunk + rustfmt + clippy.
+# Dev-only image: Rust toolchain + rustfmt + clippy.
 # Source code is NOT baked in — it's bind-mounted at runtime via docker-compose.
 FROM rust:1-slim
 
 # System deps: build-essential for native crates, pkg-config + libssl-dev for
-# anything linking OpenSSL, ca-certificates + curl for downloading trunk.
+# anything linking OpenSSL, ca-certificates for crates.io TLS.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
         ca-certificates \
-        curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust components + WASM target.
-RUN rustup component add rustfmt clippy \
-    && rustup target add wasm32-unknown-unknown
-
-# Trunk: grab prebuilt binary (much faster than `cargo install trunk`).
-RUN curl -sSL https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz \
-        | tar -xzf - -C /usr/local/bin \
-    && chmod +x /usr/local/bin/trunk
+# Rust components.
+RUN rustup component add rustfmt clippy
 
 WORKDIR /app
 

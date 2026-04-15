@@ -6,8 +6,6 @@ services:
     image: brownshock-dev
     container_name: brownshock-dev
     working_dir: /app
-    ports:
-      - "8080:8080"          # trunk serve
     volumes:
       - .:/app                           # bind-mount project (Windows <-> container)
       - cargo-target:/app/target         # build cache (NOT visible on Windows, stays fast)
