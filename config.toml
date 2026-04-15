@@ -20,7 +20,17 @@
 # How many milliseconds between each game step.
 #   Lower = faster game.    Higher = slower game.
 #   Try:  50 (hectic)  150 (normal)  400 (chill)
-tick_ms = 150
+tick_ms = 10
+
+
+# ---- Player (@) --------------------------------------------
+[player]
+
+# Your max movement speed, in tiles per second.
+#   5  = slow and careful
+#   10 = normal
+#   20 = very fast
+speed = 10
 
 
 # ---- NPC (the blue "N" that walks around) ------------------

@@ -22,6 +22,7 @@ use serde::Deserialize;
 #[serde(default)]
 struct GameConfig {
     tick_ms: u64,
+    player: PlayerSettings,
     npc: NpcSettings,
 }
 
@@ -29,8 +30,30 @@ impl Default for GameConfig {
     fn default() -> Self {
         Self {
             tick_ms: 150,
+            player: PlayerSettings::default(),
             npc: NpcSettings::default(),
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct PlayerSettings {
+    /// Max movement speed in tiles per second (converted to cooldown internally).
+    speed: f32,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self { speed: 10.0 }
+    }
+}
+
+impl PlayerSettings {
+    /// Convert tiles-per-second to milliseconds-per-move.
+    fn cooldown_ms(&self) -> u64 {
+        let clamped = self.speed.max(1.0);
+        (1000.0 / clamped) as u64
     }
 }
 
@@ -161,10 +184,15 @@ struct State {
     npcs: Vec<Npc>,
     phase: Phase,
     quit: bool,
+    /// Single-slot input buffer: stores the most recent movement direction
+    /// during cooldown. Applied and cleared when cooldown expires.
+    pending_move: Option<(i32, i32)>,
+    last_move: Instant,
+    move_cooldown: Duration,
 }
 
 impl State {
-    fn new(npc_settings: &NpcSettings) -> Self {
+    fn new(config: &GameConfig) -> Self {
         let mut map = vec![Tile::Floor; (WIDTH * HEIGHT) as usize];
         for x in 0..WIDTH {
             map[idx(x, 0)] = Tile::Wall;
@@ -176,7 +204,7 @@ impl State {
         }
         map[idx(WIDTH - 3, 2)] = Tile::Goal;
 
-        let npcs = vec![Npc::from_settings((WIDTH / 2, HEIGHT / 2), npc_settings)];
+        let npcs = vec![Npc::from_settings((WIDTH / 2, HEIGHT / 2), &config.npc)];
 
         Self {
             map,
@@ -184,6 +212,9 @@ impl State {
             npcs,
             phase: Phase::Playing,
             quit: false,
+            pending_move: None,
+            last_move: Instant::now(),
+            move_cooldown: Duration::from_millis(config.player.cooldown_ms()),
         }
     }
 
@@ -203,26 +234,42 @@ impl State {
         }
     }
 
-    fn input(&mut self, code: KeyCode, mods: KeyModifiers, npc_settings: &NpcSettings) {
+    fn input(&mut self, code: KeyCode, mods: KeyModifiers, config: &GameConfig) {
         if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.quit = true;
             return;
         }
         match self.phase {
             Phase::Playing => match code {
-                KeyCode::Up | KeyCode::Char('w') => self.try_move(0, -1),
-                KeyCode::Down | KeyCode::Char('s') => self.try_move(0, 1),
-                KeyCode::Left | KeyCode::Char('a') => self.try_move(-1, 0),
-                KeyCode::Right | KeyCode::Char('d') => self.try_move(1, 0),
+                // Movement keys: buffer the direction (single-slot, latest wins).
+                KeyCode::Up | KeyCode::Char('w') => self.pending_move = Some((0, -1)),
+                KeyCode::Down | KeyCode::Char('s') => self.pending_move = Some((0, 1)),
+                KeyCode::Left | KeyCode::Char('a') => self.pending_move = Some((-1, 0)),
+                KeyCode::Right | KeyCode::Char('d') => self.pending_move = Some((1, 0)),
+                // Non-movement: execute immediately, no cooldown.
                 KeyCode::Char('q') => self.phase = Phase::Lose,
                 KeyCode::Esc => self.quit = true,
                 _ => {}
             },
             Phase::Win | Phase::Lose => match code {
-                KeyCode::Char('r') => *self = State::new(npc_settings),
+                KeyCode::Char('r') => *self = State::new(config),
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
                 _ => {}
             },
+        }
+    }
+
+    /// Consume the buffered movement if the cooldown has elapsed.
+    fn apply_pending_move(&mut self) {
+        if self.phase != Phase::Playing {
+            return;
+        }
+        if let Some((dx, dy)) = self.pending_move {
+            if self.last_move.elapsed() >= self.move_cooldown {
+                self.try_move(dx, dy);
+                self.pending_move = None;
+                self.last_move = Instant::now();
+            }
         }
     }
 
@@ -286,7 +333,7 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
-    let mut state = State::new(&config.npc);
+    let mut state = State::new(config);
     let tick_duration = Duration::from_millis(config.tick_ms);
     let mut last_tick = Instant::now();
 
@@ -299,9 +346,11 @@ fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
         // but never tied to the world-tick cadence.
         if poll(Duration::from_millis(20))? {
             if let Event::Key(k) = read()? {
-                state.input(k.code, k.modifiers, &config.npc);
+                state.input(k.code, k.modifiers, config);
             }
         }
+        // Player movement: apply buffered input when cooldown allows.
+        state.apply_pending_move();
         // World tick: advance only when the configured interval has elapsed.
         if last_tick.elapsed() >= tick_duration {
             state.tick();
