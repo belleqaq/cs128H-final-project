@@ -1,0 +1,20 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: brownshock-dev
+    container_name: brownshock-dev
+    working_dir: /app
+    ports:
+      - "8080:8080"          # trunk serve
+    volumes:
+      - .:/app                           # bind-mount project (Windows <-> container)
+      - cargo-target:/app/target         # build cache (NOT visible on Windows, stays fast)
+      - cargo-registry:/usr/local/cargo/registry
+    tty: true
+    stdin_open: true
+
+volumes:
+  cargo-target:
+  cargo-registry:
