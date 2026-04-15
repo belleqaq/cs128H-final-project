@@ -1,5 +1,5 @@
 use std::io::{self, stdout, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -287,18 +287,26 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
 
 fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
     let mut state = State::new(&config.npc);
-    let tick = Duration::from_millis(config.tick_ms);
+    let tick_duration = Duration::from_millis(config.tick_ms);
+    let mut last_tick = Instant::now();
+
     loop {
         render(w, &state)?;
         if state.quit {
             break;
         }
-        if poll(tick)? {
+        // Input: poll with a short timeout so the player feels responsive,
+        // but never tied to the world-tick cadence.
+        if poll(Duration::from_millis(20))? {
             if let Event::Key(k) = read()? {
                 state.input(k.code, k.modifiers, &config.npc);
             }
         }
-        state.tick();
+        // World tick: advance only when the configured interval has elapsed.
+        if last_tick.elapsed() >= tick_duration {
+            state.tick();
+            last_tick = Instant::now();
+        }
     }
     Ok(())
 }
