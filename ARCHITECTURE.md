@@ -3,7 +3,7 @@
 Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
-Last synced with code: commit 7adb576
+Last synced with code: commit (pending)
 
 ---
 
@@ -12,7 +12,8 @@ Last synced with code: commit 7adb576
 ```
 src/
   main.rs          — all game logic (single file for now)
-Cargo.toml         — deps: crossterm, fastrand
+config.toml        — player-facing settings (edit & re-run to apply)
+Cargo.toml         — deps: crossterm, fastrand, serde, toml
 Dockerfile.dev     — dev container (Rust + fmt + clippy)
 docker-compose.yml — bind-mount + cargo cache volumes
 ```
@@ -23,16 +24,20 @@ docker-compose.yml — bind-mount + cargo cache volumes
 
 ```
 Brownshock
-├── Global constants (src/main.rs, top of file)
-│   ├── TICK_MS: u64 = 150        ← world tick interval (ms)
+├── config.toml (player-facing, no code knowledge needed)
+│   ├── tick_ms:       u64 = 150        ← world tick interval (ms)
+│   └── [npc]
+│       ├── wait_min:      u32 = 1      ← min ticks between moves
+│       ├── wait_max:      u32 = 10     ← max ticks between moves
+│       ├── move_distance: i32 = 1      ← tiles per activation
+│       └── symbol:        str = "N"    ← render character
+│
+├── Code-only constants (src/main.rs, top of file)
 │   ├── WIDTH:   i32 = 80         ← map columns
 │   └── HEIGHT:  i32 = 22         ← map rows
 │
-├── NpcConfig (struct, src/main.rs)
-│   ├── tick_range:    (u32, u32) = (1, 10)   ← dice range for wait ticks
-│   ├── move_distance: i32        = 1          ← tiles per activation
-│   ├── symbol:        char       = 'N'        ← render character
-│   ├── color:         Color      = Blue       ← render colour
+├── Npc runtime fields (populated from config.toml + hardcoded)
+│   ├── color:         Color = Blue     ← render colour (code-only)
 │   ├── [planned] fov_range:      i32          ← vision distance (tiles)
 │   ├── [planned] fov_angle:      f32          ← cone half-angle (degrees)
 │   ├── [planned] patrol_points:  Vec<(i32,i32)> ← waypoint loop

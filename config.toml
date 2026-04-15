@@ -1,0 +1,44 @@
+# ============================================================
+#  Brownshock — Game Settings
+# ============================================================
+#
+#  Edit this file to change how the game feels.
+#  Save the file, then re-run the game to see your changes:
+#
+#      docker compose run --rm dev cargo run
+#
+#  Rules:
+#    - Lines starting with # are comments (ignored by the game).
+#    - Only change the numbers/letters AFTER the = sign.
+#    - If you break something, delete this file and the game
+#      will use its built-in defaults.
+#
+# ============================================================
+
+
+# ---- Game Speed --------------------------------------------
+# How many milliseconds between each game step.
+#   Lower = faster game.    Higher = slower game.
+#   Try:  50 (hectic)  150 (normal)  400 (chill)
+tick_ms = 150
+
+
+# ---- NPC (the blue "N" that walks around) ------------------
+[npc]
+
+# Random wait before each move (in game steps).
+# The NPC rolls a random number between wait_min and wait_max.
+# That number = how many steps it stands still before moving.
+#   Small numbers = NPC moves often (harder).
+#   Big numbers   = NPC moves rarely (easier).
+wait_min = 1
+wait_max = 10
+
+# How many tiles the NPC jumps per move.
+#   1 = walks one tile at a time (normal).
+#   2 = jumps two tiles (harder to dodge).
+move_distance = 1
+
+# What character represents the NPC on screen.
+# Must be a single character.  Examples:  "N"  "X"  "!"  "O"
+symbol = "N"

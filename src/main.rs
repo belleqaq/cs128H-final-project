@@ -11,15 +11,72 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
-// Global constants — change these to tune the game feel.
+// Config — loaded from config.toml at startup.
+// Every field has a default so the file (or any key) can be omitted entirely.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct GameConfig {
+    tick_ms: u64,
+    npc: NpcSettings,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            tick_ms: 150,
+            npc: NpcSettings::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct NpcSettings {
+    wait_min: u32,
+    wait_max: u32,
+    move_distance: i32,
+    symbol: String,
+}
+
+impl Default for NpcSettings {
+    fn default() -> Self {
+        Self {
+            wait_min: 1,
+            wait_max: 10,
+            move_distance: 1,
+            symbol: "N".to_string(),
+        }
+    }
+}
+
+impl NpcSettings {
+    fn symbol_char(&self) -> char {
+        self.symbol.chars().next().unwrap_or('N')
+    }
+}
+
+fn load_config() -> GameConfig {
+    match std::fs::read_to_string("config.toml") {
+        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("Warning: config.toml has errors: {e}");
+            eprintln!("Using default settings. Press any key to continue...");
+            GameConfig::default()
+        }),
+        Err(_) => GameConfig::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Map constants (kept as constants; map size changes are rare and technical)
 // ---------------------------------------------------------------------------
 
 const WIDTH: i32 = 80;
 const HEIGHT: i32 = 22;
-/// Milliseconds per world tick. Lower = faster game.
-const TICK_MS: u64 = 150;
 
 // ---------------------------------------------------------------------------
 // Tiles
@@ -37,64 +94,42 @@ fn idx(x: i32, y: i32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// NPC config & state
+// NPC runtime state
 // ---------------------------------------------------------------------------
 
-/// Tunable parameters for an NPC. Adding fields here is the intended way to
-/// introduce new difficulty knobs (speed, vision range, patrol patterns, etc.)
-/// without touching the movement logic itself.
-struct NpcConfig {
-    /// Min/max ticks to wait between moves (inclusive).
-    tick_range: (u32, u32),
-    /// How many tiles the NPC advances per activation.
-    move_distance: i32,
-    /// Character drawn on screen.
-    symbol: char,
-    /// Foreground colour.
-    color: Color,
-}
-
-impl Default for NpcConfig {
-    fn default() -> Self {
-        Self {
-            tick_range: (1, 10),
-            move_distance: 1,
-            symbol: 'N',
-            color: Color::Blue,
-        }
-    }
-}
-
 struct Npc {
-    config: NpcConfig,
     pos: (i32, i32),
-    /// -1 (left) or +1 (right).
     direction: i32,
-    /// Ticks remaining until the next activation.
     ticks_remaining: u32,
+    symbol: char,
+    color: Color,
+    // Config values copied in so we don't need a lifetime on GameConfig.
+    tick_range: (u32, u32),
+    move_distance: i32,
 }
 
 impl Npc {
-    fn new(pos: (i32, i32), config: NpcConfig) -> Self {
-        let ticks = fastrand::u32(config.tick_range.0..=config.tick_range.1);
+    fn from_settings(pos: (i32, i32), s: &NpcSettings) -> Self {
+        let range = (s.wait_min, s.wait_max.max(s.wait_min));
+        let ticks = fastrand::u32(range.0..=range.1);
         let dir = if fastrand::bool() { 1 } else { -1 };
         Self {
-            config,
             pos,
             direction: dir,
             ticks_remaining: ticks,
+            symbol: s.symbol_char(),
+            color: Color::Blue,
+            tick_range: range,
+            move_distance: s.move_distance,
         }
     }
 
-    /// Called once per world tick. Decrements the countdown; on zero, moves
-    /// and re-rolls both dice.
     fn tick(&mut self, map: &[Tile]) {
         if self.ticks_remaining > 0 {
             self.ticks_remaining -= 1;
             return;
         }
-        // Activation: try to move `move_distance` tiles.
-        for _ in 0..self.config.move_distance {
+        for _ in 0..self.move_distance {
             let nx = self.pos.0 + self.direction;
             if nx <= 0 || nx >= WIDTH - 1 || map[idx(nx, self.pos.1)] == Tile::Wall {
                 self.direction = -self.direction;
@@ -102,9 +137,7 @@ impl Npc {
             }
             self.pos.0 = nx;
         }
-        // Re-roll both dice.
-        self.ticks_remaining =
-            fastrand::u32(self.config.tick_range.0..=self.config.tick_range.1);
+        self.ticks_remaining = fastrand::u32(self.tick_range.0..=self.tick_range.1);
         if fastrand::bool() {
             self.direction = -self.direction;
         }
@@ -131,7 +164,7 @@ struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(npc_settings: &NpcSettings) -> Self {
         let mut map = vec![Tile::Floor; (WIDTH * HEIGHT) as usize];
         for x in 0..WIDTH {
             map[idx(x, 0)] = Tile::Wall;
@@ -143,7 +176,7 @@ impl State {
         }
         map[idx(WIDTH - 3, 2)] = Tile::Goal;
 
-        let npcs = vec![Npc::new((WIDTH / 2, HEIGHT / 2), NpcConfig::default())];
+        let npcs = vec![Npc::from_settings((WIDTH / 2, HEIGHT / 2), npc_settings)];
 
         Self {
             map,
@@ -170,7 +203,7 @@ impl State {
         }
     }
 
-    fn input(&mut self, code: KeyCode, mods: KeyModifiers) {
+    fn input(&mut self, code: KeyCode, mods: KeyModifiers, npc_settings: &NpcSettings) {
         if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.quit = true;
             return;
@@ -186,14 +219,13 @@ impl State {
                 _ => {}
             },
             Phase::Win | Phase::Lose => match code {
-                KeyCode::Char('r') => *self = State::new(),
+                KeyCode::Char('r') => *self = State::new(npc_settings),
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
                 _ => {}
             },
         }
     }
 
-    /// Advance the world by one tick. Called every TICK_MS regardless of input.
     fn tick(&mut self) {
         if self.phase != Phase::Playing {
             return;
@@ -225,16 +257,14 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
             )?;
         }
     }
-    // NPCs
     for npc in &state.npcs {
         queue!(
             w,
             MoveTo(npc.pos.0 as u16, npc.pos.1 as u16),
-            SetForegroundColor(npc.config.color),
-            Print(npc.config.symbol),
+            SetForegroundColor(npc.color),
+            Print(npc.symbol),
         )?;
     }
-    // Player (drawn last so it's always visible on top)
     queue!(
         w,
         MoveTo(state.player.0 as u16, state.player.1 as u16),
@@ -252,34 +282,34 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop (tick-based)
+// Main loop
 // ---------------------------------------------------------------------------
 
-fn game_loop<W: Write>(w: &mut W) -> io::Result<()> {
-    let mut state = State::new();
+fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
+    let mut state = State::new(&config.npc);
+    let tick = Duration::from_millis(config.tick_ms);
     loop {
         render(w, &state)?;
         if state.quit {
             break;
         }
-        // Collect input within the tick window (non-blocking).
-        if poll(Duration::from_millis(TICK_MS))? {
+        if poll(tick)? {
             if let Event::Key(k) = read()? {
-                state.input(k.code, k.modifiers);
+                state.input(k.code, k.modifiers, &config.npc);
             }
         }
-        // Advance the world one tick.
         state.tick();
     }
     Ok(())
 }
 
 fn main() -> io::Result<()> {
+    let config = load_config();
     let mut out = stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, Hide)?;
 
-    let result = game_loop(&mut out);
+    let result = game_loop(&mut out, &config);
 
     execute!(out, Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
