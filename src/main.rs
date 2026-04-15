@@ -39,21 +39,24 @@ impl Default for GameConfig {
 #[derive(Deserialize)]
 #[serde(default)]
 struct PlayerSettings {
-    /// Max movement speed in tiles per second (converted to cooldown internally).
     speed: f32,
+    acceleration: f32,
+    keep_momentum: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
-        Self { speed: 10.0 }
+        Self {
+            speed: 10.0,
+            acceleration: 50.0,
+            keep_momentum: 1.0,
+        }
     }
 }
 
 impl PlayerSettings {
-    /// Convert tiles-per-second to milliseconds-per-move.
-    fn cooldown_ms(&self) -> u64 {
-        let clamped = self.speed.max(1.0);
-        (1000.0 / clamped) as u64
+    fn clamped_keep_momentum(&self) -> f32 {
+        self.keep_momentum.clamp(0.0, 1.0)
     }
 }
 
@@ -95,7 +98,7 @@ fn load_config() -> GameConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Map constants (kept as constants; map size changes are rare and technical)
+// Map constants
 // ---------------------------------------------------------------------------
 
 const WIDTH: i32 = 80;
@@ -117,6 +120,35 @@ fn idx(x: i32, y: i32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Direction helpers (dot product, normalization)
+// ---------------------------------------------------------------------------
+
+fn dir_magnitude(d: (i32, i32)) -> f32 {
+    ((d.0 * d.0 + d.1 * d.1) as f32).sqrt()
+}
+
+/// Normalized dot product between two direction vectors. Returns 0.0 if
+/// either vector has zero magnitude (shouldn't happen for valid directions).
+fn dir_dot_normalized(a: (i32, i32), b: (i32, i32)) -> f32 {
+    let ma = dir_magnitude(a);
+    let mb = dir_magnitude(b);
+    if ma < f32::EPSILON || mb < f32::EPSILON {
+        return 0.0;
+    }
+    let dot = (a.0 * b.0 + a.1 * b.1) as f32;
+    (dot / (ma * mb)).clamp(-1.0, 1.0)
+}
+
+/// Calculate speed retention when changing from `old` to `new` direction.
+///   dot_factor = (dot(old, new) + 1) / 2          → 0..1
+///   retention  = dot_factor + km × (1 - dot_factor)
+fn direction_retention(old: (i32, i32), new: (i32, i32), keep_momentum: f32) -> f32 {
+    let dot = dir_dot_normalized(old, new);
+    let dot_factor = (dot + 1.0) / 2.0;
+    dot_factor + keep_momentum * (1.0 - dot_factor)
+}
+
+// ---------------------------------------------------------------------------
 // NPC runtime state
 // ---------------------------------------------------------------------------
 
@@ -126,7 +158,6 @@ struct Npc {
     ticks_remaining: u32,
     symbol: char,
     color: Color,
-    // Config values copied in so we don't need a lifetime on GameConfig.
     tick_range: (u32, u32),
     move_distance: i32,
 }
@@ -178,17 +209,25 @@ enum Phase {
     Lose,
 }
 
+/// How long after the last key event we consider the direction released.
+const HOLD_TIMEOUT_MS: u128 = 500;
+
 struct State {
     map: Vec<Tile>,
     player: (i32, i32),
     npcs: Vec<Npc>,
     phase: Phase,
     quit: bool,
-    /// Single-slot input buffer: stores the most recent movement direction
-    /// during cooldown. Applied and cleared when cooldown expires.
-    pending_move: Option<(i32, i32)>,
-    last_move: Instant,
-    move_cooldown: Duration,
+    // Movement model: held-direction + acceleration + accumulator.
+    held_direction: Option<(i32, i32)>,
+    current_speed: f32,
+    move_accumulator: f32,
+    last_key_time: Instant,
+    last_frame: Instant,
+    // Config cache.
+    max_speed: f32,
+    acceleration: f32,
+    keep_momentum: f32,
 }
 
 impl State {
@@ -212,9 +251,14 @@ impl State {
             npcs,
             phase: Phase::Playing,
             quit: false,
-            pending_move: None,
-            last_move: Instant::now(),
-            move_cooldown: Duration::from_millis(config.player.cooldown_ms()),
+            held_direction: None,
+            current_speed: 0.0,
+            move_accumulator: 0.0,
+            last_key_time: Instant::now(),
+            last_frame: Instant::now(),
+            max_speed: config.player.speed.max(1.0),
+            acceleration: config.player.acceleration.max(0.0),
+            keep_momentum: config.player.clamped_keep_momentum(),
         }
     }
 
@@ -240,17 +284,32 @@ impl State {
             return;
         }
         match self.phase {
-            Phase::Playing => match code {
-                // Movement keys: buffer the direction (single-slot, latest wins).
-                KeyCode::Up | KeyCode::Char('w') => self.pending_move = Some((0, -1)),
-                KeyCode::Down | KeyCode::Char('s') => self.pending_move = Some((0, 1)),
-                KeyCode::Left | KeyCode::Char('a') => self.pending_move = Some((-1, 0)),
-                KeyCode::Right | KeyCode::Char('d') => self.pending_move = Some((1, 0)),
-                // Non-movement: execute immediately, no cooldown.
-                KeyCode::Char('q') => self.phase = Phase::Lose,
-                KeyCode::Esc => self.quit = true,
-                _ => {}
-            },
+            Phase::Playing => {
+                let new_dir: Option<(i32, i32)> = match code {
+                    KeyCode::Up | KeyCode::Char('w') => Some((0, -1)),
+                    KeyCode::Down | KeyCode::Char('s') => Some((0, 1)),
+                    KeyCode::Left | KeyCode::Char('a') => Some((-1, 0)),
+                    KeyCode::Right | KeyCode::Char('d') => Some((1, 0)),
+                    _ => None,
+                };
+                if let Some(nd) = new_dir {
+                    // Apply dot-product momentum retention on direction change.
+                    if let Some(old) = self.held_direction {
+                        if old != nd {
+                            let retention = direction_retention(old, nd, self.keep_momentum);
+                            self.current_speed *= retention;
+                        }
+                    }
+                    self.held_direction = Some(nd);
+                    self.last_key_time = Instant::now();
+                } else {
+                    match code {
+                        KeyCode::Char('q') => self.phase = Phase::Lose,
+                        KeyCode::Esc => self.quit = true,
+                        _ => {}
+                    }
+                }
+            }
             Phase::Win | Phase::Lose => match code {
                 KeyCode::Char('r') => *self = State::new(config),
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
@@ -259,20 +318,38 @@ impl State {
         }
     }
 
-    /// Consume the buffered movement if the cooldown has elapsed.
-    fn apply_pending_move(&mut self) {
+    /// Called every frame. Handles acceleration, accumulator, and tile moves.
+    fn update_movement(&mut self) {
         if self.phase != Phase::Playing {
             return;
         }
-        if let Some((dx, dy)) = self.pending_move {
-            if self.last_move.elapsed() >= self.move_cooldown {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        // Key release detection via timeout.
+        if self.last_key_time.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+            self.held_direction = None;
+        }
+
+        if self.held_direction.is_some() {
+            self.current_speed =
+                (self.current_speed + self.acceleration * dt).min(self.max_speed);
+        } else {
+            self.current_speed = 0.0;
+            self.move_accumulator = 0.0;
+        }
+
+        self.move_accumulator += self.current_speed * dt;
+        while self.move_accumulator >= 1.0 {
+            if let Some((dx, dy)) = self.held_direction {
                 self.try_move(dx, dy);
-                self.pending_move = None;
-                self.last_move = Instant::now();
             }
+            self.move_accumulator -= 1.0;
         }
     }
 
+    /// Advance world by one tick (NPCs only; player moves via update_movement).
     fn tick(&mut self) {
         if self.phase != Phase::Playing {
             return;
@@ -342,16 +419,14 @@ fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
         if state.quit {
             break;
         }
-        // Input: poll with a short timeout so the player feels responsive,
-        // but never tied to the world-tick cadence.
         if poll(Duration::from_millis(20))? {
             if let Event::Key(k) = read()? {
                 state.input(k.code, k.modifiers, config);
             }
         }
-        // Player movement: apply buffered input when cooldown allows.
-        state.apply_pending_move();
-        // World tick: advance only when the configured interval has elapsed.
+        // Player movement: acceleration + accumulator, every frame.
+        state.update_movement();
+        // World tick: NPCs advance on fixed timer.
         if last_tick.elapsed() >= tick_duration {
             state.tick();
             last_tick = Instant::now();

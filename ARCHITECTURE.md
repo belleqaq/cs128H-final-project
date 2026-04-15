@@ -3,7 +3,7 @@
 Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
-Last synced with code: commit (pending — player speed + input buffer)
+Last synced with code: acceleration + momentum model
 
 ---
 
@@ -27,7 +27,10 @@ Brownshock
 ├── config.toml (player-facing, no code knowledge needed)
 │   ├── tick_ms:       u64 = 150        ← world tick interval (ms)
 │   ├── [player]
-│   │   └── speed:     f32 = 10.0       ← max tiles per second (→ cooldown_ms internally)
+│   │   ├── speed:          f32 = 10.0  ← max tiles per second
+│   │   ├── acceleration:   f32 = 50.0  ← tiles/sec² ramp-up rate
+│   │   └── keep_momentum:  f32 = 1.0   ← 0–1 slider: speed kept on direction change
+│   │       (uses dot-product weighting: sharper turns lose more speed)
 │   └── [npc]
 │       ├── wait_min:      u32 = 1      ← min ticks between moves
 │       ├── wait_max:      u32 = 10     ← max ticks between moves

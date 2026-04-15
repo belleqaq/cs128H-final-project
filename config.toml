@@ -20,7 +20,7 @@
 # How many milliseconds between each game step.
 #   Lower = faster game.    Higher = slower game.
 #   Try:  50 (hectic)  150 (normal)  400 (chill)
-tick_ms = 10
+tick_ms = 150
 
 
 # ---- Player (@) --------------------------------------------
@@ -31,6 +31,32 @@ tick_ms = 10
 #   10 = normal
 #   20 = very fast
 speed = 10
+
+# How quickly you reach max speed when you start moving,
+# in tiles per second per second.
+#   Big number  (e.g. 100) = almost instant, snappy controls
+#   Small number (e.g. 10) = slow ramp-up, feels heavy / icy
+#   Try: 50 (normal)  20 (sluggish)  200 (instant)
+acceleration = 50
+
+# How much speed you keep when you change direction.
+# This is a slider from 0 to 1.
+#
+#   0.0 = full stop when turning (heavy, strategic gameplay)
+#         - 180° turn: lose ALL speed
+#         -  90° turn: lose HALF speed
+#
+#   0.5 = keep some speed (balanced)
+#         - 180° turn: keep half
+#         -  90° turn: keep 75%
+#
+#   1.0 = never lose speed (fluid, fast gameplay)
+#         - any turn: keep ALL speed
+#
+# The game uses the angle between your old and new direction
+# to decide exactly how much speed to keep. Sharper turns
+# lose more speed (unless this is set to 1.0).
+keep_momentum = 1.0
 
 
 # ---- NPC (the blue "N" that walks around) ------------------
