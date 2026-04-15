@@ -1,8 +1,9 @@
 use std::io::{self, stdout, Write};
+use std::time::Duration;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{read, Event, KeyCode, KeyModifiers},
+    event::{poll, read, Event, KeyCode, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{
@@ -11,8 +12,18 @@ use crossterm::{
     },
 };
 
+// ---------------------------------------------------------------------------
+// Global constants — change these to tune the game feel.
+// ---------------------------------------------------------------------------
+
 const WIDTH: i32 = 80;
 const HEIGHT: i32 = 22;
+/// Milliseconds per world tick. Lower = faster game.
+const TICK_MS: u64 = 150;
+
+// ---------------------------------------------------------------------------
+// Tiles
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tile {
@@ -20,6 +31,89 @@ enum Tile {
     Wall,
     Goal,
 }
+
+fn idx(x: i32, y: i32) -> usize {
+    (y * WIDTH + x) as usize
+}
+
+// ---------------------------------------------------------------------------
+// NPC config & state
+// ---------------------------------------------------------------------------
+
+/// Tunable parameters for an NPC. Adding fields here is the intended way to
+/// introduce new difficulty knobs (speed, vision range, patrol patterns, etc.)
+/// without touching the movement logic itself.
+struct NpcConfig {
+    /// Min/max ticks to wait between moves (inclusive).
+    tick_range: (u32, u32),
+    /// How many tiles the NPC advances per activation.
+    move_distance: i32,
+    /// Character drawn on screen.
+    symbol: char,
+    /// Foreground colour.
+    color: Color,
+}
+
+impl Default for NpcConfig {
+    fn default() -> Self {
+        Self {
+            tick_range: (1, 10),
+            move_distance: 1,
+            symbol: 'N',
+            color: Color::Blue,
+        }
+    }
+}
+
+struct Npc {
+    config: NpcConfig,
+    pos: (i32, i32),
+    /// -1 (left) or +1 (right).
+    direction: i32,
+    /// Ticks remaining until the next activation.
+    ticks_remaining: u32,
+}
+
+impl Npc {
+    fn new(pos: (i32, i32), config: NpcConfig) -> Self {
+        let ticks = fastrand::u32(config.tick_range.0..=config.tick_range.1);
+        let dir = if fastrand::bool() { 1 } else { -1 };
+        Self {
+            config,
+            pos,
+            direction: dir,
+            ticks_remaining: ticks,
+        }
+    }
+
+    /// Called once per world tick. Decrements the countdown; on zero, moves
+    /// and re-rolls both dice.
+    fn tick(&mut self, map: &[Tile]) {
+        if self.ticks_remaining > 0 {
+            self.ticks_remaining -= 1;
+            return;
+        }
+        // Activation: try to move `move_distance` tiles.
+        for _ in 0..self.config.move_distance {
+            let nx = self.pos.0 + self.direction;
+            if nx <= 0 || nx >= WIDTH - 1 || map[idx(nx, self.pos.1)] == Tile::Wall {
+                self.direction = -self.direction;
+                break;
+            }
+            self.pos.0 = nx;
+        }
+        // Re-roll both dice.
+        self.ticks_remaining =
+            fastrand::u32(self.config.tick_range.0..=self.config.tick_range.1);
+        if fastrand::bool() {
+            self.direction = -self.direction;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -31,12 +125,9 @@ enum Phase {
 struct State {
     map: Vec<Tile>,
     player: (i32, i32),
+    npcs: Vec<Npc>,
     phase: Phase,
     quit: bool,
-}
-
-fn idx(x: i32, y: i32) -> usize {
-    (y * WIDTH + x) as usize
 }
 
 impl State {
@@ -51,9 +142,13 @@ impl State {
             map[idx(WIDTH - 1, y)] = Tile::Wall;
         }
         map[idx(WIDTH - 3, 2)] = Tile::Goal;
+
+        let npcs = vec![Npc::new((WIDTH / 2, HEIGHT / 2), NpcConfig::default())];
+
         Self {
             map,
             player: (2, HEIGHT - 3),
+            npcs,
             phase: Phase::Playing,
             quit: false,
         }
@@ -76,7 +171,6 @@ impl State {
     }
 
     fn input(&mut self, code: KeyCode, mods: KeyModifiers) {
-        // Ctrl-C always quits (raw mode swallows the default SIGINT).
         if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.quit = true;
             return;
@@ -98,7 +192,21 @@ impl State {
             },
         }
     }
+
+    /// Advance the world by one tick. Called every TICK_MS regardless of input.
+    fn tick(&mut self) {
+        if self.phase != Phase::Playing {
+            return;
+        }
+        for npc in &mut self.npcs {
+            npc.tick(&self.map);
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
 fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
     queue!(w, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -117,6 +225,16 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
             )?;
         }
     }
+    // NPCs
+    for npc in &state.npcs {
+        queue!(
+            w,
+            MoveTo(npc.pos.0 as u16, npc.pos.1 as u16),
+            SetForegroundColor(npc.config.color),
+            Print(npc.config.symbol),
+        )?;
+    }
+    // Player (drawn last so it's always visible on top)
     queue!(
         w,
         MoveTo(state.player.0 as u16, state.player.1 as u16),
@@ -133,6 +251,10 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
     w.flush()
 }
 
+// ---------------------------------------------------------------------------
+// Main loop (tick-based)
+// ---------------------------------------------------------------------------
+
 fn game_loop<W: Write>(w: &mut W) -> io::Result<()> {
     let mut state = State::new();
     loop {
@@ -140,9 +262,14 @@ fn game_loop<W: Write>(w: &mut W) -> io::Result<()> {
         if state.quit {
             break;
         }
-        if let Event::Key(k) = read()? {
-            state.input(k.code, k.modifiers);
+        // Collect input within the tick window (non-blocking).
+        if poll(Duration::from_millis(TICK_MS))? {
+            if let Event::Key(k) = read()? {
+                state.input(k.code, k.modifiers);
+            }
         }
+        // Advance the world one tick.
+        state.tick();
     }
     Ok(())
 }
