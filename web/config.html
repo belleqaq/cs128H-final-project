@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Brownshock — Config</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="config-app">
+    <nav class="nav">
+      <a href="/">&#8592; Game</a>
+      <span class="nav-title">Live Config Editor</span>
+      <span id="status" class="status"></span>
+    </nav>
+
+    <p class="hint">
+      Drag any slider — the running game reacts instantly. No restart needed.
+    </p>
+
+    <!-- Game speed -->
+    <section class="cfg-group">
+      <h3>Game Speed</h3>
+      <div class="field">
+        <label for="tick_ms">Tick interval (ms)</label>
+        <input type="range" id="tick_ms" min="20" max="500" step="10" />
+        <output for="tick_ms"></output>
+      </div>
+    </section>
+
+    <!-- Player -->
+    <section class="cfg-group">
+      <h3>Player (@)</h3>
+      <div class="field">
+        <label for="player_speed">Max speed (tiles/tick)</label>
+        <input type="range" id="player_speed" min="0.05" max="1" step="0.05" />
+        <output for="player_speed"></output>
+      </div>
+      <div class="field">
+        <label for="player_acceleration">Acceleration</label>
+        <input type="range" id="player_acceleration" min="0.01" max="1" step="0.01" />
+        <output for="player_acceleration"></output>
+      </div>
+      <div class="field">
+        <label for="player_keep_momentum">Keep momentum</label>
+        <input type="range" id="player_keep_momentum" min="0" max="1" step="0.05" />
+        <output for="player_keep_momentum"></output>
+      </div>
+      <div class="field">
+        <label for="player_friction">Friction</label>
+        <input type="range" id="player_friction" min="0" max="1" step="0.05" />
+        <output for="player_friction"></output>
+      </div>
+    </section>
+
+    <!-- NPC -->
+    <section class="cfg-group">
+      <h3>NPC</h3>
+      <div class="field">
+        <label for="npc_wait_min">Wait min (ticks)</label>
+        <input type="range" id="npc_wait_min" min="1" max="50" step="1" />
+        <output for="npc_wait_min"></output>
+      </div>
+      <div class="field">
+        <label for="npc_wait_max">Wait max (ticks)</label>
+        <input type="range" id="npc_wait_max" min="1" max="50" step="1" />
+        <output for="npc_wait_max"></output>
+      </div>
+      <div class="field">
+        <label for="npc_move_distance">Move distance (tiles)</label>
+        <input type="range" id="npc_move_distance" min="1" max="5" step="1" />
+        <output for="npc_move_distance"></output>
+      </div>
+      <div class="field">
+        <label for="npc_symbol">Symbol</label>
+        <input type="text" id="npc_symbol" maxlength="1" value="N" />
+      </div>
+    </section>
+
+    <!-- Actions -->
+    <div class="cfg-actions">
+      <button id="btn-defaults">Reset to defaults</button>
+      <button id="btn-save">Save to config.toml</button>
+    </div>
+  </div>
+  <script src="/config.js"></script>
+</body>
+</html>

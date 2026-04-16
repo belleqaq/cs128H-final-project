@@ -1,9 +1,9 @@
 //! config.toml loading + defaults.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct GameConfig {
     pub tick_ms: u64,
@@ -21,7 +21,7 @@ impl Default for GameConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct PlayerSettings {
     /// Maximum horizontal speed, in TILES PER TICK. Hard cap 1.0.
@@ -57,7 +57,7 @@ impl PlayerSettings {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct NpcSettings {
     /// Minimum wait (in ticks, at baseline tick rate) between moves.
@@ -84,6 +84,21 @@ impl Default for NpcSettings {
 impl NpcSettings {
     pub fn symbol_char(&self) -> char {
         self.symbol.chars().next().unwrap_or('N')
+    }
+}
+
+impl GameConfig {
+    /// Write the current config to `config.toml`, overwriting whatever was
+    /// there. Comments from the original hand-written file will be lost.
+    pub fn save_to_file(&self) -> std::io::Result<()> {
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let text = format!(
+            "# Brownshock — config.toml\n\
+             # Saved by the live config editor. See ARCHITECTURE.md for field docs.\n\n\
+             {body}"
+        );
+        std::fs::write("config.toml", text)
     }
 }
 

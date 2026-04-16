@@ -43,6 +43,21 @@ impl Npc {
         }
     }
 
+    /// Hot-update settings from the live config editor. Updates the NPC's
+    /// tick_range, move_distance, and symbol. The current `ticks_remaining`
+    /// countdown finishes with the old range; the new range takes effect on
+    /// the next roll.
+    pub fn apply_settings(&mut self, s: &NpcSettings, tick_ms: u64) {
+        let scale = BASELINE_TICK_MS as f32 / tick_ms.max(1) as f32;
+        let min_scaled = ((s.wait_min as f32) * scale).ceil() as u32;
+        let max_scaled = ((s.wait_max as f32) * scale).ceil() as u32;
+        let wait_min = min_scaled.max(1);
+        let wait_max = max_scaled.max(wait_min);
+        self.tick_range = (wait_min, wait_max);
+        self.move_distance = s.move_distance;
+        self.symbol = s.symbol_char();
+    }
+
     fn tick(&mut self, map: &[Tile]) {
         if self.ticks_remaining > 0 {
             self.ticks_remaining -= 1;
@@ -178,6 +193,19 @@ impl State {
         let allowed = matches!((here, dy), (Tile::StairUp, -1) | (Tile::StairDown, 1));
         if allowed {
             self.try_move_to(self.player.0, self.player.1 + dy);
+        }
+    }
+
+    /// Hot-update physics and NPC params from a (possibly changed) config.
+    /// Called once per tick by the game loop so that live-editor changes
+    /// take effect on the very next frame.
+    pub fn apply_config(&mut self, config: &GameConfig) {
+        self.max_speed = config.player.clamped_speed();
+        self.acceleration = config.player.acceleration.max(0.0);
+        self.keep_momentum = config.player.clamped_keep_momentum();
+        self.friction = config.player.clamped_friction();
+        for npc in &mut self.npcs {
+            npc.apply_settings(&config.npc, config.tick_ms);
         }
     }
 
