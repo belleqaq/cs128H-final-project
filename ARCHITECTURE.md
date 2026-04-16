@@ -4,6 +4,7 @@ Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
 Last synced with code: tick-locked movement + Stair tiles + NPC auto-scaling
+                        + adaptive key-release detection
 
 ---
 
@@ -44,6 +45,27 @@ cross a single tile.
 - There is currently **no diagonal movement**. Vertical movement exists
   only as stair transitions (and in the future, jumps).
 
+### Adaptive key-release detection
+
+TTY protocols historically don't send key-release events — we have to
+infer release by timeout. This breaks SOCD (A+D cancel) because the OS
+only repeats the *last* pressed key, so the "other" key stops receiving
+events and times out while still physically held.
+
+The game handles both worlds:
+
+- **Precise mode** — triggered the first time we observe a real
+  `KeyEventKind::Release` event. From then on we trust the terminal,
+  disable the timeout fallback entirely, and releases are frame-accurate.
+  Supported by: Windows Terminal, VS Code, iTerm2, Kitty, WezTerm, Alacritty.
+- **Basic mode** — terminal never sends Release events. Falls back to a
+  700ms release timeout (covers the OS's ~500ms initial repeat delay so
+  the opposite-key SOCD bug stays squashed). Trade-off: truly releasing
+  a key takes up to 700ms to register. Used by: cmd.exe, basic PowerShell
+  console.
+
+Mode is auto-detected at runtime and displayed on the HUD.
+
 ---
 
 ## Truth tree: tunable parameters
@@ -68,11 +90,15 @@ Brownshock
 │        so NPC real-time pacing stays roughly constant when tick_ms changes)
 │
 ├── Code-only constants (src/main.rs, top of file)
-│   ├── WIDTH:            i32 = 80     ← map columns
-│   ├── HEIGHT:           i32 = 22     ← map rows
-│   ├── HOLD_TIMEOUT_MS:  u128 = 80    ← key-release fallback (ms)
-│   ├── SPEED_EPSILON:    f32 = 0.01   ← snap-to-zero threshold
-│   └── BASELINE_TICK_MS: u64 = 150    ← reference tick rate for NPC scaling
+│   ├── WIDTH:                  i32  = 80   ← map columns
+│   ├── HEIGHT:                 i32  = 22   ← map rows
+│   ├── LEGACY_HOLD_TIMEOUT_MS: u128 = 700  ← key-release fallback used only
+│   │                                         on terminals that don't emit
+│   │                                         real Release events (cmd.exe);
+│   │                                         700ms covers OS initial repeat
+│   │                                         delay to prevent SOCD dropout
+│   ├── SPEED_EPSILON:          f32  = 0.01 ← snap-to-zero threshold
+│   └── BASELINE_TICK_MS:       u64  = 150  ← reference tick rate for NPC scaling
 │
 ├── Npc runtime fields (populated from config.toml + hardcoded)
 │   ├── color:         Color = Blue     ← render colour (code-only)

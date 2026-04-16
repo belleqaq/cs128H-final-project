@@ -121,7 +121,17 @@ const HEIGHT: i32 = 22;
 
 /// How long after the last key event we consider a key released (fallback for
 /// terminals that don't support the Kitty keyboard protocol).
-const HOLD_TIMEOUT_MS: u128 = 80;
+/// Fallback release-detection timeout used on terminals that DO NOT send
+/// real KeyEventKind::Release events (e.g. legacy cmd.exe).
+///
+/// Set large enough to cover the OS's initial key-repeat delay (~500ms).
+/// On Windows the typical first-repeat delay is 250–750ms; 700 is a safe
+/// cover that prevents the "press opposite key -> other key times out in
+/// 80ms -> character dashes the wrong way" bug.
+///
+/// Once we observe any real Release event we trust the terminal and stop
+/// using this timeout entirely (see `Keys::trust_release`).
+const LEGACY_HOLD_TIMEOUT_MS: u128 = 700;
 
 /// Speed threshold (tiles/tick) below which we snap to zero during friction.
 const SPEED_EPSILON: f32 = 0.01;
@@ -262,8 +272,8 @@ impl HoldKey {
     fn release(&mut self) {
         self.pressed = false;
     }
-    fn timeout_check(&mut self) {
-        if self.pressed && self.last_event.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+    fn timeout_check(&mut self, threshold_ms: u128) {
+        if self.pressed && self.last_event.elapsed().as_millis() > threshold_ms {
             self.pressed = false;
         }
     }
@@ -294,8 +304,8 @@ impl EdgeKey {
     fn release(&mut self) {
         self.latched = false;
     }
-    fn timeout_check(&mut self) {
-        if self.latched && self.last_event.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+    fn timeout_check(&mut self, threshold_ms: u128) {
+        if self.latched && self.last_event.elapsed().as_millis() > threshold_ms {
             self.latched = false;
         }
     }
@@ -306,6 +316,15 @@ struct Keys {
     right: HoldKey,
     w: EdgeKey,
     s: EdgeKey,
+    /// True once we've seen a real KeyEventKind::Release event. Terminals
+    /// that support the Kitty keyboard protocol (Windows Terminal, VSCode,
+    /// iTerm2, Kitty, Alacritty, WezTerm) will send Release; terminals that
+    /// don't (legacy cmd.exe, basic PowerShell console) never will.
+    ///
+    /// Once true: trust release events completely, skip all timeout checks.
+    /// While false: fall back to LEGACY_HOLD_TIMEOUT_MS (700ms) so the
+    /// opposite-key SOCD bug is covered despite OS first-repeat delay.
+    trust_release: bool,
 }
 
 impl Keys {
@@ -315,13 +334,26 @@ impl Keys {
             right: HoldKey::new(),
             w: EdgeKey::new(),
             s: EdgeKey::new(),
+            trust_release: false,
         }
     }
+    /// Called whenever the terminal sends us a real Release event.
+    /// After the first one, we know the terminal is trustworthy and
+    /// permanently switch off the timeout-based fallback.
+    fn mark_release_seen(&mut self) {
+        self.trust_release = true;
+    }
     fn timeout_check_all(&mut self) {
-        self.left.timeout_check();
-        self.right.timeout_check();
-        self.w.timeout_check();
-        self.s.timeout_check();
+        // In precise mode, real Release events drive every release.
+        // Skip the timeout entirely so held keys never spuriously drop.
+        if self.trust_release {
+            return;
+        }
+        let t = LEGACY_HOLD_TIMEOUT_MS;
+        self.left.timeout_check(t);
+        self.right.timeout_check(t);
+        self.w.timeout_check(t);
+        self.s.timeout_check(t);
     }
     /// Refresh timestamps of pressed L/R keys so A+D clash doesn't timeout
     /// the "other" key while OS only sends repeat for the latest one.
@@ -447,6 +479,13 @@ impl State {
         }
 
         let is_release = kind == KeyEventKind::Release;
+
+        // Seeing any real Release event proves the terminal supports the
+        // Kitty keyboard protocol. From now on, trust releases and skip
+        // the timeout fallback.
+        if is_release {
+            self.keys.mark_release_seen();
+        }
 
         match self.phase {
             Phase::Playing => {
@@ -604,6 +643,21 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
         Phase::Lose => "YOU LOSE. R: restart | Esc: quit",
     };
     queue!(w, MoveTo(0, HEIGHT as u16), ResetColor, Print(msg))?;
+
+    // Terminal-capability diagnostic: shows whether we're using real key
+    // Release events (precise) or the 700ms fallback (cmd.exe-style).
+    let (tag, color) = if state.keys.trust_release {
+        ("terminal: precise (Kitty)", Color::Green)
+    } else {
+        ("terminal: basic (SOCD imprecise — use Windows Terminal for best feel)", Color::DarkYellow)
+    };
+    queue!(
+        w,
+        MoveTo(0, HEIGHT as u16 + 1),
+        SetForegroundColor(color),
+        Print(tag),
+        ResetColor,
+    )?;
     w.flush()
 }
 
