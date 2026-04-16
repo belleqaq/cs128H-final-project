@@ -10,6 +10,8 @@ services:
       - .:/app                           # bind-mount project (Windows <-> container)
       - cargo-target:/app/target         # build cache (NOT visible on Windows, stays fast)
       - cargo-registry:/usr/local/cargo/registry
+    ports:
+      - "8080:8080"                      # forward host:8080 -> container:8080 (game server)
     tty: true
     stdin_open: true
 

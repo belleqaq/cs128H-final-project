@@ -60,13 +60,23 @@ changes).
 ## Step 4 — Run the game
 
 ```
-docker compose run --rm dev cargo run
+docker compose run --rm --service-ports dev cargo run
 ```
 
-The first run compiles the code (~1–2 min). When it's ready you'll see a
-line like `Brownshock listening on http://127.0.0.1:54321` and your default
-browser will open to that URL automatically. If it doesn't, copy the URL
-into the browser yourself.
+⚠️ The `--service-ports` flag is **required** — without it Docker won't
+publish port 8080 to your host, and the browser will say "connection
+refused". (`docker compose run` ignores ports by default; only `up` and
+`run --service-ports` publish them.)
+
+The first run compiles the code (~1–2 min). When it's ready you'll see:
+
+```
+Brownshock listening on http://127.0.0.1:8080  (bound on 0.0.0.0:8080)
+```
+
+Open `http://127.0.0.1:8080` in your browser (any modern one). The server
+tries to auto-open the browser but will fail when running inside Docker —
+just paste the URL manually.
 
 Click the browser tab once to give it keyboard focus, then play as usual.
 Press `Ctrl-C` in the terminal to stop the server.
@@ -76,6 +86,7 @@ Press `Ctrl-C` in the terminal to stop the server.
 | Key | Action |
 |---|---|
 | Arrow keys / `W A S D` | Move |
+| `Q` | Trigger lose state (placeholder, until NPC detection lands) |
 | `R` | Restart after win/lose |
 | `Ctrl-C` (in terminal) | Stop the server |
 
@@ -95,8 +106,15 @@ Walk onto `T` to win.
 
 - **"Cannot connect to the Docker daemon"** — Docker Desktop isn't running.
   Launch it and wait for the whale icon to go green.
-- **Browser didn't open automatically** — copy the `http://127.0.0.1:…` URL
-  from the terminal and paste it into any browser.
+- **"This site can't be reached" / "Connection refused"** — you probably
+  forgot `--service-ports` on `docker compose run`. Without that flag
+  Docker doesn't forward port 8080 to your host. Stop the container and
+  re-run with `docker compose run --rm --service-ports dev cargo run`.
+- **Port 8080 already in use** — override the port with an env var, e.g.
+  `docker compose run --rm --service-ports -e PORT=9090 -p 9090:9090 dev cargo run`.
+- **Browser didn't open automatically** — expected when running inside
+  Docker (the container has no GUI). Copy the URL from the terminal and
+  paste it into your browser manually.
 - **Keys don't do anything** — click on the game tab once to give it focus.
 - **Server won't exit** — `Ctrl-C` in the terminal. If it's stuck:
   `docker kill brownshock-dev` from another terminal.

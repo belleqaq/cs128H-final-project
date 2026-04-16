@@ -44,7 +44,7 @@ preserved on the `archive/terminal` branch (tag `v0.1-terminal`).
 │     │   on_player_tick + tick_world, serialize               │
 │     │   snapshot, broadcast::send(json)                      │
 │     │                                                        │
-│     ├── axum::serve on 127.0.0.1:<os-assigned port>          │
+│     ├── axum::serve on 0.0.0.0:$PORT (default 8080)          │
 │     │     GET /       → embedded index.html                  │
 │     │     GET /*path  → embedded asset (via rust-embed)      │
 │     │     GET /ws     → WebSocket upgrade                    │

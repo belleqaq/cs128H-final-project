@@ -67,6 +67,8 @@ enum ClientMessage {
     Input { left: bool, right: bool },
     /// Rising edge of W or S (dy = -1 or +1).
     Stair { dy: i32 },
+    /// Q pressed: force Lose phase (placeholder until NPC detection lands).
+    Lose,
     /// R pressed after win/lose (or any time): reset the world.
     Restart,
 }
@@ -96,24 +98,32 @@ async fn main() {
         .fallback(serve_asset)
         .with_state(app_state.clone());
 
-    // Bind to 127.0.0.1 on an OS-assigned port so multiple instances can
-    // coexist and we never collide with something the user already has running.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    // Bind on all interfaces (0.0.0.0) so the server is reachable from the
+    // host machine when running inside a Docker container with the port
+    // published. Port is fixed (default 8080, overridable via $PORT) so
+    // docker-compose can pre-publish it.
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let bind_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
-        .expect("failed to bind 127.0.0.1:0");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr failed");
-    let url = format!("http://{addr}");
-    println!("Brownshock listening on {url}");
+        .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
+    // URL the user's browser should hit. Always localhost — when running in
+    // Docker, compose forwards host-localhost → container-0.0.0.0.
+    let url = format!("http://127.0.0.1:{port}");
+    println!("Brownshock listening on {url}  (bound on {bind_addr})");
 
     // Fire up the game loop in the background.
     tokio::spawn(game_loop(app_state.clone(), tick_ms));
 
-    // Auto-open the default browser. `open::that` spawns the OS handler and
-    // returns immediately on Windows/macOS; on Linux it runs xdg-open to
-    // completion (which is fast).
+    // Auto-open the default browser. Inside Docker this will fail (no GUI in
+    // the container) — that's fine, we printed the URL above for the user to
+    // open in their host browser.
     if let Err(e) = open::that(&url) {
-        eprintln!("[startup] couldn't auto-open browser: {e}");
-        eprintln!("[startup] open {url} manually");
+        eprintln!("[startup] couldn't auto-open browser ({e})");
+        eprintln!("[startup] open {url} in your browser manually");
     }
 
     // Stop on Ctrl+C.
@@ -249,6 +259,7 @@ async fn handle_client_message(app: &AppState, text: &str) {
     match msg {
         ClientMessage::Input { left, right } => game.set_direction_input(left, right),
         ClientMessage::Stair { dy } => game.press_stair(dy),
+        ClientMessage::Lose => game.force_lose(),
         ClientMessage::Restart => game.restart(&app.config),
     }
 }

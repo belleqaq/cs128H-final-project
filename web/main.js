@@ -190,6 +190,12 @@
       return;
     }
 
+    if (k === "q") {
+      e.preventDefault();
+      if (!e.repeat) send({ type: "lose" });
+      return;
+    }
+
     if (k === "r") {
       e.preventDefault();
       send({ type: "restart" });

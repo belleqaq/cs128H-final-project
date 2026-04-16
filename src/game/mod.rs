@@ -13,9 +13,8 @@ pub mod config;
 pub mod state;
 pub mod tile;
 
-pub use config::{GameConfig, NpcSettings, PlayerSettings, load_config};
-pub use state::{Phase, Snapshot, State};
-pub use tile::Tile;
+pub use config::{load_config, GameConfig};
+pub use state::State;
 
 /// Map dimensions (in tiles). Not user-tunable: every other system scales
 /// against these, and the current map generator assumes fixed 80x22.

@@ -19,16 +19,6 @@ impl Tile {
             Tile::Floor | Tile::Goal | Tile::StairUp | Tile::StairDown
         )
     }
-    /// Single-character representation for ASCII rendering.
-    pub fn glyph(self) -> char {
-        match self {
-            Tile::Floor => '.',
-            Tile::Wall => '#',
-            Tile::Goal => 'T',
-            Tile::StairUp => '^',
-            Tile::StairDown => 'v',
-        }
-    }
 }
 
 pub fn idx(x: i32, y: i32, width: i32) -> usize {
