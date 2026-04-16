@@ -24,48 +24,35 @@ impl Default for GameConfig {
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct PlayerSettings {
-    /// Maximum horizontal speed, in TILES PER TICK. Hard cap 1.0.
-    pub speed: f32,
-    /// Acceleration per tick (tiles/tick² in tick-world terms).
+    /// Terminal velocity (tiles/tick). Velocity is clamped here each tick.
+    /// Not a "speed setting" — it's the cap that produces dynamic equilibrium
+    /// with friction at full acceleration.
+    #[serde(alias = "speed")]
+    pub max_speed: f32,
+    /// Velocity added per tick while holding a direction (tiles/tick²).
     pub acceleration: f32,
-    /// Velocity retained on input reversal. 0=snap-to-zero, 1=pure accel-driven.
-    pub keep_momentum: f32,
-    /// Per-tick friction multiplier (0=instant stop, 1=no friction).
+    /// Per-tick velocity multiplier. Applied EVERY tick (not just on release).
+    /// 0 = instant stop, <1 = decelerating, 1 = no friction, >1 = amplifying.
     pub friction: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            speed: 1.0,
+            max_speed: 1.0,
             acceleration: 0.3,
-            keep_momentum: 1.0,
-            friction: 0.6,
+            friction: 0.85,
         }
-    }
-}
-
-impl PlayerSettings {
-    pub fn clamped_speed(&self) -> f32 {
-        self.speed.clamp(0.0, 1.0)
-    }
-    pub fn clamped_keep_momentum(&self) -> f32 {
-        self.keep_momentum.clamp(0.0, 1.0)
-    }
-    pub fn clamped_friction(&self) -> f32 {
-        self.friction.clamp(0.0, 1.0)
     }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct NpcSettings {
-    /// Minimum wait (in ticks, at baseline tick rate) between moves.
-    pub wait_min: u32,
-    /// Maximum wait (in ticks, at baseline tick rate) between moves.
-    pub wait_max: u32,
-    /// Tiles per activation.
-    pub move_distance: i32,
+    /// Minimum ticks the NPC "holds" a direction before releasing.
+    pub hold_min: u32,
+    /// Maximum ticks the NPC "holds" a direction before releasing.
+    pub hold_max: u32,
     /// Render character.
     pub symbol: String,
 }
@@ -73,9 +60,8 @@ pub struct NpcSettings {
 impl Default for NpcSettings {
     fn default() -> Self {
         Self {
-            wait_min: 1,
-            wait_max: 10,
-            move_distance: 1,
+            hold_min: 5,
+            hold_max: 30,
             symbol: "N".to_string(),
         }
     }
@@ -102,9 +88,7 @@ impl GameConfig {
     }
 }
 
-/// Load `config.toml` from the current working directory. If it's missing,
-/// malformed, or has any field missing, we fall back to built-in defaults
-/// and print a warning to stderr — never panic, never block startup.
+/// Load `config.toml` from the current working directory.
 pub fn load_config() -> GameConfig {
     let path = Path::new("config.toml");
     let Ok(text) = std::fs::read_to_string(path) else {

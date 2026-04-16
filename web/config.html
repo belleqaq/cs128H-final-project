@@ -14,7 +14,8 @@
     </nav>
 
     <p class="hint">
-      Drag any slider — the running game reacts instantly. No restart needed.
+      Drag any slider or type a number — the running game reacts instantly.
+      Number inputs accept any value; sliders are range-limited.
     </p>
 
     <!-- Game speed -->
@@ -23,7 +24,7 @@
       <div class="field">
         <label for="tick_ms">Tick interval (ms)</label>
         <input type="range" id="tick_ms" min="20" max="500" step="10" />
-        <output for="tick_ms"></output>
+        <input type="number" class="num-input" data-for="tick_ms" step="10" />
       </div>
     </section>
 
@@ -31,24 +32,19 @@
     <section class="cfg-group">
       <h3>Player (@)</h3>
       <div class="field">
-        <label for="player_speed">Max speed (tiles/tick)</label>
-        <input type="range" id="player_speed" min="0.05" max="1" step="0.05" />
-        <output for="player_speed"></output>
+        <label for="player_max_speed">Max speed (tiles/tick)</label>
+        <input type="range" id="player_max_speed" min="0.05" max="3" step="0.05" />
+        <input type="number" class="num-input" data-for="player_max_speed" step="0.05" />
       </div>
       <div class="field">
-        <label for="player_acceleration">Acceleration</label>
-        <input type="range" id="player_acceleration" min="0.01" max="1" step="0.01" />
-        <output for="player_acceleration"></output>
+        <label for="player_acceleration">Acceleration (tiles/tick²)</label>
+        <input type="range" id="player_acceleration" min="0.01" max="2" step="0.01" />
+        <input type="number" class="num-input" data-for="player_acceleration" step="0.01" />
       </div>
       <div class="field">
-        <label for="player_keep_momentum">Keep momentum</label>
-        <input type="range" id="player_keep_momentum" min="0" max="1" step="0.05" />
-        <output for="player_keep_momentum"></output>
-      </div>
-      <div class="field">
-        <label for="player_friction">Friction</label>
-        <input type="range" id="player_friction" min="0" max="1" step="0.05" />
-        <output for="player_friction"></output>
+        <label for="player_friction">Friction (per-tick multiplier)</label>
+        <input type="range" id="player_friction" min="0" max="1" step="0.01" />
+        <input type="number" class="num-input" data-for="player_friction" step="0.01" />
       </div>
     </section>
 
@@ -56,19 +52,14 @@
     <section class="cfg-group">
       <h3>NPC</h3>
       <div class="field">
-        <label for="npc_wait_min">Wait min (ticks)</label>
-        <input type="range" id="npc_wait_min" min="1" max="50" step="1" />
-        <output for="npc_wait_min"></output>
+        <label for="npc_hold_min">Hold min (ticks)</label>
+        <input type="range" id="npc_hold_min" min="0" max="80" step="1" />
+        <input type="number" class="num-input" data-for="npc_hold_min" step="1" />
       </div>
       <div class="field">
-        <label for="npc_wait_max">Wait max (ticks)</label>
-        <input type="range" id="npc_wait_max" min="1" max="50" step="1" />
-        <output for="npc_wait_max"></output>
-      </div>
-      <div class="field">
-        <label for="npc_move_distance">Move distance (tiles)</label>
-        <input type="range" id="npc_move_distance" min="1" max="5" step="1" />
-        <output for="npc_move_distance"></output>
+        <label for="npc_hold_max">Hold max (ticks)</label>
+        <input type="range" id="npc_hold_max" min="0" max="80" step="1" />
+        <input type="number" class="num-input" data-for="npc_hold_max" step="1" />
       </div>
       <div class="field">
         <label for="npc_symbol">Symbol</label>

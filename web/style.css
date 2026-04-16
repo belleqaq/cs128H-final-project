@@ -138,11 +138,22 @@ html, body {
   flex: 1;
   accent-color: var(--good);
 }
-.field output {
-  flex: 0 0 50px;
-  text-align: right;
-  font-size: 13px;
+.field .num-input {
+  flex: 0 0 64px;
+  width: 64px;
+  background: #1a1a1a;
   color: var(--fg);
+  border: 1px solid #333;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: 13px;
+  text-align: right;
+  -moz-appearance: textfield;
+}
+.field .num-input::-webkit-inner-spin-button,
+.field .num-input::-webkit-outer-spin-button {
+  opacity: 1;
 }
 .field input[type="text"] {
   width: 32px;

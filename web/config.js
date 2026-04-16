@@ -3,16 +3,41 @@
 // Fetches the current GameConfig from the server on load, mirrors it into
 // the form, and POSTs the full config on every slider/input change.  The
 // server applies it on the next tick so the game reacts in real time.
+//
+// Each field has BOTH a range slider (clamped by HTML min/max) and a number
+// input (unclamped — accepts any value).  Editing either syncs the other.
 
 (() => {
-  // Defaults match GameConfig::default() in Rust. Used by "Reset to defaults".
+  // Defaults match GameConfig::default() in Rust.
   const DEFAULTS = {
     tick_ms: 150,
-    player: { speed: 1.0, acceleration: 0.3, keep_momentum: 1.0, friction: 0.6 },
-    npc: { wait_min: 1, wait_max: 10, move_distance: 1, symbol: "N" },
+    player: { max_speed: 1.0, acceleration: 0.3, friction: 0.85 },
+    npc: { hold_min: 5, hold_max: 30, symbol: "N" },
   };
 
   const statusEl = document.getElementById("status");
+
+  // -----------------------------------------------------------------------
+  // Bidirectional slider ↔ number sync
+  // -----------------------------------------------------------------------
+
+  /** Set both the slider and its paired number input to `v`. */
+  function setVal(sliderId, v) {
+    const slider = document.getElementById(sliderId);
+    const numInput = document.querySelector(`.num-input[data-for="${sliderId}"]`);
+    if (slider) slider.value = v;
+    if (numInput) numInput.value = v;
+  }
+
+  /** Read the authoritative value from the number input (unclamped). */
+  function num(sliderId) {
+    const numInput = document.querySelector(`.num-input[data-for="${sliderId}"]`);
+    return parseFloat(numInput ? numInput.value : document.getElementById(sliderId).value);
+  }
+  function int(sliderId) {
+    const numInput = document.querySelector(`.num-input[data-for="${sliderId}"]`);
+    return parseInt(numInput ? numInput.value : document.getElementById(sliderId).value, 10);
+  }
 
   // -----------------------------------------------------------------------
   // Form ↔ Config mapping
@@ -20,54 +45,28 @@
 
   function populateForm(cfg) {
     setVal("tick_ms", cfg.tick_ms);
-    setVal("player_speed", cfg.player.speed);
+    setVal("player_max_speed", cfg.player.max_speed);
     setVal("player_acceleration", cfg.player.acceleration);
-    setVal("player_keep_momentum", cfg.player.keep_momentum);
     setVal("player_friction", cfg.player.friction);
-    setVal("npc_wait_min", cfg.npc.wait_min);
-    setVal("npc_wait_max", cfg.npc.wait_max);
-    setVal("npc_move_distance", cfg.npc.move_distance);
+    setVal("npc_hold_min", cfg.npc.hold_min);
+    setVal("npc_hold_max", cfg.npc.hold_max);
     document.getElementById("npc_symbol").value = cfg.npc.symbol;
-    syncAllOutputs();
   }
 
   function readForm() {
     return {
       tick_ms: int("tick_ms"),
       player: {
-        speed: num("player_speed"),
+        max_speed: num("player_max_speed"),
         acceleration: num("player_acceleration"),
-        keep_momentum: num("player_keep_momentum"),
         friction: num("player_friction"),
       },
       npc: {
-        wait_min: int("npc_wait_min"),
-        wait_max: Math.max(int("npc_wait_max"), int("npc_wait_min")),
-        move_distance: int("npc_move_distance"),
+        hold_min: int("npc_hold_min"),
+        hold_max: Math.max(int("npc_hold_max"), int("npc_hold_min")),
         symbol: document.getElementById("npc_symbol").value || "N",
       },
     };
-  }
-
-  function setVal(id, v) {
-    document.getElementById(id).value = v;
-  }
-  function num(id) {
-    return parseFloat(document.getElementById(id).value);
-  }
-  function int(id) {
-    return parseInt(document.getElementById(id).value, 10);
-  }
-
-  // -----------------------------------------------------------------------
-  // <output> display sync
-  // -----------------------------------------------------------------------
-
-  function syncAllOutputs() {
-    for (const input of document.querySelectorAll("input[type=range]")) {
-      const out = document.querySelector(`output[for="${input.id}"]`);
-      if (out) out.textContent = input.value;
-    }
   }
 
   // -----------------------------------------------------------------------
@@ -125,9 +124,23 @@
   // Events
   // -----------------------------------------------------------------------
 
-  // Every slider/input change → debounced POST.
-  document.getElementById("config-app").addEventListener("input", (e) => {
-    syncAllOutputs();
+  const app = document.getElementById("config-app");
+
+  // Slider change → sync number input, then POST.
+  app.addEventListener("input", (e) => {
+    const target = e.target;
+
+    if (target.type === "range") {
+      // Slider moved → update paired number input.
+      const numInput = document.querySelector(`.num-input[data-for="${target.id}"]`);
+      if (numInput) numInput.value = target.value;
+    } else if (target.classList.contains("num-input")) {
+      // Number typed → update paired slider (slider clamps naturally).
+      const sliderId = target.dataset.for;
+      const slider = document.getElementById(sliderId);
+      if (slider) slider.value = target.value;
+    }
+
     scheduleApply();
   });
 
