@@ -116,8 +116,17 @@ Walk onto `T` to win.
   Docker (the container has no GUI). Copy the URL from the terminal and
   paste it into your browser manually.
 - **Keys don't do anything** — click on the game tab once to give it focus.
-- **Server won't exit** — `Ctrl-C` in the terminal. If it's stuck:
-  `docker kill brownshock-dev` from another terminal.
+- **How to stop the server** — `Ctrl-C` in the terminal where it's running.
+  It should exit instantly (we cancel in-flight WebSockets on Ctrl-C, not
+  drain them).
+- **Ctrl-C didn't work / terminal frozen** — open a **second** terminal on
+  your host and run either of these; both are safe:
+  ```
+  docker kill brownshock-dev
+  docker compose down
+  ```
+  `docker kill` sends SIGKILL to the container (instant). `compose down`
+  stops + removes the container (slightly slower but cleans up).
 - **Everything else** — see [`DEV.md`](./DEV.md) for detailed dev
   workflow (running tests, formatting, entering the container shell).
 

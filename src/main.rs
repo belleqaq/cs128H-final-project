@@ -126,16 +126,22 @@ async fn main() {
         eprintln!("[startup] open {url} in your browser manually");
     }
 
-    // Stop on Ctrl+C.
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        println!("\nShutting down.");
-    };
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .expect("server error");
+    // Race the server against Ctrl-C. We deliberately do NOT use
+    // `with_graceful_shutdown` here: that semantic waits for every open
+    // connection to drain, and WebSockets are long-lived, so Ctrl-C would
+    // appear to "hang". With select!, as soon as ctrl_c fires we return
+    // from main, the tokio runtime drops, and every task (WS sessions,
+    // game loop) is cancelled immediately.
+    tokio::select! {
+        res = axum::serve(listener, app) => {
+            if let Err(e) = res {
+                eprintln!("[server] exited with error: {e}");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nCtrl-C received — stopping.");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
