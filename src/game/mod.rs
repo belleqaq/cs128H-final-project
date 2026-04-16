@@ -21,11 +21,6 @@ pub use state::State;
 pub const WIDTH: i32 = 80;
 pub const HEIGHT: i32 = 22;
 
-/// Baseline tick interval the NPC difficulty is calibrated against.
-/// When the user changes `tick_ms` in config.toml, NPC wait values are
-/// scaled by `BASELINE_TICK_MS / tick_ms` so real-time pacing is stable.
-pub const BASELINE_TICK_MS: u64 = 150;
-
 /// Threshold under which |velocity| is snapped to zero (prevents endless
 /// floating-point trickle below 1/tile/tick motion).
 pub const SPEED_EPSILON: f32 = 0.01;
