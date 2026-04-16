@@ -42,24 +42,31 @@ impl Default for GameConfig {
 #[derive(Deserialize)]
 #[serde(default)]
 struct PlayerSettings {
+    /// Maximum horizontal speed, in TILES PER TICK. Hard cap 1.0.
     speed: f32,
+    /// Acceleration per tick (tiles/tick² in tick-world terms).
     acceleration: f32,
+    /// Speed retained on direction change. 0=full stop, 1=no loss.
     keep_momentum: f32,
+    /// Per-tick friction multiplier (0=instant stop, 1=no friction).
     friction: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            speed: 10.0,
-            acceleration: 50.0,
+            speed: 1.0,
+            acceleration: 0.3,
             keep_momentum: 1.0,
-            friction: 0.85,
+            friction: 0.6,
         }
     }
 }
 
 impl PlayerSettings {
+    fn clamped_speed(&self) -> f32 {
+        self.speed.clamp(0.0, 1.0)
+    }
     fn clamped_keep_momentum(&self) -> f32 {
         self.keep_momentum.clamp(0.0, 1.0)
     }
@@ -106,11 +113,23 @@ fn load_config() -> GameConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Map constants
+// Constants
 // ---------------------------------------------------------------------------
 
 const WIDTH: i32 = 80;
 const HEIGHT: i32 = 22;
+
+/// How long after the last key event we consider a key released (fallback for
+/// terminals that don't support the Kitty keyboard protocol).
+const HOLD_TIMEOUT_MS: u128 = 80;
+
+/// Speed threshold (tiles/tick) below which we snap to zero during friction.
+const SPEED_EPSILON: f32 = 0.01;
+
+/// Reference tick rate that NPC wait_min/wait_max are calibrated against.
+/// If the user changes tick_ms away from this, NPC waits scale automatically
+/// so real-time NPC behavior stays consistent.
+const BASELINE_TICK_MS: u64 = 150;
 
 // ---------------------------------------------------------------------------
 // Tiles
@@ -121,10 +140,18 @@ enum Tile {
     Floor,
     Wall,
     Goal,
+    /// Stand on this tile and press W to go up one cell.
+    StairUp,
+    /// Stand on this tile and press S to go down one cell.
+    StairDown,
 }
 
 fn idx(x: i32, y: i32) -> usize {
     (y * WIDTH + x) as usize
+}
+
+fn is_walkable(t: Tile) -> bool {
+    matches!(t, Tile::Floor | Tile::Goal | Tile::StairUp | Tile::StairDown)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,8 +162,6 @@ fn dir_magnitude(d: (i32, i32)) -> f32 {
     ((d.0 * d.0 + d.1 * d.1) as f32).sqrt()
 }
 
-/// Normalized dot product between two direction vectors. Returns 0.0 if
-/// either vector has zero magnitude (shouldn't happen for valid directions).
 fn dir_dot_normalized(a: (i32, i32), b: (i32, i32)) -> f32 {
     let ma = dir_magnitude(a);
     let mb = dir_magnitude(b);
@@ -147,9 +172,7 @@ fn dir_dot_normalized(a: (i32, i32), b: (i32, i32)) -> f32 {
     (dot / (ma * mb)).clamp(-1.0, 1.0)
 }
 
-/// Calculate speed retention when changing from `old` to `new` direction.
-///   dot_factor = (dot(old, new) + 1) / 2          → 0..1
-///   retention  = dot_factor + km × (1 - dot_factor)
+/// Speed retention when changing from `old` to `new` direction.
 fn direction_retention(old: (i32, i32), new: (i32, i32), keep_momentum: f32) -> f32 {
     let dot = dir_dot_normalized(old, new);
     let dot_factor = (dot + 1.0) / 2.0;
@@ -157,7 +180,7 @@ fn direction_retention(old: (i32, i32), new: (i32, i32), keep_momentum: f32) -> 
 }
 
 // ---------------------------------------------------------------------------
-// NPC runtime state
+// NPC
 // ---------------------------------------------------------------------------
 
 struct Npc {
@@ -171,8 +194,15 @@ struct Npc {
 }
 
 impl Npc {
-    fn from_settings(pos: (i32, i32), s: &NpcSettings) -> Self {
-        let range = (s.wait_min, s.wait_max.max(s.wait_min));
+    fn from_settings(pos: (i32, i32), s: &NpcSettings, tick_ms: u64) -> Self {
+        // Auto-scale wait values so real-time NPC behavior stays consistent
+        // when the user changes tick_ms. Config is calibrated at BASELINE_TICK_MS.
+        let scale = BASELINE_TICK_MS as f32 / tick_ms.max(1) as f32;
+        let min_scaled = ((s.wait_min as f32) * scale).ceil() as u32;
+        let max_scaled = ((s.wait_max as f32) * scale).ceil() as u32;
+        let wait_min = min_scaled.max(1);
+        let wait_max = max_scaled.max(wait_min);
+        let range = (wait_min, wait_max);
         let ticks = fastrand::u32(range.0..=range.1);
         let dir = if fastrand::bool() { 1 } else { -1 };
         Self {
@@ -193,7 +223,7 @@ impl Npc {
         }
         for _ in 0..self.move_distance {
             let nx = self.pos.0 + self.direction;
-            if nx <= 0 || nx >= WIDTH - 1 || map[idx(nx, self.pos.1)] == Tile::Wall {
+            if nx <= 0 || nx >= WIDTH - 1 || !is_walkable(map[idx(nx, self.pos.1)]) {
                 self.direction = -self.direction;
                 break;
             }
@@ -203,6 +233,110 @@ impl Npc {
         if fastrand::bool() {
             self.direction = -self.direction;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input: two kinds of keys
+//   - Hold keys (A/D): tracked continuously with press/release/timeout.
+//   - Edge keys (W/S): latch on first press, trigger once, need release or
+//     timeout before they can trigger again.
+// ---------------------------------------------------------------------------
+
+struct HoldKey {
+    pressed: bool,
+    last_event: Instant,
+}
+
+impl HoldKey {
+    fn new() -> Self {
+        Self {
+            pressed: false,
+            last_event: Instant::now(),
+        }
+    }
+    fn press(&mut self) {
+        self.pressed = true;
+        self.last_event = Instant::now();
+    }
+    fn release(&mut self) {
+        self.pressed = false;
+    }
+    fn timeout_check(&mut self) {
+        if self.pressed && self.last_event.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+            self.pressed = false;
+        }
+    }
+}
+
+struct EdgeKey {
+    latched: bool,
+    last_event: Instant,
+}
+
+impl EdgeKey {
+    fn new() -> Self {
+        Self {
+            latched: false,
+            last_event: Instant::now(),
+        }
+    }
+    /// Returns true if this is a fresh press (rising edge).
+    fn press(&mut self) -> bool {
+        self.last_event = Instant::now();
+        if !self.latched {
+            self.latched = true;
+            true
+        } else {
+            false
+        }
+    }
+    fn release(&mut self) {
+        self.latched = false;
+    }
+    fn timeout_check(&mut self) {
+        if self.latched && self.last_event.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+            self.latched = false;
+        }
+    }
+}
+
+struct Keys {
+    left: HoldKey,
+    right: HoldKey,
+    w: EdgeKey,
+    s: EdgeKey,
+}
+
+impl Keys {
+    fn new() -> Self {
+        Self {
+            left: HoldKey::new(),
+            right: HoldKey::new(),
+            w: EdgeKey::new(),
+            s: EdgeKey::new(),
+        }
+    }
+    fn timeout_check_all(&mut self) {
+        self.left.timeout_check();
+        self.right.timeout_check();
+        self.w.timeout_check();
+        self.s.timeout_check();
+    }
+    /// Refresh timestamps of pressed L/R keys so A+D clash doesn't timeout
+    /// the "other" key while OS only sends repeat for the latest one.
+    fn refresh_pressed_holds(&mut self) {
+        let now = Instant::now();
+        if self.left.pressed {
+            self.left.last_event = now;
+        }
+        if self.right.pressed {
+            self.right.last_event = now;
+        }
+    }
+    /// Net horizontal direction (SOCD neutral: A+D cancels to 0).
+    fn net_horizontal(&self) -> i32 {
+        self.right.pressed as i32 - self.left.pressed as i32
     }
 }
 
@@ -217,120 +351,19 @@ enum Phase {
     Lose,
 }
 
-/// How long after the last key event we consider a key released (fallback for
-/// terminals that don't support the Kitty keyboard protocol).
-const HOLD_TIMEOUT_MS: u128 = 500;
-
-/// Per-frame speed threshold below which we snap to zero.
-const SPEED_EPSILON: f32 = 0.1;
-
-// ---------------------------------------------------------------------------
-// Independent key-state tracking (SOCD-ready)
-// ---------------------------------------------------------------------------
-
-struct KeyState {
-    pressed: bool,
-    last_press: Instant,
-}
-
-impl KeyState {
-    fn new() -> Self {
-        Self {
-            pressed: false,
-            last_press: Instant::now(),
-        }
-    }
-    fn press(&mut self) {
-        self.pressed = true;
-        self.last_press = Instant::now();
-    }
-    fn release(&mut self) {
-        self.pressed = false;
-    }
-    /// Timeout-based release for terminals without Release events.
-    fn timeout_check(&mut self) {
-        if self.pressed && self.last_press.elapsed().as_millis() > HOLD_TIMEOUT_MS {
-            self.pressed = false;
-        }
-    }
-}
-
-/// Which axis was most recently pressed. Used to resolve W+D into a single
-/// cardinal direction (no diagonals for now).
-#[derive(Clone, Copy, PartialEq)]
-enum Axis { X, Y }
-
-struct Keys {
-    up: KeyState,
-    down: KeyState,
-    left: KeyState,
-    right: KeyState,
-    last_axis: Axis,
-}
-
-impl Keys {
-    fn new() -> Self {
-        Self {
-            up: KeyState::new(),
-            down: KeyState::new(),
-            left: KeyState::new(),
-            right: KeyState::new(),
-            last_axis: Axis::X,
-        }
-    }
-    /// Refresh the timestamp of every currently-pressed key. Call this on any
-    /// direction key event so that during a D+A clash the "other" key doesn't
-    /// timeout while the OS only sends repeat events for the latest key.
-    fn refresh_all_pressed(&mut self) {
-        let now = Instant::now();
-        if self.up.pressed    { self.up.last_press = now; }
-        if self.down.pressed  { self.down.last_press = now; }
-        if self.left.pressed  { self.left.last_press = now; }
-        if self.right.pressed { self.right.last_press = now; }
-    }
-    /// Run timeout check on all four keys (fallback release detection).
-    fn timeout_check_all(&mut self) {
-        self.up.timeout_check();
-        self.down.timeout_check();
-        self.left.timeout_check();
-        self.right.timeout_check();
-    }
-    /// Synthesize net direction from currently-held keys (SOCD neutral).
-    /// When both axes are active, the most recently pressed axis wins
-    /// (no diagonal movement).
-    fn net_direction(&self) -> (i32, i32) {
-        let dx = self.right.pressed as i32 - self.left.pressed as i32;
-        let dy = self.down.pressed as i32 - self.up.pressed as i32;
-        if dx != 0 && dy != 0 {
-            // Resolve to single axis based on which was pressed last.
-            match self.last_axis {
-                Axis::X => (dx, 0),
-                Axis::Y => (0, dy),
-            }
-        } else {
-            (dx, dy)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Game state
-// ---------------------------------------------------------------------------
-
 struct State {
     map: Vec<Tile>,
     player: (i32, i32),
     npcs: Vec<Npc>,
     phase: Phase,
     quit: bool,
-    // Input: per-key tracking.
+    // Input
     keys: Keys,
-    // Movement: acceleration + friction + accumulator.
+    // Horizontal movement model (tick-based).
     prev_direction: (i32, i32),
     current_speed: f32,
     move_accumulator: f32,
-    last_frame: Instant,
-    // Config cache.
+    // Config cache
     max_speed: f32,
     acceleration: f32,
     keep_momentum: f32,
@@ -349,8 +382,15 @@ impl State {
             map[idx(WIDTH - 1, y)] = Tile::Wall;
         }
         map[idx(WIDTH - 3, 2)] = Tile::Goal;
+        // Test stairs near the player start (player: (2, HEIGHT-3)).
+        map[idx(5, HEIGHT - 3)] = Tile::StairUp;
+        map[idx(7, HEIGHT - 4)] = Tile::StairDown;
 
-        let npcs = vec![Npc::from_settings((WIDTH / 2, HEIGHT / 2), &config.npc)];
+        let npcs = vec![Npc::from_settings(
+            (WIDTH / 2, HEIGHT / 2),
+            &config.npc,
+            config.tick_ms,
+        )];
 
         Self {
             map,
@@ -362,28 +402,41 @@ impl State {
             prev_direction: (0, 0),
             current_speed: 0.0,
             move_accumulator: 0.0,
-            last_frame: Instant::now(),
-            max_speed: config.player.speed.max(1.0),
+            max_speed: config.player.clamped_speed(),
             acceleration: config.player.acceleration.max(0.0),
             keep_momentum: config.player.clamped_keep_momentum(),
             friction: config.player.clamped_friction(),
         }
     }
 
-    fn try_move(&mut self, dx: i32, dy: i32) {
-        let nx = self.player.0 + dx;
-        let ny = self.player.1 + dy;
+    fn try_move_to(&mut self, nx: i32, ny: i32) {
         if nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT {
             return;
         }
         match self.map[idx(nx, ny)] {
             Tile::Wall => {}
-            Tile::Floor => self.player = (nx, ny),
             Tile::Goal => {
                 self.player = (nx, ny);
                 self.phase = Phase::Win;
             }
+            Tile::Floor | Tile::StairUp | Tile::StairDown => {
+                self.player = (nx, ny);
+            }
         }
+    }
+
+    /// W on StairUp or S on StairDown triggers a single vertical step.
+    fn try_stair_move(&mut self, dy: i32) {
+        let here = self.map[idx(self.player.0, self.player.1)];
+        let allowed = match (here, dy) {
+            (Tile::StairUp, -1) => true,
+            (Tile::StairDown, 1) => true,
+            _ => false,
+        };
+        if !allowed {
+            return;
+        }
+        self.try_move_to(self.player.0, self.player.1 + dy);
     }
 
     /// Handle a key event. `kind` distinguishes Press/Release/Repeat.
@@ -397,34 +450,42 @@ impl State {
 
         match self.phase {
             Phase::Playing => {
-                // Map key → per-key state update.
-                let is_direction = matches!(
-                    code,
-                    KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                    | KeyCode::Char('w') | KeyCode::Char('a')
-                    | KeyCode::Char('s') | KeyCode::Char('d')
-                );
                 match code {
-                    KeyCode::Up | KeyCode::Char('w') => {
-                        if is_release { self.keys.up.release(); } else { self.keys.up.press(); self.keys.last_axis = Axis::Y; }
-                    }
-                    KeyCode::Down | KeyCode::Char('s') => {
-                        if is_release { self.keys.down.release(); } else { self.keys.down.press(); self.keys.last_axis = Axis::Y; }
-                    }
                     KeyCode::Left | KeyCode::Char('a') => {
-                        if is_release { self.keys.left.release(); } else { self.keys.left.press(); self.keys.last_axis = Axis::X; }
+                        if is_release {
+                            self.keys.left.release();
+                        } else {
+                            self.keys.left.press();
+                            self.keys.refresh_pressed_holds();
+                        }
                     }
                     KeyCode::Right | KeyCode::Char('d') => {
-                        if is_release { self.keys.right.release(); } else { self.keys.right.press(); self.keys.last_axis = Axis::X; }
+                        if is_release {
+                            self.keys.right.release();
+                        } else {
+                            self.keys.right.press();
+                            self.keys.refresh_pressed_holds();
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('w') => {
+                        if is_release {
+                            self.keys.w.release();
+                        } else if self.keys.w.press() {
+                            // Rising edge → try to go up via stair.
+                            self.try_stair_move(-1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('s') => {
+                        if is_release {
+                            self.keys.s.release();
+                        } else if self.keys.s.press() {
+                            // Rising edge → try to go down via stair.
+                            self.try_stair_move(1);
+                        }
                     }
                     KeyCode::Char('q') if !is_release => self.phase = Phase::Lose,
                     KeyCode::Esc if !is_release => self.quit = true,
                     _ => {}
-                }
-                // Keep all pressed keys alive so the "other" key in a
-                // D+A clash doesn't timeout from lack of OS repeat events.
-                if is_direction && !is_release {
-                    self.keys.refresh_all_pressed();
                 }
             }
             Phase::Win | Phase::Lose => {
@@ -439,21 +500,19 @@ impl State {
         }
     }
 
-    /// Called every frame. Synthesizes direction from keys, applies
-    /// acceleration/friction, accumulates fractional tiles, executes moves.
-    fn update_movement(&mut self) {
+    /// Called once per world tick. Handles key timeouts, horizontal
+    /// acceleration/friction, accumulator, and at most one tile of movement.
+    fn on_player_tick(&mut self) {
         if self.phase != Phase::Playing {
             return;
         }
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f32();
-        self.last_frame = now;
 
-        // Timeout-based release fallback.
+        // Timeout-based release fallback for all keys.
         self.keys.timeout_check_all();
 
-        // Synthesize net direction via SOCD neutral.
-        let dir = self.keys.net_direction();
+        // Horizontal direction only (W/S do not drive continuous movement).
+        let dx = self.keys.net_horizontal();
+        let dir = (dx, 0);
         let has_dir = dir != (0, 0);
 
         // Direction change → dot-product momentum retention.
@@ -463,18 +522,13 @@ impl State {
         }
 
         if has_dir {
-            // Accelerate toward max speed.
-            self.current_speed =
-                (self.current_speed + self.acceleration * dt).min(self.max_speed);
+            // Accelerate toward max speed (both in tiles/tick units).
+            self.current_speed = (self.current_speed + self.acceleration).min(self.max_speed);
             self.prev_direction = dir;
         } else {
-            // Friction deceleration: exponential decay each frame.
-            // friction^(1/fps) per frame — we raise to a power proportional
-            // to dt so it's frame-rate independent.
+            // Friction: per-tick exponential decay.
             if self.current_speed > SPEED_EPSILON {
-                // friction is per-tick at 60fps baseline; we use pow(friction, dt*60)
-                // to keep feel consistent across frame rates.
-                self.current_speed *= self.friction.powf(dt * 60.0);
+                self.current_speed *= self.friction;
                 if self.current_speed < SPEED_EPSILON {
                     self.current_speed = 0.0;
                     self.move_accumulator = 0.0;
@@ -485,15 +539,17 @@ impl State {
             }
         }
 
-        self.move_accumulator += self.current_speed * dt;
+        // Accumulate one tick's worth of movement. Capped at 1 tile per tick
+        // because max_speed ≤ 1.0 and we add at most max_speed per tick.
+        self.move_accumulator += self.current_speed;
         let move_dir = if has_dir { dir } else { self.prev_direction };
-        while self.move_accumulator >= 1.0 {
-            self.try_move(move_dir.0, move_dir.1);
+        if self.move_accumulator >= 1.0 {
+            self.try_move_to(self.player.0 + move_dir.0, self.player.1 + move_dir.1);
             self.move_accumulator -= 1.0;
         }
     }
 
-    /// Advance world by one tick (NPCs only; player moves via update_movement).
+    /// World tick: advance NPCs.
     fn tick(&mut self) {
         if self.phase != Phase::Playing {
             return;
@@ -516,6 +572,8 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
                 Tile::Wall => ('#', Color::Grey),
                 Tile::Floor => ('.', Color::DarkGrey),
                 Tile::Goal => ('T', Color::Yellow),
+                Tile::StairUp => ('^', Color::Yellow),
+                Tile::StairDown => ('v', Color::Yellow),
             };
             queue!(
                 w,
@@ -541,7 +599,7 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
     )?;
 
     let msg = match state.phase {
-        Phase::Playing => "Arrows/WASD: move | Q: lose | Esc: quit",
+        Phase::Playing => "A/D: move | W/S: stairs (on ^/v) | Q: lose | Esc: quit",
         Phase::Win => "YOU WIN! R: restart | Esc: quit",
         Phase::Lose => "YOU LOSE. R: restart | Esc: quit",
     };
@@ -555,8 +613,7 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
 
 fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
     // Try to enable keyboard enhancement (Kitty protocol) for real Release events.
-    // If the terminal doesn't support it, this silently fails and we fall back
-    // to timeout-based release detection.
+    // Silently fails on unsupported terminals; we fall back to timeout.
     let _ = execute!(
         w,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
@@ -576,10 +633,9 @@ fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
                 state.input(k.code, k.modifiers, k.kind, config);
             }
         }
-        // Player movement: acceleration + friction + accumulator, every frame.
-        state.update_movement();
-        // World tick: NPCs advance on fixed timer.
+        // World tick: player physics + NPCs both advance on tick.
         if last_tick.elapsed() >= tick_duration {
+            state.on_player_tick();
             state.tick();
             last_tick = Instant::now();
         }

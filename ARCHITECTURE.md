@@ -3,7 +3,7 @@
 Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
-Last synced with code: SOCD input + friction deceleration
+Last synced with code: tick-locked movement + Stair tiles + NPC auto-scaling
 
 ---
 
@@ -20,6 +20,32 @@ docker-compose.yml — bind-mount + cargo cache volumes
 
 ---
 
+## Movement model (tick-locked)
+
+The player moves in a **tick-locked** model: every `tick_ms` milliseconds
+the world advances exactly one step. Within a single tick the player can
+move **at most one tile**. Slower speeds simply take multiple ticks to
+cross a single tile.
+
+- `speed` is in tiles/tick, hard-capped at 1.0.
+- `acceleration` is tiles/tick added per tick while a direction is held.
+- `friction` is a per-tick multiplier applied when no direction is held
+  (or when A+D cancel out SOCD-style).
+- Each tick: an internal accumulator grows by `current_speed`. When it
+  reaches ≥1.0 the player steps one tile and the accumulator wraps down.
+
+### Input split
+
+- **A/D** (left/right) are *hold keys*: continuous movement, SOCD neutral
+  (both held ⇒ no direction), with friction and momentum physics.
+- **W/S** (up/down) are *edge-triggered*: one press = one attempted
+  move, and the move only succeeds on the correct stair tile
+  (`^` for up, `v` for down). No accel/friction/momentum on W/S.
+- There is currently **no diagonal movement**. Vertical movement exists
+  only as stair transitions (and in the future, jumps).
+
+---
+
 ## Truth tree: tunable parameters
 
 ```
@@ -27,23 +53,26 @@ Brownshock
 ├── config.toml (player-facing, no code knowledge needed)
 │   ├── tick_ms:       u64 = 150        ← world tick interval (ms)
 │   ├── [player]
-│   │   ├── speed:          f32 = 10.0  ← max tiles per second
-│   │   ├── acceleration:   f32 = 50.0  ← tiles/sec² ramp-up rate
-│   │   ├── keep_momentum:  f32 = 1.0   ← 0–1 slider: speed kept on direction change
+│   │   ├── speed:          f32 = 1.0   ← max tiles per TICK (hard-capped at 1.0)
+│   │   ├── acceleration:   f32 = 0.3   ← tiles/tick added per tick while holding
+│   │   ├── keep_momentum:  f32 = 1.0   ← 0–1 slider: speed kept on L/R flip
 │   │   │   (uses dot-product weighting: sharper turns lose more speed)
-│   │   └── friction:       f32 = 0.85  ← per-frame decay when no direction held
-│   │       (exponential: 1.0=infinite slide, 0.0=instant stop)
+│   │   └── friction:       f32 = 0.6   ← per-tick decay when no direction held
+│   │       (1.0=infinite slide, 0.0=instant stop)
 │   └── [npc]
-│       ├── wait_min:      u32 = 1      ← min ticks between moves
-│       ├── wait_max:      u32 = 10     ← max ticks between moves
+│       ├── wait_min:      u32 = 1      ← min ticks between moves (at baseline)
+│       ├── wait_max:      u32 = 10     ← max ticks between moves (at baseline)
 │       ├── move_distance: i32 = 1      ← tiles per activation
 │       └── symbol:        str = "N"    ← render character
+│       (wait_min / wait_max are auto-scaled by BASELINE_TICK_MS / tick_ms
+│        so NPC real-time pacing stays roughly constant when tick_ms changes)
 │
 ├── Code-only constants (src/main.rs, top of file)
-│   ├── WIDTH:          i32 = 80    ← map columns
-│   ├── HEIGHT:         i32 = 22    ← map rows
-│   ├── HOLD_TIMEOUT_MS: u128 = 500 ← key release fallback (ms)
-│   └── SPEED_EPSILON:  f32 = 0.1   ← snap-to-zero threshold
+│   ├── WIDTH:            i32 = 80     ← map columns
+│   ├── HEIGHT:           i32 = 22     ← map rows
+│   ├── HOLD_TIMEOUT_MS:  u128 = 80    ← key-release fallback (ms)
+│   ├── SPEED_EPSILON:    f32 = 0.01   ← snap-to-zero threshold
+│   └── BASELINE_TICK_MS: u64 = 150    ← reference tick rate for NPC scaling
 │
 ├── Npc runtime fields (populated from config.toml + hardcoded)
 │   ├── color:         Color = Blue     ← render colour (code-only)
@@ -56,7 +85,8 @@ Brownshock
 │   ├── Floor
 │   ├── Wall
 │   ├── Goal
-│   ├── [planned] Stair    ← triggers floor transition
+│   ├── StairUp      ← '^', W on this tile moves player one row up
+│   ├── StairDown    ← 'v', S on this tile moves player one row down
 │   └── [planned] Toilet   ← triggers QTE minigame
 │
 ├── Phase (enum, src/main.rs)
@@ -98,6 +128,10 @@ Brownshock
    State.tick() + render()**.
 4. **Changing a default value** is always safe — no other code depends on
    the specific number, only on the type.
+5. **Tick-based vs real-time units**: all player physics are in tiles/tick
+   now. If you add a new config knob that should feel the same at any
+   `tick_ms`, either express it in ticks or scale it against
+   `BASELINE_TICK_MS` like the NPC wait values do.
 
 ---
 

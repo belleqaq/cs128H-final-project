@@ -17,75 +17,77 @@
 
 
 # ---- Game Speed --------------------------------------------
-# How many milliseconds between each game step.
-#   Lower = faster game.    Higher = slower game.
-#   Try:  50 (hectic)  150 (normal)  400 (chill)
+# How many milliseconds between each game "tick".
+# A tick is one step of the world: the player may move,
+# the NPC may move, and the screen redraws.
+#
+#   Lower = faster game.   Higher = slower game.
+#   Try:  50 (hectic)   150 (normal)   400 (chill)
+#
+# Note: the NPC's wait times (below) are auto-scaled to keep
+# real-time behaviour roughly the same when you change this.
 tick_ms = 150
 
 
 # ---- Player (@) --------------------------------------------
 [player]
 
-# Your max movement speed, in tiles per second.
-#   5  = slow and careful
-#   10 = normal
-#   20 = very fast
-speed = 10
+# Maximum movement speed, in TILES PER TICK.
+# The game caps this at 1.0 — no matter what you put here,
+# the player never moves more than one tile per tick.
+#   1.0 = one tile every tick (fastest)
+#   0.5 = one tile every 2 ticks
+#   0.25 = one tile every 4 ticks (slow, stealthy)
+speed = 1.0
 
-# How quickly you reach max speed when you start moving,
-# in tiles per second per second.
-#   Big number  (e.g. 100) = almost instant, snappy controls
-#   Small number (e.g. 10) = slow ramp-up, feels heavy / icy
-#   Try: 50 (normal)  20 (sluggish)  200 (instant)
-acceleration = 50
+# How much speed is gained each tick while holding a direction.
+# Units: tiles-per-tick added per tick (up to the speed cap).
+#   0.3  = ramp up over ~3 ticks (normal)
+#   1.0  = reach top speed instantly
+#   0.1  = sluggish, takes ~10 ticks to reach top speed
+acceleration = 0.3
 
-# How much speed you keep when you change direction.
+# How much speed you keep when you flip direction (A -> D or D -> A).
 # This is a slider from 0 to 1.
 #
-#   0.0 = full stop when turning (heavy, strategic gameplay)
-#         - 180° turn: lose ALL speed
-#         -  90° turn: lose HALF speed
+#   0.0 = full stop on turn (heavy, strategic)
+#   0.5 = keep half speed
+#   1.0 = never lose speed on turn (fluid, slippery)
 #
-#   0.5 = keep some speed (balanced)
-#         - 180° turn: keep half
-#         -  90° turn: keep 75%
-#
-#   1.0 = never lose speed (fluid, fast gameplay)
-#         - any turn: keep ALL speed
-#
-# The game uses the angle between your old and new direction
-# to decide exactly how much speed to keep. Sharper turns
-# lose more speed (unless this is set to 1.0).
-keep_momentum = 0
+# Only affects left/right turns. There is no diagonal movement.
+keep_momentum = 1.0
 
-# How quickly you slow down when you let go of a direction,
-# or when two opposing keys cancel each other out (e.g. A+D).
-# This is a multiplier applied every frame:
+# Per-tick friction multiplier applied when no direction is held
+# (or when A and D cancel each other out, SOCD style).
 #
-#   1.0  = never slow down (infinite slide, no friction)
-#   0.95 = slow, icy stop (long slide)
-#   0.85 = normal, smooth stop
-#   0.5  = very quick stop
-#   0.0  = instant stop (no slide at all)
+#   1.0  = infinite slide, never slows down
+#   0.8  = long slide, icy
+#   0.6  = normal, noticeable slide (default)
+#   0.3  = very quick stop
+#   0.0  = instant stop, no slide at all
 #
-# Try: 0.85 (normal)  0.95 (ice)  0.7 (snappy)
-friction = 0.85
+# Each tick with no input, current_speed *= friction.
+friction = 0.6
 
 
 # ---- NPC (the blue "N" that walks around) ------------------
 [npc]
 
-# Random wait before each move (in game steps).
-# The NPC rolls a random number between wait_min and wait_max.
-# That number = how many steps it stands still before moving.
+# Random wait (in ticks) before each NPC move. The NPC rolls
+# a number between wait_min and wait_max and stands still for
+# that many ticks before stepping.
 #   Small numbers = NPC moves often (harder).
 #   Big numbers   = NPC moves rarely (easier).
+#
+# These are given at the baseline tick rate (tick_ms = 150).
+# If you change tick_ms, the game auto-scales these values so
+# the NPC still moves at about the same real-time pace.
 wait_min = 1
 wait_max = 10
 
 # How many tiles the NPC jumps per move.
-#   1 = walks one tile at a time (normal).
-#   2 = jumps two tiles (harder to dodge).
+#   1 = one tile at a time (normal)
+#   2 = two-tile jumps (harder to dodge)
 move_distance = 1
 
 # What character represents the NPC on screen.
