@@ -3,7 +3,7 @@
 Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
-Last synced with code: acceleration + momentum model
+Last synced with code: SOCD input + friction deceleration
 
 ---
 
@@ -29,8 +29,10 @@ Brownshock
 │   ├── [player]
 │   │   ├── speed:          f32 = 10.0  ← max tiles per second
 │   │   ├── acceleration:   f32 = 50.0  ← tiles/sec² ramp-up rate
-│   │   └── keep_momentum:  f32 = 1.0   ← 0–1 slider: speed kept on direction change
-│   │       (uses dot-product weighting: sharper turns lose more speed)
+│   │   ├── keep_momentum:  f32 = 1.0   ← 0–1 slider: speed kept on direction change
+│   │   │   (uses dot-product weighting: sharper turns lose more speed)
+│   │   └── friction:       f32 = 0.85  ← per-frame decay when no direction held
+│   │       (exponential: 1.0=infinite slide, 0.0=instant stop)
 │   └── [npc]
 │       ├── wait_min:      u32 = 1      ← min ticks between moves
 │       ├── wait_max:      u32 = 10     ← max ticks between moves
@@ -38,8 +40,10 @@ Brownshock
 │       └── symbol:        str = "N"    ← render character
 │
 ├── Code-only constants (src/main.rs, top of file)
-│   ├── WIDTH:   i32 = 80         ← map columns
-│   └── HEIGHT:  i32 = 22         ← map rows
+│   ├── WIDTH:          i32 = 80    ← map columns
+│   ├── HEIGHT:         i32 = 22    ← map rows
+│   ├── HOLD_TIMEOUT_MS: u128 = 500 ← key release fallback (ms)
+│   └── SPEED_EPSILON:  f32 = 0.1   ← snap-to-zero threshold
 │
 ├── Npc runtime fields (populated from config.toml + hardcoded)
 │   ├── color:         Color = Blue     ← render colour (code-only)

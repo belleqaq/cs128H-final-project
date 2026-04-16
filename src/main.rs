@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{poll, read, Event, KeyCode, KeyModifiers},
+    event::{
+        poll, read, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{
@@ -42,6 +45,7 @@ struct PlayerSettings {
     speed: f32,
     acceleration: f32,
     keep_momentum: f32,
+    friction: f32,
 }
 
 impl Default for PlayerSettings {
@@ -50,6 +54,7 @@ impl Default for PlayerSettings {
             speed: 10.0,
             acceleration: 50.0,
             keep_momentum: 1.0,
+            friction: 0.85,
         }
     }
 }
@@ -57,6 +62,9 @@ impl Default for PlayerSettings {
 impl PlayerSettings {
     fn clamped_keep_momentum(&self) -> f32 {
         self.keep_momentum.clamp(0.0, 1.0)
+    }
+    fn clamped_friction(&self) -> f32 {
+        self.friction.clamp(0.0, 1.0)
     }
 }
 
@@ -209,8 +217,81 @@ enum Phase {
     Lose,
 }
 
-/// How long after the last key event we consider the direction released.
+/// How long after the last key event we consider a key released (fallback for
+/// terminals that don't support the Kitty keyboard protocol).
 const HOLD_TIMEOUT_MS: u128 = 500;
+
+/// Per-frame speed threshold below which we snap to zero.
+const SPEED_EPSILON: f32 = 0.1;
+
+/// SQRT_2 for diagonal speed normalization.
+const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+// ---------------------------------------------------------------------------
+// Independent key-state tracking (SOCD-ready)
+// ---------------------------------------------------------------------------
+
+struct KeyState {
+    pressed: bool,
+    last_press: Instant,
+}
+
+impl KeyState {
+    fn new() -> Self {
+        Self {
+            pressed: false,
+            last_press: Instant::now(),
+        }
+    }
+    fn press(&mut self) {
+        self.pressed = true;
+        self.last_press = Instant::now();
+    }
+    fn release(&mut self) {
+        self.pressed = false;
+    }
+    /// Timeout-based release for terminals without Release events.
+    fn timeout_check(&mut self) {
+        if self.pressed && self.last_press.elapsed().as_millis() > HOLD_TIMEOUT_MS {
+            self.pressed = false;
+        }
+    }
+}
+
+struct Keys {
+    up: KeyState,
+    down: KeyState,
+    left: KeyState,
+    right: KeyState,
+}
+
+impl Keys {
+    fn new() -> Self {
+        Self {
+            up: KeyState::new(),
+            down: KeyState::new(),
+            left: KeyState::new(),
+            right: KeyState::new(),
+        }
+    }
+    /// Run timeout check on all four keys (fallback release detection).
+    fn timeout_check_all(&mut self) {
+        self.up.timeout_check();
+        self.down.timeout_check();
+        self.left.timeout_check();
+        self.right.timeout_check();
+    }
+    /// Synthesize net direction from currently-held keys (SOCD neutral).
+    fn net_direction(&self) -> (i32, i32) {
+        let dx = self.right.pressed as i32 - self.left.pressed as i32;
+        let dy = self.down.pressed as i32 - self.up.pressed as i32;
+        (dx, dy)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
 
 struct State {
     map: Vec<Tile>,
@@ -218,16 +299,18 @@ struct State {
     npcs: Vec<Npc>,
     phase: Phase,
     quit: bool,
-    // Movement model: held-direction + acceleration + accumulator.
-    held_direction: Option<(i32, i32)>,
+    // Input: per-key tracking.
+    keys: Keys,
+    // Movement: acceleration + friction + accumulator.
+    prev_direction: (i32, i32),
     current_speed: f32,
     move_accumulator: f32,
-    last_key_time: Instant,
     last_frame: Instant,
     // Config cache.
     max_speed: f32,
     acceleration: f32,
     keep_momentum: f32,
+    friction: f32,
 }
 
 impl State {
@@ -251,14 +334,15 @@ impl State {
             npcs,
             phase: Phase::Playing,
             quit: false,
-            held_direction: None,
+            keys: Keys::new(),
+            prev_direction: (0, 0),
             current_speed: 0.0,
             move_accumulator: 0.0,
-            last_key_time: Instant::now(),
             last_frame: Instant::now(),
             max_speed: config.player.speed.max(1.0),
             acceleration: config.player.acceleration.max(0.0),
             keep_momentum: config.player.clamped_keep_momentum(),
+            friction: config.player.clamped_friction(),
         }
     }
 
@@ -278,47 +362,50 @@ impl State {
         }
     }
 
-    fn input(&mut self, code: KeyCode, mods: KeyModifiers, config: &GameConfig) {
+    /// Handle a key event. `kind` distinguishes Press/Release/Repeat.
+    fn input(&mut self, code: KeyCode, mods: KeyModifiers, kind: KeyEventKind, config: &GameConfig) {
         if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.quit = true;
             return;
         }
+
+        let is_release = kind == KeyEventKind::Release;
+
         match self.phase {
             Phase::Playing => {
-                let new_dir: Option<(i32, i32)> = match code {
-                    KeyCode::Up | KeyCode::Char('w') => Some((0, -1)),
-                    KeyCode::Down | KeyCode::Char('s') => Some((0, 1)),
-                    KeyCode::Left | KeyCode::Char('a') => Some((-1, 0)),
-                    KeyCode::Right | KeyCode::Char('d') => Some((1, 0)),
-                    _ => None,
-                };
-                if let Some(nd) = new_dir {
-                    // Apply dot-product momentum retention on direction change.
-                    if let Some(old) = self.held_direction {
-                        if old != nd {
-                            let retention = direction_retention(old, nd, self.keep_momentum);
-                            self.current_speed *= retention;
-                        }
+                // Map key → per-key state update.
+                match code {
+                    KeyCode::Up | KeyCode::Char('w') => {
+                        if is_release { self.keys.up.release(); } else { self.keys.up.press(); }
                     }
-                    self.held_direction = Some(nd);
-                    self.last_key_time = Instant::now();
-                } else {
+                    KeyCode::Down | KeyCode::Char('s') => {
+                        if is_release { self.keys.down.release(); } else { self.keys.down.press(); }
+                    }
+                    KeyCode::Left | KeyCode::Char('a') => {
+                        if is_release { self.keys.left.release(); } else { self.keys.left.press(); }
+                    }
+                    KeyCode::Right | KeyCode::Char('d') => {
+                        if is_release { self.keys.right.release(); } else { self.keys.right.press(); }
+                    }
+                    KeyCode::Char('q') if !is_release => self.phase = Phase::Lose,
+                    KeyCode::Esc if !is_release => self.quit = true,
+                    _ => {}
+                }
+            }
+            Phase::Win | Phase::Lose => {
+                if !is_release {
                     match code {
-                        KeyCode::Char('q') => self.phase = Phase::Lose,
-                        KeyCode::Esc => self.quit = true,
+                        KeyCode::Char('r') => *self = State::new(config),
+                        KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
                         _ => {}
                     }
                 }
             }
-            Phase::Win | Phase::Lose => match code {
-                KeyCode::Char('r') => *self = State::new(config),
-                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
-                _ => {}
-            },
         }
     }
 
-    /// Called every frame. Handles acceleration, accumulator, and tile moves.
+    /// Called every frame. Synthesizes direction from keys, applies
+    /// acceleration/friction, accumulates fractional tiles, executes moves.
     fn update_movement(&mut self) {
         if self.phase != Phase::Playing {
             return;
@@ -327,24 +414,53 @@ impl State {
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        // Key release detection via timeout.
-        if self.last_key_time.elapsed().as_millis() > HOLD_TIMEOUT_MS {
-            self.held_direction = None;
+        // Timeout-based release fallback.
+        self.keys.timeout_check_all();
+
+        // Synthesize net direction via SOCD neutral.
+        let dir = self.keys.net_direction();
+        let has_dir = dir != (0, 0);
+
+        // Direction change → dot-product momentum retention.
+        if has_dir && self.prev_direction != (0, 0) && dir != self.prev_direction {
+            let retention = direction_retention(self.prev_direction, dir, self.keep_momentum);
+            self.current_speed *= retention;
         }
 
-        if self.held_direction.is_some() {
+        if has_dir {
+            // Accelerate toward max speed.
             self.current_speed =
                 (self.current_speed + self.acceleration * dt).min(self.max_speed);
+            self.prev_direction = dir;
         } else {
-            self.current_speed = 0.0;
-            self.move_accumulator = 0.0;
+            // Friction deceleration: exponential decay each frame.
+            // friction^(1/fps) per frame — we raise to a power proportional
+            // to dt so it's frame-rate independent.
+            if self.current_speed > SPEED_EPSILON {
+                // friction is per-tick at 60fps baseline; we use pow(friction, dt*60)
+                // to keep feel consistent across frame rates.
+                self.current_speed *= self.friction.powf(dt * 60.0);
+                if self.current_speed < SPEED_EPSILON {
+                    self.current_speed = 0.0;
+                    self.move_accumulator = 0.0;
+                }
+            } else {
+                self.current_speed = 0.0;
+                self.move_accumulator = 0.0;
+            }
         }
 
-        self.move_accumulator += self.current_speed * dt;
+        // Diagonal speed normalization: divide by √2 so diagonal isn't faster.
+        let effective_speed = if has_dir && dir.0 != 0 && dir.1 != 0 {
+            self.current_speed * INV_SQRT2
+        } else {
+            self.current_speed
+        };
+
+        self.move_accumulator += effective_speed * dt;
+        let move_dir = if has_dir { dir } else { self.prev_direction };
         while self.move_accumulator >= 1.0 {
-            if let Some((dx, dy)) = self.held_direction {
-                self.try_move(dx, dy);
-            }
+            self.try_move(move_dir.0, move_dir.1);
             self.move_accumulator -= 1.0;
         }
     }
@@ -410,6 +526,14 @@ fn render<W: Write>(w: &mut W, state: &State) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
+    // Try to enable keyboard enhancement (Kitty protocol) for real Release events.
+    // If the terminal doesn't support it, this silently fails and we fall back
+    // to timeout-based release detection.
+    let _ = execute!(
+        w,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+    );
+
     let mut state = State::new(config);
     let tick_duration = Duration::from_millis(config.tick_ms);
     let mut last_tick = Instant::now();
@@ -421,10 +545,10 @@ fn game_loop<W: Write>(w: &mut W, config: &GameConfig) -> io::Result<()> {
         }
         if poll(Duration::from_millis(20))? {
             if let Event::Key(k) = read()? {
-                state.input(k.code, k.modifiers, config);
+                state.input(k.code, k.modifiers, k.kind, config);
             }
         }
-        // Player movement: acceleration + accumulator, every frame.
+        // Player movement: acceleration + friction + accumulator, every frame.
         state.update_movement();
         // World tick: NPCs advance on fixed timer.
         if last_tick.elapsed() >= tick_duration {
@@ -443,6 +567,7 @@ fn main() -> io::Result<()> {
 
     let result = game_loop(&mut out, &config);
 
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
     execute!(out, Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     result
