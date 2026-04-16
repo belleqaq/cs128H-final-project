@@ -21,6 +21,12 @@ pub use state::State;
 pub const WIDTH: i32 = 80;
 pub const HEIGHT: i32 = 22;
 
+/// Baseline tick duration that config values (friction, acceleration) are
+/// calibrated against.  At runtime, effective values are scaled by
+/// `tick_ms / BASELINE_TICK_MS` so physics behave the same regardless of
+/// the chosen tick rate.
+pub const BASELINE_TICK_MS: f32 = 150.0;
+
 /// Threshold under which |velocity| is snapped to zero (prevents endless
 /// floating-point trickle below 1/tile/tick motion).
 pub const SPEED_EPSILON: f32 = 0.01;

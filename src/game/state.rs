@@ -1,19 +1,19 @@
-//! Game state: map, player, NPCs, phase, and the tick-locked physics.
+//! Game state: map, player, NPCs, phase, and tick-independent physics.
 //!
 //! Physics model (shared by player and NPCs):
-//!   v = v * friction + acceleration * input
-//!   if |v| > max_speed: v = sign(v) * max_speed
+//!   v = v * eff_friction + eff_accel * input
+//!   clamp v to ±max_speed
 //!
-//! Friction applies EVERY tick (not just on release). This means holding a
-//! direction accelerates toward a natural equilibrium at
-//! `min(acceleration / (1 - friction), max_speed)`. Releasing decays
-//! velocity to 0 via friction alone.
+//! Config values are calibrated to BASELINE_TICK_MS (150 ms).  At runtime
+//! they are scaled so behaviour is the same regardless of tick_ms:
+//!   eff_friction = friction ^ (tick_ms / BASELINE_TICK_MS)
+//!   eff_accel    = acceleration × (tick_ms / BASELINE_TICK_MS)
 
 use serde::Serialize;
 
 use crate::game::config::{GameConfig, NpcSettings};
 use crate::game::tile::{idx, Tile};
-use crate::game::{HEIGHT, SPEED_EPSILON, WIDTH};
+use crate::game::{BASELINE_TICK_MS, HEIGHT, SPEED_EPSILON, WIDTH};
 
 // ---------------------------------------------------------------------------
 // NPC — "holds" a direction for random ticks, same physics as the player.
@@ -146,8 +146,9 @@ pub struct State {
     move_accumulator: f32,
     // Config cache — updated every tick via apply_config.
     max_speed: f32,
-    acceleration: f32,
-    friction: f32,
+    /// Effective per-tick values, scaled from config by tick_ms / BASELINE_TICK_MS.
+    eff_accel: f32,
+    eff_friction: f32,
 }
 
 impl State {
@@ -179,8 +180,8 @@ impl State {
             velocity: 0.0,
             move_accumulator: 0.0,
             max_speed: config.player.max_speed,
-            acceleration: config.player.acceleration,
-            friction: config.player.friction,
+            eff_accel: config.player.acceleration,
+            eff_friction: config.player.friction,
         }
     }
 
@@ -188,8 +189,9 @@ impl State {
 
     pub fn apply_config(&mut self, config: &GameConfig) {
         self.max_speed = config.player.max_speed;
-        self.acceleration = config.player.acceleration;
-        self.friction = config.player.friction;
+        let dt_ratio = config.tick_ms as f32 / BASELINE_TICK_MS;
+        self.eff_friction = config.player.friction.powf(dt_ratio);
+        self.eff_accel = config.player.acceleration * dt_ratio;
         for npc in &mut self.npcs {
             npc.apply_settings(&config.npc);
         }
@@ -239,8 +241,8 @@ impl State {
 
         let input = self.keys.net_horizontal() as f32;
 
-        // Both forces act every tick.
-        self.velocity = self.velocity * self.friction + self.acceleration * input;
+        // Both forces act every tick (values pre-scaled for tick independence).
+        self.velocity = self.velocity * self.eff_friction + self.eff_accel * input;
 
         // Dynamic equilibrium cap: at max_speed, the clamp effectively
         // reduces the acceleration contribution to exactly compensate
@@ -272,7 +274,7 @@ impl State {
             return;
         }
         for npc in &mut self.npcs {
-            npc.tick(&self.map, self.acceleration, self.friction, self.max_speed);
+            npc.tick(&self.map, self.eff_accel, self.eff_friction, self.max_speed);
         }
     }
 
