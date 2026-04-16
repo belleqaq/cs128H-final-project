@@ -81,6 +81,10 @@ just paste the URL manually.
 Click the browser tab once to give it keyboard focus, then play as usual.
 Press `Ctrl-C` in the terminal to stop the server.
 
+> **Contributors:** the full dev guide — incremental rebuild loop,
+> debugging with DevTools, running tests, adding tiles/inputs/config
+> knobs, nuke-and-reset — lives in [`DEV.md`](./DEV.md).
+
 ### Controls
 
 | Key | Action |
