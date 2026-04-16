@@ -34,10 +34,9 @@ docker compose version
 Both should print a version number. If not, reopen the terminal or restart
 Docker Desktop.
 
-> **Windows note:** use **Windows Terminal** (from Microsoft Store, free) or
-> the terminal inside VS Code, not the old Command Prompt or PowerShell
-> window. The game uses ANSI escape codes that legacy Windows consoles
-> render poorly.
+> **Note:** the game no longer runs in the terminal. `cargo run` starts a
+> tiny local web server and opens the game in your default browser. Any
+> modern browser works.
 
 ## Step 2 — Get the code (one-time)
 
@@ -64,17 +63,21 @@ changes).
 docker compose run --rm dev cargo run
 ```
 
-The first run compiles the code (~1–2 min). After that, the terminal
-switches to the game screen.
+The first run compiles the code (~1–2 min). When it's ready you'll see a
+line like `Brownshock listening on http://127.0.0.1:54321` and your default
+browser will open to that URL automatically. If it doesn't, copy the URL
+into the browser yourself.
+
+Click the browser tab once to give it keyboard focus, then play as usual.
+Press `Ctrl-C` in the terminal to stop the server.
 
 ### Controls
 
 | Key | Action |
 |---|---|
 | Arrow keys / `W A S D` | Move |
-| `Q` | Trigger lose state (placeholder, until NPCs exist) |
 | `R` | Restart after win/lose |
-| `Esc` or `Ctrl-C` | Quit cleanly |
+| `Ctrl-C` (in terminal) | Stop the server |
 
 ### What you should see
 
@@ -92,15 +95,17 @@ Walk onto `T` to win.
 
 - **"Cannot connect to the Docker daemon"** — Docker Desktop isn't running.
   Launch it and wait for the whale icon to go green.
-- **Window too small / text wraps** — make the terminal at least 80 columns
-  wide and 23 rows tall before running.
-- **Weird characters / colors** — switch to Windows Terminal (Windows) or a
-  modern terminal emulator.
-- **Game won't exit** — `Esc` or `Ctrl-C`. If it's stuck, close the tab and
-  open a new one. As a last resort: `docker kill brownshock-dev` from
-  another terminal.
+- **Browser didn't open automatically** — copy the `http://127.0.0.1:…` URL
+  from the terminal and paste it into any browser.
+- **Keys don't do anything** — click on the game tab once to give it focus.
+- **Server won't exit** — `Ctrl-C` in the terminal. If it's stuck:
+  `docker kill brownshock-dev` from another terminal.
 - **Everything else** — see [`DEV.md`](./DEV.md) for detailed dev
   workflow (running tests, formatting, entering the container shell).
+
+> **Previous terminal version:** the old crossterm-based terminal renderer
+> is preserved on the `archive/terminal` branch (tag `v0.1-terminal`) for
+> reference.
 
 ---
 

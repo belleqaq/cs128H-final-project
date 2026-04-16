@@ -3,8 +3,8 @@
 Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
-Last synced with code: tick-locked movement + Stair tiles + NPC auto-scaling
-                        + adaptive key-release detection + signed-velocity physics
+Last synced with code: web migration (axum + WebSocket + DOM grid) +
+                        signed-velocity physics + Stair tiles + NPC auto-scaling
 
 ---
 
@@ -12,12 +12,95 @@ Last synced with code: tick-locked movement + Stair tiles + NPC auto-scaling
 
 ```
 src/
-  main.rs          — all game logic (single file for now)
+  main.rs          — axum HTTP/WebSocket server + tokio game loop (transport only)
+  game/
+    mod.rs         — module root: re-exports + shared constants
+    config.rs      — GameConfig / PlayerSettings / NpcSettings + load_config()
+    tile.rs        — Tile enum + idx() helper
+    state.rs       — State, Npc, Keys, Phase, Snapshot (pure game logic)
+web/
+  index.html       — host page (grid container + HUD)
+  style.css        — grid layout + tile colours
+  main.js          — DOM renderer + WebSocket client + keyboard handler
 config.toml        — player-facing settings (edit & re-run to apply)
-Cargo.toml         — deps: crossterm, fastrand, serde, toml
+Cargo.toml         — deps: tokio, axum, rust-embed, fastrand, serde, serde_json, toml, open, mime_guess
 Dockerfile.dev     — dev container (Rust + fmt + clippy)
 docker-compose.yml — bind-mount + cargo cache volumes
 ```
+
+The terminal renderer (crossterm) has been removed from `main`; it's
+preserved on the `archive/terminal` branch (tag `v0.1-terminal`).
+
+---
+
+## Runtime architecture (web edition)
+
+```
+┌──────────────────────── Rust binary ────────────────────────┐
+│                                                              │
+│   tokio runtime                                              │
+│     │                                                        │
+│     ├── game loop task       ──every tick_ms──>  State       │
+│     │   on_player_tick + tick_world, serialize               │
+│     │   snapshot, broadcast::send(json)                      │
+│     │                                                        │
+│     ├── axum::serve on 127.0.0.1:<os-assigned port>          │
+│     │     GET /       → embedded index.html                  │
+│     │     GET /*path  → embedded asset (via rust-embed)      │
+│     │     GET /ws     → WebSocket upgrade                    │
+│     │                                                        │
+│     └── per-client WebSocket task                            │
+│           rx = broadcaster.subscribe()                       │
+│           select!                                            │
+│             rx.recv()       → socket.send(Text)              │
+│             socket.recv()   → parse + State.{input/stair/…}  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+        ▲                                           │
+        │ WebSocket frames                          │
+        │ (server → browser: snapshot JSON)         │
+        │ (browser → server: input JSON)            │
+        ▼                                           ▼
+┌──────────────────────── Browser tab ─────────────────────────┐
+│   main.js                                                    │
+│     - buildGrid(w,h): 80×22 DOM <span>s on a monospace font  │
+│     - onmessage: render(snapshot) — overwrite cells          │
+│     - keydown/keyup: mirror A/D held state, send on change;  │
+│       W/S rising edge → stair; R → restart                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Wire format
+
+Snapshot (server → browser, every tick):
+```
+{ "width": 80, "height": 22,
+  "map":   ["floor","wall",…],    // length = 80*22, snake_case tile kinds
+  "player": [x, y],
+  "npcs":  [{ "pos": [x,y], "symbol": "N" }, …],
+  "phase": "playing" | "win" | "lose" }
+```
+
+Client → server messages (one per keyboard edge):
+```
+{ "type": "input",   "left": bool, "right": bool }  // A/D mirror
+{ "type": "stair",   "dy": -1 | 1 }                 // W/S rising edge
+{ "type": "restart" }                               // R
+```
+
+### Why WebSocket and not SSE / polling
+
+We need both directions: the browser pushes input events as they happen
+(polling would add ~tick_ms/2 of input lag), and the server pushes a full
+snapshot every tick. WebSocket gives us one persistent connection for both
+directions with minimal per-message overhead.
+
+### Why a DOM grid and not &lt;canvas&gt;
+
+80×22 = 1760 cells. Updating that many DOM spans per tick is cheap and the
+diff-overwrite loop in `main.js` keeps allocations at zero. Canvas would
+be overkill and would require re-implementing text positioning. Monospace
+DOM spans look identical to the terminal version and are one line of CSS.
 
 ---
 
@@ -59,26 +142,15 @@ Each tick:
 - There is currently **no diagonal movement**. Vertical movement exists
   only as stair transitions (and in the future, jumps).
 
-### Adaptive key-release detection
+### Key-release detection (obsolete on web)
 
-TTY protocols historically don't send key-release events — we have to
-infer release by timeout. This breaks SOCD (A+D cancel) because the OS
-only repeats the *last* pressed key, so the "other" key stops receiving
-events and times out while still physically held.
-
-The game handles both worlds:
-
-- **Precise mode** — triggered the first time we observe a real
-  `KeyEventKind::Release` event. From then on we trust the terminal,
-  disable the timeout fallback entirely, and releases are frame-accurate.
-  Supported by: Windows Terminal, VS Code, iTerm2, Kitty, WezTerm, Alacritty.
-- **Basic mode** — terminal never sends Release events. Falls back to a
-  700ms release timeout (covers the OS's ~500ms initial repeat delay so
-  the opposite-key SOCD bug stays squashed). Trade-off: truly releasing
-  a key takes up to 700ms to register. Used by: cmd.exe, basic PowerShell
-  console.
-
-Mode is auto-detected at runtime and displayed on the HUD.
+The terminal version had to infer key-release by timeout on legacy consoles
+that don't send real release events (cmd.exe). The web port doesn't need
+any of that — the browser emits real `keydown`/`keyup` for every key, even
+during OS key-repeat. `main.js` tracks held state directly and mirrors it
+to the server; SOCD neutral (A+D cancel) is resolved server-side in
+`Keys::net_horizontal`. This machinery is preserved on `archive/terminal`
+for reference.
 
 ---
 
@@ -103,16 +175,11 @@ Brownshock
 │       (wait_min / wait_max are auto-scaled by BASELINE_TICK_MS / tick_ms
 │        so NPC real-time pacing stays roughly constant when tick_ms changes)
 │
-├── Code-only constants (src/main.rs, top of file)
-│   ├── WIDTH:                  i32  = 80   ← map columns
-│   ├── HEIGHT:                 i32  = 22   ← map rows
-│   ├── LEGACY_HOLD_TIMEOUT_MS: u128 = 700  ← key-release fallback used only
-│   │                                         on terminals that don't emit
-│   │                                         real Release events (cmd.exe);
-│   │                                         700ms covers OS initial repeat
-│   │                                         delay to prevent SOCD dropout
-│   ├── SPEED_EPSILON:          f32  = 0.01 ← snap-to-zero threshold
-│   └── BASELINE_TICK_MS:       u64  = 150  ← reference tick rate for NPC scaling
+├── Code-only constants (src/game/mod.rs)
+│   ├── WIDTH:            i32  = 80   ← map columns
+│   ├── HEIGHT:           i32  = 22   ← map rows
+│   ├── SPEED_EPSILON:    f32  = 0.01 ← snap-to-zero threshold
+│   └── BASELINE_TICK_MS: u64  = 150  ← reference tick rate for NPC scaling
 │
 ├── Npc runtime fields (populated from config.toml + hardcoded)
 │   ├── color:         Color = Blue     ← render colour (code-only)
@@ -160,18 +227,26 @@ Brownshock
 
 ## Conventions
 
-1. **New tunable → add to the relevant Config struct** (not as a loose
-   constant). This keeps difficulty knobs discoverable in one place.
-2. **New tile type → add Tile variant + handle in render() + handle in
-   try_move() / npc.tick()**.
-3. **New game phase → add Phase variant + handle in State.input() +
-   State.tick() + render()**.
-4. **Changing a default value** is always safe — no other code depends on
+1. **New tunable → add to the relevant Config struct** in `src/game/config.rs`
+   (not as a loose constant). This keeps difficulty knobs discoverable in one place.
+2. **New tile type → add Tile variant in `src/game/tile.rs` + handle in
+   `State::try_move_to` / `Npc::tick` + add a glyph + add mappings in
+   `web/main.js` (TILE_GLYPH, TILE_CLASS) and a colour in `web/style.css`**.
+3. **New game phase → add Phase variant in `src/game/state.rs` + handle
+   wherever `phase` is matched + update the `hudTop` rendering in
+   `web/main.js`**.
+4. **New input action → add a ClientMessage variant in `src/main.rs` +
+   a matching send() in `web/main.js`'s keydown handler + a corresponding
+   method on State**.
+5. **Changing a default value** is always safe — no other code depends on
    the specific number, only on the type.
-5. **Tick-based vs real-time units**: all player physics are in tiles/tick
-   now. If you add a new config knob that should feel the same at any
+6. **Tick-based vs real-time units**: all player physics are in tiles/tick.
+   If you add a new config knob that should feel the same at any
    `tick_ms`, either express it in ticks or scale it against
    `BASELINE_TICK_MS` like the NPC wait values do.
+7. **Never hold `app.game` lock across an `await` that performs I/O.**
+   Take the lock in a `let x = { let game = app.game.lock().await; … };`
+   block, extract what you need, drop it, then do the I/O.
 
 ---
 

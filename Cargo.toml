@@ -1,10 +1,22 @@
 [package]
 name = "brownshock"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-crossterm = "0.27"
+# Core game logic (config parsing, RNG, (de)serialization)
 fastrand = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+
+# Async runtime + web server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+
+# Embed frontend files (index.html, main.js, style.css) into the final exe
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+
+# Auto-open the default browser on startup
+open = "5"
