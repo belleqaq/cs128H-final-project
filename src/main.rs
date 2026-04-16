@@ -224,9 +224,6 @@ const HOLD_TIMEOUT_MS: u128 = 500;
 /// Per-frame speed threshold below which we snap to zero.
 const SPEED_EPSILON: f32 = 0.1;
 
-/// SQRT_2 for diagonal speed normalization.
-const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
-
 // ---------------------------------------------------------------------------
 // Independent key-state tracking (SOCD-ready)
 // ---------------------------------------------------------------------------
@@ -258,11 +255,17 @@ impl KeyState {
     }
 }
 
+/// Which axis was most recently pressed. Used to resolve W+D into a single
+/// cardinal direction (no diagonals for now).
+#[derive(Clone, Copy, PartialEq)]
+enum Axis { X, Y }
+
 struct Keys {
     up: KeyState,
     down: KeyState,
     left: KeyState,
     right: KeyState,
+    last_axis: Axis,
 }
 
 impl Keys {
@@ -272,7 +275,18 @@ impl Keys {
             down: KeyState::new(),
             left: KeyState::new(),
             right: KeyState::new(),
+            last_axis: Axis::X,
         }
+    }
+    /// Refresh the timestamp of every currently-pressed key. Call this on any
+    /// direction key event so that during a D+A clash the "other" key doesn't
+    /// timeout while the OS only sends repeat events for the latest key.
+    fn refresh_all_pressed(&mut self) {
+        let now = Instant::now();
+        if self.up.pressed    { self.up.last_press = now; }
+        if self.down.pressed  { self.down.last_press = now; }
+        if self.left.pressed  { self.left.last_press = now; }
+        if self.right.pressed { self.right.last_press = now; }
     }
     /// Run timeout check on all four keys (fallback release detection).
     fn timeout_check_all(&mut self) {
@@ -282,10 +296,20 @@ impl Keys {
         self.right.timeout_check();
     }
     /// Synthesize net direction from currently-held keys (SOCD neutral).
+    /// When both axes are active, the most recently pressed axis wins
+    /// (no diagonal movement).
     fn net_direction(&self) -> (i32, i32) {
         let dx = self.right.pressed as i32 - self.left.pressed as i32;
         let dy = self.down.pressed as i32 - self.up.pressed as i32;
-        (dx, dy)
+        if dx != 0 && dy != 0 {
+            // Resolve to single axis based on which was pressed last.
+            match self.last_axis {
+                Axis::X => (dx, 0),
+                Axis::Y => (0, dy),
+            }
+        } else {
+            (dx, dy)
+        }
     }
 }
 
@@ -374,22 +398,33 @@ impl State {
         match self.phase {
             Phase::Playing => {
                 // Map key → per-key state update.
+                let is_direction = matches!(
+                    code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                    | KeyCode::Char('w') | KeyCode::Char('a')
+                    | KeyCode::Char('s') | KeyCode::Char('d')
+                );
                 match code {
                     KeyCode::Up | KeyCode::Char('w') => {
-                        if is_release { self.keys.up.release(); } else { self.keys.up.press(); }
+                        if is_release { self.keys.up.release(); } else { self.keys.up.press(); self.keys.last_axis = Axis::Y; }
                     }
                     KeyCode::Down | KeyCode::Char('s') => {
-                        if is_release { self.keys.down.release(); } else { self.keys.down.press(); }
+                        if is_release { self.keys.down.release(); } else { self.keys.down.press(); self.keys.last_axis = Axis::Y; }
                     }
                     KeyCode::Left | KeyCode::Char('a') => {
-                        if is_release { self.keys.left.release(); } else { self.keys.left.press(); }
+                        if is_release { self.keys.left.release(); } else { self.keys.left.press(); self.keys.last_axis = Axis::X; }
                     }
                     KeyCode::Right | KeyCode::Char('d') => {
-                        if is_release { self.keys.right.release(); } else { self.keys.right.press(); }
+                        if is_release { self.keys.right.release(); } else { self.keys.right.press(); self.keys.last_axis = Axis::X; }
                     }
                     KeyCode::Char('q') if !is_release => self.phase = Phase::Lose,
                     KeyCode::Esc if !is_release => self.quit = true,
                     _ => {}
+                }
+                // Keep all pressed keys alive so the "other" key in a
+                // D+A clash doesn't timeout from lack of OS repeat events.
+                if is_direction && !is_release {
+                    self.keys.refresh_all_pressed();
                 }
             }
             Phase::Win | Phase::Lose => {
@@ -450,14 +485,7 @@ impl State {
             }
         }
 
-        // Diagonal speed normalization: divide by √2 so diagonal isn't faster.
-        let effective_speed = if has_dir && dir.0 != 0 && dir.1 != 0 {
-            self.current_speed * INV_SQRT2
-        } else {
-            self.current_speed
-        };
-
-        self.move_accumulator += effective_speed * dt;
+        self.move_accumulator += self.current_speed * dt;
         let move_dir = if has_dir { dir } else { self.prev_direction };
         while self.move_accumulator >= 1.0 {
             self.try_move(move_dir.0, move_dir.1);
