@@ -47,14 +47,18 @@ speed = 1.0
 #   0.1  = sluggish, takes ~10 ticks to reach top speed
 acceleration = 0.3
 
-# How much speed you keep when you flip direction (A -> D or D -> A).
-# This is a slider from 0 to 1.
+# How much velocity is kept when you press the OPPOSITE direction of
+# the direction you're currently moving. A slider from 0 to 1.
 #
-#   0.0 = full stop on turn (heavy, strategic)
-#   0.5 = keep half speed
-#   1.0 = never lose speed on turn (fluid, slippery)
+#   1.0 = keep all velocity; reversal is driven purely by acceleration
+#         (smoothest/most physical — slide decelerates, then builds back
+#         up in the new direction).
+#   0.5 = instantly halve velocity on reversal, then accelerate.
+#   0.0 = velocity snaps to 0 on reversal, then accelerates from rest
+#         (snappy "stop-turn" feel like platformers).
 #
-# Only affects left/right turns. There is no diagonal movement.
+# Only fires on A -> D or D -> A input against current motion.
+# Has no effect if you're already moving in the pressed direction.
 keep_momentum = 1.0
 
 # Per-tick friction multiplier applied when no direction is held
@@ -67,7 +71,7 @@ keep_momentum = 1.0
 #   0.0  = instant stop, no slide at all
 #
 # Each tick with no input, current_speed *= friction.
-friction = 0.6
+friction = 0.1
 
 
 # ---- NPC (the blue "N" that walks around) ------------------

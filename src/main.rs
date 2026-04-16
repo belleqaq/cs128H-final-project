@@ -164,30 +164,9 @@ fn is_walkable(t: Tile) -> bool {
     matches!(t, Tile::Floor | Tile::Goal | Tile::StairUp | Tile::StairDown)
 }
 
-// ---------------------------------------------------------------------------
-// Direction helpers (dot product, normalization)
-// ---------------------------------------------------------------------------
-
-fn dir_magnitude(d: (i32, i32)) -> f32 {
-    ((d.0 * d.0 + d.1 * d.1) as f32).sqrt()
-}
-
-fn dir_dot_normalized(a: (i32, i32), b: (i32, i32)) -> f32 {
-    let ma = dir_magnitude(a);
-    let mb = dir_magnitude(b);
-    if ma < f32::EPSILON || mb < f32::EPSILON {
-        return 0.0;
-    }
-    let dot = (a.0 * b.0 + a.1 * b.1) as f32;
-    (dot / (ma * mb)).clamp(-1.0, 1.0)
-}
-
-/// Speed retention when changing from `old` to `new` direction.
-fn direction_retention(old: (i32, i32), new: (i32, i32), keep_momentum: f32) -> f32 {
-    let dot = dir_dot_normalized(old, new);
-    let dot_factor = (dot + 1.0) / 2.0;
-    dot_factor + keep_momentum * (1.0 - dot_factor)
-}
+// (Direction-retention helpers removed: the old unsigned-speed model has
+// been replaced by a signed-velocity model, so dot-product reasoning is
+// no longer needed — see State::on_player_tick.)
 
 // ---------------------------------------------------------------------------
 // NPC
@@ -391,9 +370,12 @@ struct State {
     quit: bool,
     // Input
     keys: Keys,
-    // Horizontal movement model (tick-based).
-    prev_direction: (i32, i32),
-    current_speed: f32,
+    // Horizontal movement model (tick-based, signed).
+    //   velocity          — tiles/tick, SIGNED. +ve = moving right, -ve = moving left.
+    //   move_accumulator  — tiles, SIGNED. Crosses ±1.0 to trigger a tile step.
+    // Sign coupling is what makes "pressing A while sliding right" decelerate
+    // naturally to zero before accelerating left, instead of teleporting.
+    velocity: f32,
     move_accumulator: f32,
     // Config cache
     max_speed: f32,
@@ -431,8 +413,7 @@ impl State {
             phase: Phase::Playing,
             quit: false,
             keys: Keys::new(),
-            prev_direction: (0, 0),
-            current_speed: 0.0,
+            velocity: 0.0,
             move_accumulator: 0.0,
             max_speed: config.player.clamped_speed(),
             acceleration: config.player.acceleration.max(0.0),
@@ -540,51 +521,54 @@ impl State {
     }
 
     /// Called once per world tick. Handles key timeouts, horizontal
-    /// acceleration/friction, accumulator, and at most one tile of movement.
+    /// acceleration/friction, and at most one tile of movement per tick.
+    ///
+    /// Signed-velocity model: `velocity` carries both magnitude and
+    /// direction. Pressing A applies negative acceleration and pressing D
+    /// applies positive acceleration; sign changes happen naturally when
+    /// acceleration overcomes existing velocity. No teleporting.
     fn on_player_tick(&mut self) {
         if self.phase != Phase::Playing {
             return;
         }
 
-        // Timeout-based release fallback for all keys.
+        // Timeout-based release fallback for all keys (no-op in precise mode).
         self.keys.timeout_check_all();
 
-        // Horizontal direction only (W/S do not drive continuous movement).
-        let dx = self.keys.net_horizontal();
-        let dir = (dx, 0);
-        let has_dir = dir != (0, 0);
+        // Horizontal input axis: -1 (A), 0 (none or SOCD neutral), +1 (D).
+        let input = self.keys.net_horizontal() as f32;
 
-        // Direction change → dot-product momentum retention.
-        if has_dir && self.prev_direction != (0, 0) && dir != self.prev_direction {
-            let retention = direction_retention(self.prev_direction, dir, self.keep_momentum);
-            self.current_speed *= retention;
-        }
-
-        if has_dir {
-            // Accelerate toward max speed (both in tiles/tick units).
-            self.current_speed = (self.current_speed + self.acceleration).min(self.max_speed);
-            self.prev_direction = dir;
+        if input != 0.0 {
+            // If user is pressing the opposite direction of current motion,
+            // optionally bleed some speed instantly. With keep_momentum=1.0
+            // this is a no-op and the flip is driven purely by acceleration
+            // (most physical). With keep_momentum=0.0, velocity snaps to 0
+            // on reversal (stop-turn feel).
+            if self.velocity * input < 0.0 {
+                self.velocity *= self.keep_momentum;
+            }
+            // Apply acceleration in the input direction and clamp.
+            self.velocity =
+                (self.velocity + self.acceleration * input).clamp(-self.max_speed, self.max_speed);
         } else {
-            // Friction: per-tick exponential decay.
-            if self.current_speed > SPEED_EPSILON {
-                self.current_speed *= self.friction;
-                if self.current_speed < SPEED_EPSILON {
-                    self.current_speed = 0.0;
-                    self.move_accumulator = 0.0;
-                }
-            } else {
-                self.current_speed = 0.0;
+            // No input (or SOCD neutral): friction pulls velocity toward 0.
+            self.velocity *= self.friction;
+            if self.velocity.abs() < SPEED_EPSILON {
+                self.velocity = 0.0;
                 self.move_accumulator = 0.0;
             }
         }
 
-        // Accumulate one tick's worth of movement. Capped at 1 tile per tick
-        // because max_speed ≤ 1.0 and we add at most max_speed per tick.
-        self.move_accumulator += self.current_speed;
-        let move_dir = if has_dir { dir } else { self.prev_direction };
+        // Signed accumulator: crosses +1.0 → step right, -1.0 → step left.
+        // When velocity changes sign, the accumulator naturally unwinds
+        // toward zero before accumulating in the new direction.
+        self.move_accumulator += self.velocity;
         if self.move_accumulator >= 1.0 {
-            self.try_move_to(self.player.0 + move_dir.0, self.player.1 + move_dir.1);
+            self.try_move_to(self.player.0 + 1, self.player.1);
             self.move_accumulator -= 1.0;
+        } else if self.move_accumulator <= -1.0 {
+            self.try_move_to(self.player.0 - 1, self.player.1);
+            self.move_accumulator += 1.0;
         }
     }
 

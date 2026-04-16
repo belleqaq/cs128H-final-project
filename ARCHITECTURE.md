@@ -4,7 +4,7 @@ Living document. Updated alongside code. Read this before modifying any
 config, adding a new system, or tuning difficulty.
 
 Last synced with code: tick-locked movement + Stair tiles + NPC auto-scaling
-                        + adaptive key-release detection
+                        + adaptive key-release detection + signed-velocity physics
 
 ---
 
@@ -28,12 +28,26 @@ the world advances exactly one step. Within a single tick the player can
 move **at most one tile**. Slower speeds simply take multiple ticks to
 cross a single tile.
 
-- `speed` is in tiles/tick, hard-capped at 1.0.
-- `acceleration` is tiles/tick added per tick while a direction is held.
-- `friction` is a per-tick multiplier applied when no direction is held
-  (or when A+D cancel out SOCD-style).
-- Each tick: an internal accumulator grows by `current_speed`. When it
-  reaches ≥1.0 the player steps one tile and the accumulator wraps down.
+State is carried by two signed scalars:
+
+- `velocity: f32` — tiles/tick, **signed**. +ve = right, -ve = left.
+- `move_accumulator: f32` — tiles, **signed**. Tracks sub-tile position.
+
+Each tick:
+
+- `speed` (config) caps `|velocity|` at 1.0.
+- `acceleration` is applied in the input direction: `velocity += accel × input`.
+- `friction` is a per-tick multiplier on velocity when input is zero
+  (or when A+D cancel SOCD-style): `velocity *= friction`.
+- `keep_momentum` only fires when the user presses *against* the current
+  motion: `velocity *= keep_momentum` once, before acceleration that tick.
+  With `keep_momentum = 1.0` reversal is driven purely by acceleration
+  (most physical — old velocity bleeds away naturally through the sign
+  crossing, no teleporting).
+- `move_accumulator += velocity`. Crossing +1.0 steps right, -1.0 steps
+  left, then the accumulator unwinds by 1. Because sign is carried, a
+  velocity flip mid-slide cancels pending forward steps instead of
+  teleporting a slide into the opposite direction.
 
 ### Input split
 
