@@ -87,11 +87,14 @@ async fn main() {
 
         // -- Render --
         clear_background(color_u8!(16, 18, 30, 255));
-        let (vx, vy) = state.player_visual_pos();
+
+        // Interpolation factor: how far we are between the last tick and the next.
+        let t = (tick_acc / tick_s).min(1.0) as f32;
+        let (vx, vy) = state.player_visual_pos(t);
         let cam_x = vx * TILE_SIZE - screen_width() / 2.0;
         let cam_y = vy * TILE_SIZE - screen_height() / 2.0;
 
-        // Draw tiles.
+        // Draw tiles (no grid lines — seamless surface).
         for gy in 0..state.map_h {
             for gx in 0..state.map_w {
                 let cell = state.map[idx(gx, gy, state.map_w)];
@@ -106,7 +109,6 @@ async fn main() {
                     Terrain::Toilet => color_u8!(200, 200, 220, 255),
                 };
                 draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE, color);
-                draw_rectangle_lines(sx, sy, TILE_SIZE, TILE_SIZE, 1.0, color_u8!(20, 20, 30, 80));
             }
         }
 

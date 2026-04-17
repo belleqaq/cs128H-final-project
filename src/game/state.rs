@@ -47,6 +47,8 @@ pub struct State {
     move_state: MoveState,
     velocity: (f32, f32),
     move_acc: (f32, f32),
+    // Previous visual position — for frame interpolation.
+    prev_visual: (f32, f32),
     // Effective per-tick values (scaled from config).
     eff_accel: f32,
     eff_friction: f32,
@@ -67,6 +69,7 @@ impl State {
             move_state: MoveState::Normal,
             velocity: (0.0, 0.0),
             move_acc: (0.0, 0.0),
+            prev_visual: (2.0, 2.0),
             eff_accel: config.player.acceleration,
             eff_friction: config.player.friction,
             max_speed: config.player.max_speed,
@@ -95,6 +98,9 @@ impl State {
         if self.phase != Phase::Playing {
             return;
         }
+
+        // Snapshot current visual pos for frame interpolation.
+        self.prev_visual = self.current_visual();
 
         let (ix, iy) = (self.input_x as f32, self.input_y as f32);
 
@@ -130,43 +136,76 @@ impl State {
         self.move_acc.0 += self.velocity.0;
         self.move_acc.1 += self.velocity.1;
 
+        // X axis stepping.
         while self.move_acc.0 >= 1.0 {
-            self.try_move(1, 0);
+            if !self.try_move(1, 0) {
+                self.velocity.0 = 0.0;
+                self.move_acc.0 = 0.0;
+                break;
+            }
             self.move_acc.0 -= 1.0;
         }
         while self.move_acc.0 <= -1.0 {
-            self.try_move(-1, 0);
+            if !self.try_move(-1, 0) {
+                self.velocity.0 = 0.0;
+                self.move_acc.0 = 0.0;
+                break;
+            }
             self.move_acc.0 += 1.0;
         }
+
+        // Y axis stepping.
         while self.move_acc.1 >= 1.0 {
-            self.try_move(0, 1);
+            if !self.try_move(0, 1) {
+                self.velocity.1 = 0.0;
+                self.move_acc.1 = 0.0;
+                break;
+            }
             self.move_acc.1 -= 1.0;
         }
         while self.move_acc.1 <= -1.0 {
-            self.try_move(0, -1);
+            if !self.try_move(0, -1) {
+                self.velocity.1 = 0.0;
+                self.move_acc.1 = 0.0;
+                break;
+            }
             self.move_acc.1 += 1.0;
         }
     }
 
-    fn try_move(&mut self, dx: i32, dy: i32) {
+    /// Try to step one tile. Returns true if the move succeeded.
+    fn try_move(&mut self, dx: i32, dy: i32) -> bool {
         let nx = self.player.0 + dx;
         let ny = self.player.1 + dy;
         if nx < 0 || nx >= self.map_w || ny < 0 || ny >= self.map_h {
-            return;
+            return false;
         }
         let cell = self.map[idx(nx, ny, self.map_w)];
         if cell.terrain.is_walkable() {
             self.player = (nx, ny);
+            true
+        } else {
+            false
         }
     }
 
     // -- Rendering helpers --
 
-    /// Fractional position for smooth rendering interpolation.
-    pub fn player_visual_pos(&self) -> (f32, f32) {
+    /// Raw visual position at current tick (grid + accumulator fraction).
+    fn current_visual(&self) -> (f32, f32) {
         (
             self.player.0 as f32 + self.move_acc.0,
             self.player.1 as f32 + self.move_acc.1,
+        )
+    }
+
+    /// Interpolated visual position for smooth rendering between ticks.
+    /// `t` is the fraction of the current tick elapsed (0.0 to 1.0).
+    pub fn player_visual_pos(&self, t: f32) -> (f32, f32) {
+        let cur = self.current_visual();
+        (
+            self.prev_visual.0 + (cur.0 - self.prev_visual.0) * t,
+            self.prev_visual.1 + (cur.1 - self.prev_visual.1) * t,
         )
     }
 }
