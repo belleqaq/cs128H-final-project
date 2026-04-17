@@ -38,14 +38,18 @@ impl Default for WindowSettings {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PlayerSettings {
-    pub speed: f32,
+    pub max_speed: f32,
+    pub acceleration: f32,
+    pub friction: f32,
     pub radius: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            speed: 210.0,
+            max_speed: 4.0,
+            acceleration: 0.8,
+            friction: 0.85,
             radius: 18.0,
         }
     }

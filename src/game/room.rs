@@ -54,6 +54,20 @@ impl Decoration {
     }
 }
 
+pub struct Toilet {
+    pub rect:     Rect,
+    pub capacity: f32,
+    pub filled:   f32,
+}
+
+impl Toilet {
+    pub fn new(x: f32, y: f32, capacity: f32) -> Self {
+        Self { rect: Rect::new(x, y, 50.0, 60.0), capacity, filled: 0.0 }
+    }
+    pub fn is_full(&self) -> bool { self.filled >= self.capacity }
+    pub fn remaining(&self) -> f32 { (self.capacity - self.filled).max(0.0) }
+}
+
 pub struct Room {
     pub name: &'static str,
     pub walk_area: Rect,
@@ -63,6 +77,7 @@ pub struct Room {
     pub target: Option<Target>,
     pub decorations: Vec<Decoration>,
     pub floor_color: Color,
+    pub toilets: Vec<Toilet>,
 }
 
 impl Room {
@@ -118,6 +133,10 @@ impl Room {
                 ),
             ],
             floor_color: color_u8!(62, 65, 89, 255),
+            toilets: vec![
+                Toilet::new(720.0, 400.0, 55.0),
+                Toilet::new(155.0, 430.0, 55.0),
+            ],
         };
 
         let hall = Self {
@@ -162,6 +181,10 @@ impl Room {
                 ),
             ],
             floor_color: color_u8!(58, 61, 83, 255),
+            toilets: vec![
+                Toilet::new(155.0, 390.0, 60.0),
+                Toilet::new(450.0, 170.0, 60.0),
+            ],
         };
 
         vec![bedroom, hall]

@@ -20,5 +20,7 @@ height = 720
 title = "Brownshock"
 
 [player]
-speed = 210.0
+max_speed = 2.0
+acceleration = 0.3
+friction = 0.8
 radius = 18.0
