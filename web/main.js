@@ -149,18 +149,18 @@
   // Keyboard
   // -------------------------------------------------------------------------
 
-  const held = { left: false, right: false };
-  let lastSent = { left: false, right: false };
+  const held = { left: false, right: false, up: false, down: false };
+  let lastSent = { left: false, right: false, up: false, down: false };
 
   function sendInputIfChanged(force = false) {
-    if (force || held.left !== lastSent.left || held.right !== lastSent.right) {
+    if (force || held.left !== lastSent.left || held.right !== lastSent.right || held.up !== lastSent.up || held.down !== lastSent.down) {
       lastSent = { ...held };
-      send({ type: "input", left: held.left, right: held.right });
+      send({ type: "input", left: held.left, right: held.right, up: held.up, down: held.down });
     }
   }
 
   function isMovementKey(k) {
-    return k === "a" || k === "d" || k === "arrowleft" || k === "arrowright";
+    return k === "a" || k === "d" || k === "arrowleft" || k === "arrowright" || k === "w" || k === "s" || k === "arrowup" || k === "arrowdown";
   }
 
   window.addEventListener("keydown", (e) => {
@@ -174,19 +174,9 @@
       if (e.repeat) return; // holding is handled by held-flag, not repeat
       if (k === "a" || k === "arrowleft") held.left = true;
       if (k === "d" || k === "arrowright") held.right = true;
+      if (k === "w" || k === "arrowup") held.up = true;
+      if (k === "s" || k === "arrowdown") held.down = true;
       sendInputIfChanged();
-      return;
-    }
-
-    // W/S only act on the rising edge — stairs are single-shot.
-    if (k === "w" || k === "arrowup") {
-      e.preventDefault();
-      if (!e.repeat) send({ type: "stair", dy: -1 });
-      return;
-    }
-    if (k === "s" || k === "arrowdown") {
-      e.preventDefault();
-      if (!e.repeat) send({ type: "stair", dy: 1 });
       return;
     }
 
@@ -207,8 +197,10 @@
     const k = e.key.toLowerCase();
     if (isMovementKey(k)) {
       e.preventDefault();
-      if (k === "a" || k === "arrowleft") held.left = false;
+      if (k === "a" || k === "arrowleft")  held.left  = false;
       if (k === "d" || k === "arrowright") held.right = false;
+      if (k === "w" || k === "arrowup")    held.up    = false;
+      if (k === "s" || k === "arrowdown")  held.down  = false;
       sendInputIfChanged();
     }
   });

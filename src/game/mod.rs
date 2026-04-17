@@ -21,6 +21,12 @@ pub use state::State;
 pub const WIDTH: i32 = 80;
 pub const HEIGHT: i32 = 22;
 
+pub const NUM_FLOORS: usize = 3;
+/// Position of the StairUp tile (leads to floor above). Present on every floor except the top.
+pub const STAIR_UP_POS: (i32, i32) = (WIDTH - 5, HEIGHT - 3);
+/// Position of the StairDown tile (leads to floor below). Present on every floor except the bottom.
+pub const STAIR_DOWN_POS: (i32, i32) = (5, 3);
+
 /// Baseline tick duration that config values (friction, acceleration) are
 /// calibrated against.  At runtime, effective values are scaled by
 /// `tick_ms / BASELINE_TICK_MS` so physics behave the same regardless of

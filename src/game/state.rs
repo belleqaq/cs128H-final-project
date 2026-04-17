@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::game::config::{GameConfig, NpcSettings};
 use crate::game::tile::{idx, Tile};
-use crate::game::{BASELINE_TICK_MS, HEIGHT, SPEED_EPSILON, WIDTH};
+use crate::game::{BASELINE_TICK_MS, HEIGHT, NUM_FLOORS, SPEED_EPSILON, STAIR_DOWN_POS, STAIR_UP_POS, WIDTH};
 
 // ---------------------------------------------------------------------------
 // NPC — "holds" a direction for random ticks, same physics as the player.
@@ -21,6 +21,7 @@ use crate::game::{BASELINE_TICK_MS, HEIGHT, SPEED_EPSILON, WIDTH};
 
 pub struct Npc {
     pub pos: (i32, i32),
+    pub floor: usize,
     velocity: f32,
     move_accumulator: f32,
     /// Current "held" direction: -1 (left), 0 (released), 1 (right).
@@ -31,10 +32,11 @@ pub struct Npc {
 }
 
 impl Npc {
-    pub fn from_settings(pos: (i32, i32), s: &NpcSettings) -> Self {
+    pub fn from_settings(pos: (i32, i32), floor: usize, s: &NpcSettings) -> Self {
         let hold_max = s.hold_max.max(s.hold_min);
         Self {
             pos,
+            floor,
             velocity: 0.0,
             move_accumulator: 0.0,
             holding_direction: 0,
@@ -112,11 +114,16 @@ impl Npc {
 pub struct Keys {
     pub left: bool,
     pub right: bool,
+    pub up: bool,
+    pub down: bool,
 }
 
 impl Keys {
     fn net_horizontal(&self) -> i32 {
         self.right as i32 - self.left as i32
+    }
+    fn net_vertical(&self) -> i32 {
+        self.down as i32 - self.up as i32
     }
 }
 
@@ -137,13 +144,16 @@ pub enum Phase {
 // ---------------------------------------------------------------------------
 
 pub struct State {
-    map: Vec<Tile>,
+    floors: Vec<Vec<Tile>>,
+    current_floor: usize,
     player: (i32, i32),
     npcs: Vec<Npc>,
     phase: Phase,
     keys: Keys,
     velocity: f32,
     move_accumulator: f32,
+    velocity_y: f32,
+    move_accumulator_y: f32,
     // Config cache — updated every tick via apply_config.
     max_speed: f32,
     /// Effective per-tick values, scaled from config by tick_ms / BASELINE_TICK_MS.
@@ -151,34 +161,49 @@ pub struct State {
     eff_friction: f32,
 }
 
+fn make_floor(floor_idx: usize) -> Vec<Tile> {
+    let mut map = vec![Tile::Floor; (WIDTH * HEIGHT) as usize];
+    for x in 0..WIDTH {
+        map[idx(x, 0, WIDTH)] = Tile::Wall;
+        map[idx(x, HEIGHT - 1, WIDTH)] = Tile::Wall;
+    }
+    for y in 0..HEIGHT {
+        map[idx(0, y, WIDTH)] = Tile::Wall;
+        map[idx(WIDTH - 1, y, WIDTH)] = Tile::Wall;
+    }
+    if floor_idx < NUM_FLOORS - 1 {
+        map[idx(STAIR_UP_POS.0, STAIR_UP_POS.1, WIDTH)] = Tile::StairUp;
+    }
+    if floor_idx > 0 {
+        map[idx(STAIR_DOWN_POS.0, STAIR_DOWN_POS.1, WIDTH)] = Tile::StairDown;
+    }
+    if floor_idx == NUM_FLOORS - 1 {
+        map[idx(WIDTH - 3, 2, WIDTH)] = Tile::Goal;
+    }
+    map
+}
+
 impl State {
     pub fn new(config: &GameConfig) -> Self {
-        let mut map = vec![Tile::Floor; (WIDTH * HEIGHT) as usize];
-        for x in 0..WIDTH {
-            map[idx(x, 0, WIDTH)] = Tile::Wall;
-            map[idx(x, HEIGHT - 1, WIDTH)] = Tile::Wall;
-        }
-        for y in 0..HEIGHT {
-            map[idx(0, y, WIDTH)] = Tile::Wall;
-            map[idx(WIDTH - 1, y, WIDTH)] = Tile::Wall;
-        }
-        map[idx(WIDTH - 3, 2, WIDTH)] = Tile::Goal;
-        map[idx(5, HEIGHT - 3, WIDTH)] = Tile::StairUp;
-        map[idx(7, HEIGHT - 4, WIDTH)] = Tile::StairDown;
+        let floors: Vec<Vec<Tile>> = (0..NUM_FLOORS).map(make_floor).collect();
 
-        let npcs = vec![Npc::from_settings(
-            (WIDTH / 2, HEIGHT / 2),
-            &config.npc,
-        )];
+        let mut npcs = Vec::new();
+        for floor in 0..NUM_FLOORS {
+            npcs.push(Npc::from_settings((WIDTH / 3,     HEIGHT / 2), floor, &config.npc));
+            npcs.push(Npc::from_settings((2 * WIDTH / 3, HEIGHT / 3), floor, &config.npc));
+        }
 
         Self {
-            map,
+            floors,
+            current_floor: 0,
             player: (2, HEIGHT - 3),
             npcs,
             phase: Phase::Playing,
             keys: Keys::default(),
             velocity: 0.0,
             move_accumulator: 0.0,
+            velocity_y: 0.0,
+            move_accumulator_y: 0.0,
             max_speed: config.player.max_speed,
             eff_accel: config.player.acceleration,
             eff_friction: config.player.friction,
@@ -199,23 +224,14 @@ impl State {
 
     // -- Input API --
 
-    pub fn set_direction_input(&mut self, left: bool, right: bool) {
+    pub fn set_direction_input(&mut self, left: bool, right: bool, up: bool, down: bool) {
         if self.phase != Phase::Playing {
             return;
         }
         self.keys.left = left;
         self.keys.right = right;
-    }
-
-    pub fn press_stair(&mut self, dy: i32) {
-        if self.phase != Phase::Playing {
-            return;
-        }
-        let here = self.map[idx(self.player.0, self.player.1, WIDTH)];
-        let allowed = matches!((here, dy), (Tile::StairUp, -1) | (Tile::StairDown, 1));
-        if allowed {
-            self.try_move_to(self.player.0, self.player.1 + dy);
-        }
+        self.keys.up = up;
+        self.keys.down = down;
     }
 
     pub fn restart(&mut self, config: &GameConfig) {
@@ -257,7 +273,7 @@ impl State {
             self.move_accumulator = 0.0;
         }
 
-        // Tile stepping.
+        // Horizontal tile stepping.
         self.move_accumulator += self.velocity;
         if self.move_accumulator >= 1.0 {
             self.try_move_to(self.player.0 + 1, self.player.1);
@@ -266,6 +282,27 @@ impl State {
             self.try_move_to(self.player.0 - 1, self.player.1);
             self.move_accumulator += 1.0;
         }
+
+        // Vertical physics (same model as horizontal).
+        let vy_input = self.keys.net_vertical() as f32;
+        self.velocity_y = self.velocity_y * self.eff_friction + self.eff_accel * vy_input;
+        if self.max_speed > 0.0 {
+            self.velocity_y = self.velocity_y.clamp(-self.max_speed, self.max_speed);
+        }
+        if vy_input == 0.0 && self.velocity_y.abs() < SPEED_EPSILON {
+            self.velocity_y = 0.0;
+            self.move_accumulator_y = 0.0;
+        }
+
+        // Vertical tile stepping.
+        self.move_accumulator_y += self.velocity_y;
+        if self.move_accumulator_y >= 1.0 {
+            self.try_move_to(self.player.0, self.player.1 + 1);
+            self.move_accumulator_y -= 1.0;
+        } else if self.move_accumulator_y <= -1.0 {
+            self.try_move_to(self.player.0, self.player.1 - 1);
+            self.move_accumulator_y += 1.0;
+        }
     }
 
     /// World tick: advance NPCs using the player's physics params.
@@ -273,8 +310,13 @@ impl State {
         if self.phase != Phase::Playing {
             return;
         }
-        for npc in &mut self.npcs {
-            npc.tick(&self.map, self.eff_accel, self.eff_friction, self.max_speed);
+        let floor_idx = self.current_floor;
+        let map = &self.floors[floor_idx];
+        let accel = self.eff_accel;
+        let friction = self.eff_friction;
+        let max_speed = self.max_speed;
+        for npc in self.npcs.iter_mut().filter(|n| n.floor == floor_idx) {
+            npc.tick(map, accel, friction, max_speed);
         }
     }
 
@@ -282,14 +324,34 @@ impl State {
         if nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT {
             return;
         }
-        match self.map[idx(nx, ny, WIDTH)] {
+        match self.floors[self.current_floor][idx(nx, ny, WIDTH)] {
             Tile::Wall => {}
             Tile::Goal => {
                 self.player = (nx, ny);
                 self.phase = Phase::Win;
             }
-            Tile::Floor | Tile::StairUp | Tile::StairDown => {
+            Tile::Floor => {
                 self.player = (nx, ny);
+            }
+            Tile::StairUp => {
+                if self.current_floor + 1 < self.floors.len() {
+                    self.current_floor += 1;
+                    self.player = (STAIR_DOWN_POS.0, STAIR_DOWN_POS.1);
+                    self.velocity = 0.0;
+                    self.move_accumulator = 0.0;
+                    self.velocity_y = 0.0;
+                    self.move_accumulator_y = 0.0;
+                }
+            }
+            Tile::StairDown => {
+                if self.current_floor > 0 {
+                    self.current_floor -= 1;
+                    self.player = (STAIR_UP_POS.0, STAIR_UP_POS.1);
+                    self.velocity = 0.0;
+                    self.move_accumulator = 0.0;
+                    self.velocity_y = 0.0;
+                    self.move_accumulator_y = 0.0;
+                }
             }
         }
     }
@@ -300,10 +362,14 @@ impl State {
         Snapshot {
             width: WIDTH,
             height: HEIGHT,
-            map: &self.map,
+            map: &self.floors[self.current_floor],
             player: self.player,
-            npcs: self.npcs.iter().map(NpcView::from).collect(),
+            npcs: self.npcs.iter()
+                .filter(|n| n.floor == self.current_floor)
+                .map(NpcView::from)
+                .collect(),
             phase: self.phase,
+            floor: self.current_floor,
         }
     }
 }
@@ -320,6 +386,7 @@ pub struct Snapshot<'a> {
     pub player: (i32, i32),
     pub npcs: Vec<NpcView>,
     pub phase: Phase,
+    pub floor: usize,
 }
 
 #[derive(Serialize)]

@@ -69,8 +69,7 @@ struct AppState {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
-    Input { left: bool, right: bool },
-    Stair { dy: i32 },
+    Input { left: bool, right: bool, up: bool, down: bool },
     Lose,
     Restart,
 }
@@ -278,11 +277,8 @@ async fn handle_client_message(app: &AppState, text: &str) {
         return;
     };
     match msg {
-        ClientMessage::Input { left, right } => {
-            app.game.lock().await.set_direction_input(left, right);
-        }
-        ClientMessage::Stair { dy } => {
-            app.game.lock().await.press_stair(dy);
+        ClientMessage::Input { left, right, up, down } => {
+            app.game.lock().await.set_direction_input(left, right, up, down);
         }
         ClientMessage::Lose => {
             app.game.lock().await.force_lose();
