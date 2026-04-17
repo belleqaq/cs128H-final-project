@@ -1,32 +1,16 @@
 //! Platform-agnostic game logic for Brownshock.
-//!
-//! This module knows nothing about crossterm, axum, WebSockets, or the DOM.
-//! It is pure state + rules: load a [`GameConfig`], construct a [`State`],
-//! call [`State::set_direction_input`] / [`State::press_stair`] as the
-//! player interacts, and tick the world every `tick_ms` via
-//! [`State::on_player_tick`] + [`State::tick_world`].
-//!
-//! Rendering is done by serializing the [`Snapshot`] view and sending it
-//! to whichever UI layer is active (the web front-end, in main).
 
+pub mod cell;
 pub mod config;
 pub mod state;
-pub mod tile;
 
 pub use config::{load_config, GameConfig};
 pub use state::State;
 
-/// Map dimensions (in tiles). Not user-tunable: every other system scales
-/// against these, and the current map generator assumes fixed 80x22.
-pub const WIDTH: i32 = 80;
-pub const HEIGHT: i32 = 22;
-
-/// Baseline tick duration that config values (friction, acceleration) are
-/// calibrated against.  At runtime, effective values are scaled by
-/// `tick_ms / BASELINE_TICK_MS` so physics behave the same regardless of
-/// the chosen tick rate.
+/// Baseline tick duration that config friction/acceleration values are
+/// calibrated against. At runtime, effective values are scaled by
+/// tick_ms / BASELINE_TICK_MS.
 pub const BASELINE_TICK_MS: f32 = 150.0;
 
-/// Threshold under which |velocity| is snapped to zero (prevents endless
-/// floating-point trickle below 1/tile/tick motion).
+/// Threshold under which |velocity| is snapped to zero.
 pub const SPEED_EPSILON: f32 = 0.01;
