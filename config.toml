@@ -12,3 +12,7 @@ tick_ms = 150
 max_speed = 1.0
 acceleration = 0.3
 friction = 0.85
+collision_radius = 0.15
+visual_radius = 0.35
+repulsion_power = 2.0
+repulsion_range = 0.5
