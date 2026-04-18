@@ -1,10 +1,11 @@
 //! Brownshock — macroquad edition.
 //!
-//! Phase 1: movement + map + rendering. No NPCs, no QTE, no urgency.
+//! Phase 2: movement + urgency + star objectives + QTE.
 
 mod game;
 
 use game::cell::{idx, Cell, Terrain};
+use game::state::{MoveState, Phase, QteKey};
 use game::{load_config, load_debug_preset, save_debug_preset, GameConfig, State};
 use macroquad::prelude::*;
 
@@ -52,9 +53,12 @@ fn test_map() -> (Vec<Cell>, i32, i32) {
     map[idx(15, 12, w)].terrain = Terrain::DoorClosed;
     map[idx(24, 12, w)].terrain = Terrain::DoorClosed;
 
-    // Two toilets.
-    map[idx(3, 2, w)].terrain = Terrain::Toilet;
-    map[idx(26, 17, w)].terrain = Terrain::Toilet;
+    // Toilet area (contiguous 2×3 block in top-left room).
+    for ty in 2..=3 {
+        for tx in 3..=5 {
+            map[idx(tx, ty, w)].terrain = Terrain::Toilet;
+        }
+    }
 
     (map, w, h)
 }
@@ -268,10 +272,10 @@ async fn main() {
 
     // Tick accumulator for fixed-step game logic.
     let mut tick_acc: f64 = 0.0;
-    let tick_s = config.tick_ms as f64 / 1000.0;
 
     let mut debug = DebugPanel::new();
     let mut save_flash: f32 = 0.0;
+    let mut prev_e_down = false;
 
     loop {
         // -- Toggle debug panel --
@@ -280,21 +284,59 @@ async fn main() {
         }
 
         // -- Input (suppressed while editing a slider value) --
-        if !debug.is_editing() {
+        let in_qte = matches!(state.move_state, MoveState::Pooping(_) | MoveState::UsingToilet(_));
+        let preparing = matches!(state.move_state, MoveState::Preparing);
+        let frozen = matches!(state.move_state, MoveState::StandingUp(_));
+        let e_down = is_key_down(KeyCode::E);
+        let e_pressed = e_down && !prev_e_down;
+        prev_e_down = e_down;
+
+        if frozen {
+            // StandingUp: all input suppressed.
+            state.set_input(false, false, false, false, false, false, false);
+        } else if in_qte {
+            // QTE: WASD for key presses, E to stand up.
+            state.set_input(false, false, false, false, false, e_down, e_pressed);
+            if is_key_pressed(KeyCode::W) { state.qte_press(QteKey::W); }
+            if is_key_pressed(KeyCode::A) { state.qte_press(QteKey::A); }
+            if is_key_pressed(KeyCode::S) { state.qte_press(QteKey::S); }
+            if is_key_pressed(KeyCode::D) { state.qte_press(QteKey::D); }
+        } else if preparing {
+            // Preparing: no movement, just track E state.
+            state.set_input(false, false, false, false, false, e_down, e_pressed);
+        } else if !debug.is_editing() {
+            // Walking/Running: full input.
             let left = is_key_down(KeyCode::A) || is_key_down(KeyCode::Left);
             let right = is_key_down(KeyCode::D) || is_key_down(KeyCode::Right);
             let up = is_key_down(KeyCode::W) || is_key_down(KeyCode::Up);
             let down = is_key_down(KeyCode::S) || is_key_down(KeyCode::Down);
-            state.set_input(left, right, up, down);
+            let run = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+            state.set_input(left, right, up, down, run, e_down, e_pressed);
         } else {
-            state.set_input(false, false, false, false);
+            // Debug editing: suppress all.
+            state.set_input(false, false, false, false, false, false, false);
         }
 
-        // -- Fixed tick --
+        // -- Per-frame E-press dispatch (discrete event, must not go through tick) --
+        if e_pressed {
+            if in_qte {
+                state.handle_e_press_qte();
+            } else if !frozen && !preparing && !debug.is_editing() {
+                state.handle_e_press();
+            }
+        }
+
+        // -- Fixed tick (dynamic tick_ms, with safety cap) --
+        let tick_s = state.tick_ms.max(1) as f64 / 1000.0;
         tick_acc += get_frame_time() as f64;
-        while tick_acc >= tick_s {
+        let mut ticks_this_frame = 0u32;
+        while tick_acc >= tick_s && ticks_this_frame < 60 {
             state.tick();
             tick_acc -= tick_s;
+            ticks_this_frame += 1;
+        }
+        if ticks_this_frame >= 60 {
+            tick_acc = 0.0; // drop excess to prevent death spiral
         }
 
         // -- Render --
@@ -329,6 +371,23 @@ async fn main() {
                     );
                 }
             }
+        }
+
+        // --- Star marker (2×2 area) ---
+        if let Some((sx, sy)) = state.star_pos {
+            let star_px = sx as f32 * TILE_SIZE - cam_x;
+            let star_py = sy as f32 * TILE_SIZE - cam_y;
+            let area = TILE_SIZE * 2.0;
+            let pulse = (get_time() as f32 * 3.0).sin() * 0.15 + 1.0;
+            // Highlight area.
+            draw_rectangle(star_px, star_py, area, area, color_u8!(255, 220, 50, 40));
+            draw_rectangle_lines(star_px, star_py, area, area, 2.0, color_u8!(255, 220, 50, 150));
+            // Centre glow.
+            let cx = star_px + TILE_SIZE;
+            let cy = star_py + TILE_SIZE;
+            let sr = TILE_SIZE * 0.4 * pulse;
+            draw_circle(cx, cy, sr, color_u8!(255, 220, 50, 180));
+            draw_circle(cx, cy, sr * 0.5, color_u8!(255, 255, 150, 255));
         }
 
         // --- Layer 2: Entities (player) ---
@@ -385,14 +444,185 @@ async fn main() {
             }
         }
 
-        // HUD.
+        // --- HUD ---
+        // Urgency bar (bottom-left).
+        {
+            let bar_x = 10.0;
+            let bar_y = screen_height() - 40.0;
+            let bar_w = 200.0;
+            let bar_h = 20.0;
+            draw_rectangle(bar_x, bar_y, bar_w, bar_h, color_u8!(30, 30, 40, 200));
+            let urg_frac = state.urgency.clamp(0.0, 1.0);
+            let urg_color = if urg_frac > 0.7 {
+                color_u8!(220, 50, 50, 255)
+            } else if urg_frac > 0.4 {
+                color_u8!(220, 180, 50, 255)
+            } else {
+                color_u8!(50, 180, 80, 255)
+            };
+            draw_rectangle(bar_x, bar_y, bar_w * urg_frac, bar_h, urg_color);
+            draw_rectangle_lines(bar_x, bar_y, bar_w, bar_h, 1.0, color_u8!(100, 100, 110, 200));
+            draw_text(
+                &format!("Urgency {:.0}%", urg_frac * 100.0),
+                bar_x + 4.0,
+                bar_y + 15.0,
+                16.0,
+                WHITE,
+            );
+        }
+
+        // Progress counter.
         draw_text(
-            "Phase 1 — WASD move, Tab debug",
+            &format!("{} / {} objectives", state.completed, state.goal_count),
             10.0,
-            screen_height() - 10.0,
-            20.0,
+            screen_height() - 50.0,
+            18.0,
+            color_u8!(200, 200, 200, 255),
+        );
+
+        // State indicator.
+        let state_text = match &state.move_state {
+            MoveState::Walking => "Walking",
+            MoveState::Running => "Running",
+            MoveState::Preparing => "Preparing...",
+            MoveState::Pooping(_) => "Pooping...",
+            MoveState::UsingToilet(_) => "Using toilet...",
+            MoveState::StandingUp(_) => "Standing up...",
+        };
+        draw_text(
+            state_text,
+            220.0,
+            screen_height() - 24.0,
+            16.0,
             color_u8!(180, 180, 180, 255),
         );
+
+        draw_text(
+            "WASD move | Shift run | Hold E to poop | Tab debug",
+            10.0,
+            screen_height() - 6.0,
+            14.0,
+            color_u8!(120, 120, 130, 255),
+        );
+
+        // --- E hold progress bar (near player) ---
+        if state.interact_hold > 0.0 && preparing {
+            let hold_frac = (state.interact_hold / 1.0).clamp(0.0, 1.0);
+            let bar_w = TILE_SIZE * 1.5;
+            let bar_h = 6.0;
+            let bx = cx - bar_w * 0.5;
+            let by = cy - state.visual_radius * TILE_SIZE - 14.0;
+            draw_rectangle(bx, by, bar_w, bar_h, color_u8!(30, 30, 40, 200));
+            draw_rectangle(bx, by, bar_w * hold_frac, bar_h, color_u8!(180, 140, 60, 255));
+        }
+
+        // --- Toast message ---
+        if let Some((ref msg, t)) = state.toast {
+            let alpha = (t.min(0.5) * 2.0).min(1.0); // fade out in last 0.5s
+            let tw = measure_text(msg, None, 28, 1.0);
+            let tx = (screen_width() - tw.width) * 0.5;
+            let ty = screen_height() * 0.25;
+            draw_text(msg, tx, ty, 28.0, Color::new(1.0, 0.9, 0.4, alpha));
+        }
+
+        // --- QTE Overlay ---
+        if let MoveState::Pooping(ref qte) | MoveState::UsingToilet(ref qte) = state.move_state {
+            let qte_w = 320.0;
+            let qte_h = 150.0;
+            let qte_x = (screen_width() - qte_w) * 0.5;
+            let qte_y = screen_height() * 0.3;
+
+            // Background.
+            draw_rectangle(qte_x, qte_y, qte_w, qte_h, color_u8!(20, 20, 30, 230));
+            // Border: flash red on fail.
+            let border_color = if qte.round_failed {
+                color_u8!(255, 50, 50, 255)
+            } else {
+                color_u8!(200, 200, 100, 200)
+            };
+            draw_rectangle_lines(qte_x, qte_y, qte_w, qte_h, 2.0, border_color);
+
+            let title = if matches!(state.move_state, MoveState::Pooping(_)) {
+                "POOPING"
+            } else {
+                "TOILET"
+            };
+            // Title + round progress.
+            draw_text(
+                &format!("{} — Round {}/{}", title, qte.rounds_completed + 1, qte.rounds_needed),
+                qte_x + 10.0, qte_y + 22.0, 18.0, color_u8!(255, 220, 100, 255),
+            );
+            // Stand-up hint.
+            draw_text(
+                "E = stand up",
+                qte_x + qte_w - 95.0, qte_y + 22.0, 13.0, color_u8!(150, 150, 150, 200),
+            );
+
+            // Always draw key sequence (even during fail flash).
+            let key_size = 40.0;
+            let gap = 8.0;
+            let total_w = qte.sequence.len() as f32 * (key_size + gap) - gap;
+            let start_x = qte_x + (qte_w - total_w) * 0.5;
+            let key_y = qte_y + 40.0;
+
+            for (i, key) in qte.sequence.iter().enumerate() {
+                let kx = start_x + i as f32 * (key_size + gap);
+                let color = if qte.round_failed {
+                    color_u8!(120, 40, 40, 255) // all red-ish during fail
+                } else if i < qte.progress {
+                    color_u8!(50, 180, 80, 255)  // done
+                } else if i == qte.progress {
+                    color_u8!(255, 220, 50, 255) // current
+                } else {
+                    color_u8!(80, 80, 90, 255)   // upcoming
+                };
+                draw_rectangle(kx, key_y, key_size, key_size, color);
+                draw_text(key.label(), kx + 12.0, key_y + 28.0, 24.0, color_u8!(20, 20, 30, 255));
+            }
+
+            // Timer bar.
+            let timer_frac = (qte.timer / qte.time_per_key).clamp(0.0, 1.0);
+            let timer_y = qte_y + 90.0;
+            draw_rectangle(qte_x + 10.0, timer_y, qte_w - 20.0, 8.0, color_u8!(40, 40, 50, 255));
+            draw_rectangle(qte_x + 10.0, timer_y, (qte_w - 20.0) * timer_frac, 8.0, color_u8!(100, 200, 255, 200));
+
+            // Poop progress bar (rounds completed / rounds needed).
+            let prog_y = qte_y + qte_h - 20.0;
+            let prog_w = qte_w - 20.0;
+            let prog_frac = qte.rounds_completed as f32 / qte.rounds_needed.max(1) as f32;
+            draw_rectangle(qte_x + 10.0, prog_y, prog_w, 10.0, color_u8!(40, 40, 50, 255));
+            draw_rectangle(qte_x + 10.0, prog_y, prog_w * prog_frac, 10.0, color_u8!(80, 220, 100, 255));
+            draw_rectangle_lines(qte_x + 10.0, prog_y, prog_w, 10.0, 1.0, color_u8!(100, 100, 110, 150));
+        }
+
+        // --- Floating kaomoji bubbles ---
+        for b in &state.bubbles {
+            let fade_in = (b.age / 0.3).min(1.0);
+            let fade_out = ((b.lifetime - b.age) / 0.5).min(1.0).max(0.0);
+            let alpha = fade_in * fade_out;
+            let bx = cx + b.x_offset;
+            let by = cy - state.visual_radius * TILE_SIZE - 20.0 + b.y_offset;
+            draw_text(&b.text, bx, by, 18.0, Color::new(1.0, 0.9, 0.5, alpha));
+        }
+
+        // --- Win/Lose screen ---
+        if state.phase == Phase::Win {
+            let text = "YOU WIN! Press R to restart";
+            draw_rectangle(0.0, 0.0, screen_width(), screen_height(), color_u8!(0, 0, 0, 150));
+            let tw = measure_text(text, None, 40, 1.0);
+            draw_text(text, (screen_width() - tw.width) * 0.5, screen_height() * 0.5, 40.0, color_u8!(100, 255, 100, 255));
+        }
+        if state.phase == Phase::Lose {
+            let text = "GAME OVER — Urgency maxed! Press R to restart";
+            draw_rectangle(0.0, 0.0, screen_width(), screen_height(), color_u8!(0, 0, 0, 150));
+            let tw = measure_text(text, None, 36, 1.0);
+            draw_text(text, (screen_width() - tw.width) * 0.5, screen_height() * 0.5, 36.0, color_u8!(255, 80, 80, 255));
+        }
+
+        // Restart key.
+        if is_key_pressed(KeyCode::R) && state.phase != Phase::Playing {
+            state.reset_position();
+        }
 
         // --- Debug panel ---
         if debug.visible {
@@ -414,15 +644,29 @@ async fn main() {
 
             let mut physics_dirty = false;
 
+            // Tick rate slider.
+            {
+                let mut tick_f = state.tick_ms as f32;
+                if debug.slider(20, panel_x, py, pw, "tick_ms", &mut tick_f, 1.0, 200.0) {
+                    state.tick_ms = tick_f.round().max(1.0) as u64;
+                    physics_dirty = true;
+                }
+            }
+            py += row_h;
+
             physics_dirty |= debug.slider(
-                0, panel_x, py, pw, "acceleration", &mut state.raw_accel, 0.01, 2.0,
+                0, panel_x, py, pw, "accel g/s²", &mut state.raw_accel, 1.0, 100.0,
             );
             py += row_h;
             physics_dirty |= debug.slider(
                 1, panel_x, py, pw, "friction", &mut state.raw_friction, 0.0, 0.99,
             );
             py += row_h;
-            debug.slider(
+            physics_dirty |= debug.slider(
+                21, panel_x, py, pw, "stop_friction", &mut state.raw_stop_friction, 0.0, 0.99,
+            );
+            py += row_h;
+            physics_dirty |= debug.slider(
                 2, panel_x, py, pw, "max_speed", &mut state.max_speed, 0.1, 5.0,
             );
             py += row_h;
@@ -442,10 +686,70 @@ async fn main() {
                 6, panel_x, py, pw, "repulsion_rng", &mut state.repulsion_range, 0.05, 2.0,
             );
             py += row_h;
+            debug.slider(
+                22, panel_x, py, pw, "repulsion_push", &mut state.repulsion_push, 0.0, 1.0,
+            );
+            py += row_h;
 
             if physics_dirty {
                 state.recompute_effective();
             }
+
+            // Gameplay sliders.
+            py += 6.0;
+            draw_rectangle(panel_x, py, pw, 18.0, color_u8!(20, 22, 36, 230));
+            draw_text("GAMEPLAY", panel_x + 4.0, py + 14.0, 13.0, color_u8!(255, 180, 80, 255));
+            py += 20.0;
+
+            debug.slider(
+                10, panel_x, py, pw, "urgency_rate", &mut state.urgency_rate, 0.0001, 0.02,
+            );
+            py += row_h;
+            debug.slider(
+                11, panel_x, py, pw, "toilet_relief", &mut state.toilet_relief, 0.05, 1.0,
+            );
+            py += row_h;
+            debug.slider(
+                25, panel_x, py, pw, "star_relief", &mut state.star_relief, 0.01, 0.5,
+            );
+            py += row_h;
+            {
+                let mut gc = state.goal_count as f32;
+                if debug.slider(12, panel_x, py, pw, "goal_count", &mut gc, 1.0, 20.0) {
+                    state.goal_count = gc.round().max(1.0) as u32;
+                }
+            }
+            py += row_h;
+            {
+                let mut ql = state.qte_length as f32;
+                if debug.slider(13, panel_x, py, pw, "qte_length", &mut ql, 1.0, 10.0) {
+                    state.qte_length = ql.round().max(1.0) as u32;
+                }
+            }
+            py += row_h;
+            debug.slider(
+                14, panel_x, py, pw, "qte_time/key", &mut state.qte_time_per_key, 0.3, 3.0,
+            );
+            py += row_h;
+            {
+                let mut pr = state.poop_rounds as f32;
+                if debug.slider(23, panel_x, py, pw, "poop_rounds", &mut pr, 1.0, 10.0) {
+                    state.poop_rounds = pr.round().max(1.0) as u32;
+                }
+            }
+            py += row_h;
+            debug.slider(
+                15, panel_x, py, pw, "run_speed_x", &mut state.run_speed_mult, 1.0, 4.0,
+            );
+            py += row_h;
+            debug.slider(
+                24, panel_x, py, pw, "run_accel_x", &mut state.run_accel_mult, 1.0, 4.0,
+            );
+            py += row_h;
+            debug.slider(
+                16, panel_x, py, pw, "run_urg_x", &mut state.run_urgency_mult, 1.0, 5.0,
+            );
+            py += row_h;
 
             // Telemetry.
             py += 4.0;
@@ -465,6 +769,14 @@ async fn main() {
                 &format!(
                     "tile ({}, {})  clearance {:.3}",
                     tile.0, tile.1, state.dbg_clearance
+                ),
+            );
+            py += 24.0;
+            debug.info_row(
+                panel_x, py, pw,
+                &format!(
+                    "urgency {:.1}%  done {}/{}",
+                    state.urgency * 100.0, state.completed, state.goal_count
                 ),
             );
             py += 28.0;

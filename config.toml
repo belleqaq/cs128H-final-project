@@ -6,13 +6,24 @@ width = 1280
 height = 720
 title = "Brownshock"
 
-tick_ms = 150
+tick_ms = 8
 
 [player]
 max_speed = 1.0
-acceleration = 0.3
+acceleration = 13.33   # grid/s²
 friction = 0.85
+stop_friction = 0.5
 collision_radius = 0.15
 visual_radius = 0.35
 repulsion_power = 2.0
 repulsion_range = 0.5
+repulsion_push = 0.15
+
+[gameplay]
+urgency_rate = 0.002
+toilet_relief = 0.4
+star_relief = 0.15
+goal_count = 3
+qte_length = 4
+qte_time_per_key = 1.0
+poop_rounds = 3

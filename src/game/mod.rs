@@ -4,7 +4,7 @@ pub mod cell;
 pub mod config;
 pub mod state;
 
-pub use config::{load_config, load_debug_preset, save_debug_preset, DebugPreset, GameConfig};
+pub use config::{load_config, load_debug_preset, save_debug_preset, DebugPreset, GameConfig, GameplaySettings};
 pub use state::State;
 
 /// Baseline tick duration that config friction/acceleration values are

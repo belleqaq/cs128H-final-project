@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Terrain {
     Floor,
     Wall,

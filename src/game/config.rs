@@ -9,6 +9,7 @@ pub struct GameConfig {
     pub window: WindowSettings,
     pub tick_ms: u64,
     pub player: PlayerSettings,
+    pub gameplay: GameplaySettings,
 }
 
 impl Default for GameConfig {
@@ -17,6 +18,40 @@ impl Default for GameConfig {
             window: WindowSettings::default(),
             tick_ms: 150,
             player: PlayerSettings::default(),
+            gameplay: GameplaySettings::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(default)]
+pub struct GameplaySettings {
+    /// Urgency increase per tick (0.0–1.0 scale).
+    pub urgency_rate: f32,
+    /// Urgency reduced when using a toilet.
+    pub toilet_relief: f32,
+    /// Urgency reduced when completing a star poop (less than toilet).
+    pub star_relief: f32,
+    /// Number of star objectives to win.
+    pub goal_count: u32,
+    /// QTE sequence length (number of keys per round).
+    pub qte_length: u32,
+    /// Seconds allowed per QTE key press.
+    pub qte_time_per_key: f32,
+    /// Rounds of QTE needed per poop session.
+    pub poop_rounds: u32,
+}
+
+impl Default for GameplaySettings {
+    fn default() -> Self {
+        Self {
+            urgency_rate: 0.002,
+            toilet_relief: 0.4,
+            star_relief: 0.15,
+            goal_count: 3,
+            qte_length: 4,
+            qte_time_per_key: 1.0,
+            poop_rounds: 3,
         }
     }
 }
@@ -43,24 +78,29 @@ impl Default for WindowSettings {
 #[serde(default)]
 pub struct PlayerSettings {
     pub max_speed: f32,
+    /// Acceleration in grid/s² (tick-independent unit).
     pub acceleration: f32,
     pub friction: f32,
+    pub stop_friction: f32,
     pub collision_radius: f32,
     pub visual_radius: f32,
     pub repulsion_power: f32,
     pub repulsion_range: f32,
+    pub repulsion_push: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
             max_speed: 1.0,
-            acceleration: 0.3,
+            acceleration: 13.33,
             friction: 0.85,
+            stop_friction: 0.5,
             collision_radius: 0.15,
             visual_radius: 0.35,
             repulsion_power: 2.0,
             repulsion_range: 0.5,
+            repulsion_push: 0.15,
         }
     }
 }
@@ -91,10 +131,12 @@ pub struct DebugPreset {
     pub max_speed: f32,
     pub acceleration: f32,
     pub friction: f32,
+    pub stop_friction: f32,
     pub collision_radius: f32,
     pub visual_radius: f32,
     pub repulsion_power: f32,
     pub repulsion_range: f32,
+    pub repulsion_push: f32,
 }
 
 impl Default for DebugPreset {
@@ -104,10 +146,12 @@ impl Default for DebugPreset {
             max_speed: p.max_speed,
             acceleration: p.acceleration,
             friction: p.friction,
+            stop_friction: p.stop_friction,
             collision_radius: p.collision_radius,
             visual_radius: p.visual_radius,
             repulsion_power: p.repulsion_power,
             repulsion_range: p.repulsion_range,
+            repulsion_push: p.repulsion_push,
         }
     }
 }
