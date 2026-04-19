@@ -1,7 +1,7 @@
 # Brownshock — Design & Migration Plan
 
-Status: **DESIGN PHASE** — do not implement until design is stable.
-Last updated: 2026-04-17
+Status: **Phase 2 COMPLETE** — Phase 3 (NPCs) next.
+Last updated: 2026-04-18
 
 ---
 
@@ -411,44 +411,44 @@ the next is just struct definitions + function signatures. An implementer
 can read the current code's type signatures and pick up from there, even if
 details of prior phases are forgotten.
 
-### Phase 1 — Ground: Move + Map + Render
+### Phase 1 — Ground: Move + Map + Render ✅ DONE
 
 **Goal:** Walk around a visible apartment map.
 
-Scope:
+Implemented:
 - macroquad 0.4 window (1280×720)
-- Tile grid: Cell { terrain, furniture } data structure
-- 2D vector physics (port from current codebase, extend to 2D)
-- One hand-written test map (hallway + 3-4 rooms + 2 public toilets)
-- Top-down rendering with Y-sorted depth (primitives, teammate's style)
-- Camera follow with smooth lerp
-- No NPCs, no QTE, no urgency
+- Tile grid: Cell { terrain } + Terrain enum (Floor/Wall/DoorOpen/DoorClosed/Toilet)
+- Continuous 2D physics: SDF collision, sub-stepped integration, soft repulsion
+- Frame interpolation (lerp between prev_pos and pos)
+- Hand-written test map with hallway + rooms + 2 toilet areas + star positions
+- Top-down rendering with layered depth (floor → entities → walls)
+- Debug panel: sliders for all physics params, save/load/reset presets
+- tick_ms configurable (default 8ms), tick-independent friction/accel
 
-**Playable result:** Walk around a map. Verify tile size, room proportions,
-movement feel.
+### Phase 2 — Core Loop: Urgency + Poop QTE ✅ DONE
 
-**Contract for next phase:** `Cell`, `Terrain`, `Furniture` structs;
-`State` with 2D `velocity`/`move_accumulator`; `MoveState` enum (initially
-just `Normal`).
+**Goal:** Manage urgency, poop at toilets/stars, QTE system. No NPCs yet.
 
-### Phase 2 — Core Loop: Urgency + Poop QTE + Fart QTE
+Implemented:
+- Urgency meter (HUD bar, rises per tick, sprint accelerates it)
+- State machine: Walking ↔ Running → Preparing → Pooping/UsingToilet → StandingUp → Walking
+- Preparing: E hold with deceleration via physics, 1s hold to enter QTE
+- QTE: multi-round WASD key sequence, per-key timer, fail-retry with flash
+- Star objectives: N stars on map, complete QTE at star = progress toward win
+- Toilet vs star relief: toilet gives more urgency reduction than star
+- StandingUp: 0.5s post-QTE stun with kaomoji toast
+- Invalid tile E press: instant kaomoji toast ("can't poop here")
+- E press during QTE: abort and stand up
+- Sprint: Shift key with separate speed/accel/urgency multipliers
+- Floating kaomoji bubbles during QTE
+- QTE HUD: key sequence display, timer bar, poop progress bar, border flash on fail
+- E hold progress bar during Preparing state
+- Debug panel: added run_accel_mult + star_relief sliders
+- **Architecture fix**: discrete E-press events processed per-frame (not per-tick)
+  to avoid signal loss at high refresh rates
 
-**Goal:** Manage urgency, poop at toilets, suppress farts. No NPCs yet.
-
-Scope:
-- Urgency meter (HUD bar, rises over time)
-- MoveState::Pooping — enter QTE when pressing E at a toilet tile
-- Poop QTE: timing-zone click mechanic (fill progress bar)
-- Fart QTE: random prompt, frequency scales with urgency
-- NoiseEvent struct (produced on fart failure — no consumers yet)
-- Urgency at max = game over; completing poop = urgency drops
-- Win condition: complete N poops
-
-**Playable result:** Solo urgency management game. Tune QTE feel and urgency
-pacing without NPC noise.
-
-**Contract for next phase:** `NoiseEvent { pos, radius, timestamp }`;
-`MoveState` enum with `Pooping` variant; urgency value readable from State.
+**Contract for next phase:** `MoveState` enum with all 6 variants; urgency
+value readable from State; `Phase` enum (Playing/Win/Lose).
 
 ### Phase 3 — Opponent: NPCs = Direction A Complete
 
@@ -508,20 +508,24 @@ Scope:
 
 ## 8. Open Design Questions
 
-- [ ] Tile pixel size: 32px? 48px? 64px?
+Resolved:
+- [x] Tile pixel size → 32px
+- [x] Sprint trigger → Shift hold (with accel/speed/urgency multipliers)
+- [x] Urgency meter rate → 0.002/tick (configurable), toilet_relief=0.4, star_relief=0.15
+- [x] How many poops to win → goal_count=3 (configurable)
+- [x] Interact key → E (hold to prepare, release to cancel)
+- [x] QTE type → WASD key sequence, multi-round, timed per key
+
+Open:
 - [ ] Furniture: block movement, block only vision, or per-type?
 - [ ] Art assets: free tileset or all primitive drawing?
-- [ ] Sprint trigger: Shift hold? Double-tap? (future, not MVP)
 - [ ] How does player know toilet difficulty? Visual cue? Proximity prompt?
 - [ ] Specific toilet modifier sets for each bathroom.
-- [ ] Urgency meter rate: how fast does it climb? Reset amount per poop?
-- [ ] How many poops to win a level?
 - [ ] Fart QTE frequency curve (urgency → probability per tick).
 - [ ] NPC vision cone parameters (range, angle).
 - [ ] Detection time thresholds (how long in cone before state change).
 - [ ] Number of NPCs per level, their routine compositions.
 - [ ] Multi-floor: future expansion or single-floor only?
-- [ ] Interact key: E? Space?
 - [ ] Player awareness indicator (eye icon when in vision cone)?
 - [ ] Minimap or directional hint for finding bathrooms?
 - [ ] Escalation between poops (new NPC wakes up, route changes)?
