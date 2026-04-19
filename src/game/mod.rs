@@ -2,6 +2,8 @@
 
 pub mod cell;
 pub mod config;
+pub mod npc;
+pub mod physics;
 pub mod state;
 
 pub use config::{load_config, load_debug_preset, save_debug_preset, DebugPreset, GameConfig, GameplaySettings};

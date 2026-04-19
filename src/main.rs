@@ -5,6 +5,7 @@
 mod game;
 
 use game::cell::{idx, Cell, Terrain};
+use game::npc::{ActivityPhase, AlertState, Npc, NpcActivity, NpcRoutine, STEER_SLOTS};
 use game::state::{MoveState, Phase, QteKey};
 use game::{load_config, load_debug_preset, save_debug_preset, GameConfig, State};
 use macroquad::prelude::*;
@@ -23,13 +24,49 @@ fn window_conf() -> Conf {
     }
 }
 
-/// Build a small test map: hallway with rooms and two toilets.
+// ---------------------------------------------------------------------------
+// Room definitions (for rendering color + NPC patrol targets)
+// ---------------------------------------------------------------------------
+
+/// Room type for coloring and NPC logic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomType { NpcRoom, Toilet, TrashRoom }
+
+/// Constant room layout for the test map.
+const ROOMS: &[(RoomType, i32, i32, i32, i32)] = &[
+    // (type, x1, y1, x2, y2)
+    (RoomType::NpcRoom,   1,  1,  8,  7),
+    (RoomType::Toilet,   10,  1, 17,  7),
+    (RoomType::TrashRoom,19,  1, 28,  7),
+];
+
+/// Check if a grid position falls inside a room, return its type.
+fn room_at(x: i32, y: i32) -> Option<RoomType> {
+    for &(rt, x1, y1, x2, y2) in ROOMS {
+        if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+            return Some(rt);
+        }
+    }
+    None
+}
+
+/// Build the test map: three walled rooms up top, corridor, open area below.
+///
+/// Layout (30×20):
+///   y=0:       border wall
+///   y=1-7:     NPC Room (x=1-8) | Toilet (x=10-17) | Trash Room (x=19-28)
+///              separated by vertical walls at x=9, x=18
+///   y=8:       horizontal wall with 2-tile door openings
+///   y=9-11:    corridor (Floor)
+///   y=12:      horizontal wall with 2-tile door openings
+///   y=13-18:   open area (Floor)
+///   y=19:      border wall
 fn test_map() -> (Vec<Cell>, i32, i32) {
     let w = 30;
     let h = 20;
     let mut map = vec![Cell::default(); (w * h) as usize];
 
-    // Walls around the border.
+    // Border walls.
     for x in 0..w {
         map[idx(x, 0, w)].terrain = Terrain::Wall;
         map[idx(x, h - 1, w)].terrain = Terrain::Wall;
@@ -39,24 +76,31 @@ fn test_map() -> (Vec<Cell>, i32, i32) {
         map[idx(w - 1, y, w)].terrain = Terrain::Wall;
     }
 
-    // Horizontal corridor wall at y=8 and y=12 (leaving gap for hallway).
+    // Vertical walls between rooms (x=9, x=18, from y=1 to y=7).
+    for y in 1..=7 {
+        map[idx(9, y, w)].terrain = Terrain::Wall;
+        map[idx(18, y, w)].terrain = Terrain::Wall;
+    }
+
+    // Horizontal corridor walls at y=8 and y=12.
     for x in 1..w - 1 {
         map[idx(x, 8, w)].terrain = Terrain::Wall;
         map[idx(x, 12, w)].terrain = Terrain::Wall;
     }
 
-    // Doors in corridor walls.
-    map[idx(5, 8, w)].terrain = Terrain::DoorClosed;
-    map[idx(15, 8, w)].terrain = Terrain::DoorClosed;
-    map[idx(24, 8, w)].terrain = Terrain::DoorClosed;
-    map[idx(5, 12, w)].terrain = Terrain::DoorClosed;
-    map[idx(15, 12, w)].terrain = Terrain::DoorClosed;
-    map[idx(24, 12, w)].terrain = Terrain::DoorClosed;
+    // Door openings (2 tiles wide) in y=8 wall.
+    for &dx in &[4, 5] { map[idx(dx, 8, w)].terrain = Terrain::Floor; }   // NPC room door
+    for &dx in &[13, 14] { map[idx(dx, 8, w)].terrain = Terrain::Floor; } // Toilet door
+    for &dx in &[22, 23] { map[idx(dx, 8, w)].terrain = Terrain::Floor; } // Trash room door
 
-    // Toilet area (contiguous 2×3 block in top-left room).
-    for ty in 2..=3 {
-        for tx in 3..=5 {
-            map[idx(tx, ty, w)].terrain = Terrain::Toilet;
+    // Door openings in y=12 wall (access to lower area).
+    for &dx in &[7, 8] { map[idx(dx, 12, w)].terrain = Terrain::Floor; }
+    for &dx in &[20, 21] { map[idx(dx, 12, w)].terrain = Terrain::Floor; }
+
+    // Toilet room floor tiles.
+    for y in 1..=7 {
+        for x in 10..=17 {
+            map[idx(x, y, w)].terrain = Terrain::Toilet;
         }
     }
 
@@ -74,6 +118,8 @@ struct DebugPanel {
     editing: Option<usize>,
     /// Text buffer while editing a value.
     edit_buf: String,
+    /// Whether the NPC Steering section is expanded.
+    npc_steer_open: bool,
 }
 
 impl DebugPanel {
@@ -83,6 +129,7 @@ impl DebugPanel {
             dragging: None,
             editing: None,
             edit_buf: String::new(),
+            npc_steer_open: false,
         }
     }
 
@@ -270,6 +317,22 @@ async fn main() {
         state.apply_preset(&preset);
     }
 
+    // Spawn one test NPC in NPC Room (x=1-8, y=1-7), center ≈ (4.5, 4.5).
+    {
+        let routine = NpcRoutine {
+            activities: vec![
+                NpcActivity::IdleInRoom { room_pos: (4, 4), idle_min_s: 3.0, idle_max_s: 6.0 },
+                NpcActivity::GoToToilet { toilet_pos: (13, 4), use_duration_s: 5.0 },
+                NpcActivity::IdleInRoom { room_pos: (4, 4), idle_min_s: 2.0, idle_max_s: 4.0 },
+                NpcActivity::TakeOutTrash { trash_pos: (23, 4), stop_duration_s: 2.0 },
+            ],
+            current: 0,
+            timer: 3.0,
+            phase: ActivityPhase::Performing,
+        };
+        state.npcs.push(Npc::new((4.5, 4.5), routine));
+    }
+
     // Tick accumulator for fixed-step game logic.
     let mut tick_acc: f64 = 0.0;
 
@@ -356,10 +419,15 @@ async fn main() {
 
                 let color = match cell.terrain {
                     Terrain::Wall => continue,
-                    Terrain::Floor => color_u8!(39, 43, 63, 255),
+                    Terrain::Toilet => color_u8!(200, 200, 220, 255),
                     Terrain::DoorOpen => color_u8!(70, 60, 40, 255),
                     Terrain::DoorClosed => color_u8!(120, 90, 50, 255),
-                    Terrain::Toilet => color_u8!(200, 200, 220, 255),
+                    Terrain::Floor => match room_at(gx, gy) {
+                        Some(RoomType::NpcRoom) => color_u8!(50, 55, 90, 255),   // blue tint
+                        Some(RoomType::TrashRoom) => color_u8!(45, 70, 50, 255), // green tint
+                        Some(RoomType::Toilet) => color_u8!(200, 200, 220, 255), // shouldn't happen
+                        None => color_u8!(39, 43, 63, 255),                      // corridor/open
+                    },
                 };
                 draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE, color);
 
@@ -393,7 +461,7 @@ async fn main() {
         // --- Layer 2: Entities (player) ---
         let cx = vx * TILE_SIZE - cam_x;
         let cy = vy * TILE_SIZE - cam_y;
-        let vr = state.visual_radius * TILE_SIZE;
+        let vr = state.radius * TILE_SIZE;
         // Shadow.
         draw_circle(cx, cy + vr * 0.3, vr * 0.7, color_u8!(10, 10, 20, 80));
         // Body.
@@ -401,13 +469,13 @@ async fn main() {
 
         // Debug overlays on player.
         if debug.visible {
-            let cr_px = state.collision_radius * TILE_SIZE;
+            let cr_px = state.radius * TILE_SIZE;
 
             // Collision circle (red).
             draw_circle_lines(cx, cy, cr_px, 1.0, color_u8!(255, 80, 80, 180));
 
             // Repulsion range circle (yellow).
-            let rep_px = (state.collision_radius + state.repulsion_range) * TILE_SIZE;
+            let rep_px = (state.radius + state.repulsion_range) * TILE_SIZE;
             draw_circle_lines(cx, cy, rep_px, 1.0, color_u8!(255, 200, 60, 100));
 
             // Nearest-wall normal line (green, from centre toward wall).
@@ -422,6 +490,78 @@ async fn main() {
                     2.0,
                     color_u8!(80, 220, 100, 180),
                 );
+            }
+        }
+
+        // --- NPCs ---
+        for (npc_idx, npc) in state.npcs.iter().enumerate() {
+            let (nx, ny) = npc.visual_pos(t);
+            let ncx = nx * TILE_SIZE - cam_x;
+            let ncy = ny * TILE_SIZE - cam_y;
+            let nvr = npc.radius * TILE_SIZE;
+            // Shadow.
+            draw_circle(ncx, ncy + nvr * 0.3, nvr * 0.7, color_u8!(10, 10, 20, 80));
+            // Body (red-tinted to distinguish from player).
+            draw_circle(ncx, ncy, nvr, color_u8!(200, 100, 100, 255));
+
+            // Alert indicator above head.
+            match npc.alert_state {
+                AlertState::Suspicious => {
+                    draw_text("?", ncx - 5.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 220, 50, 255));
+                }
+                AlertState::Alert => {
+                    draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
+                }
+                _ => {}
+            }
+
+            // Debug: collision circle + facing direction + context steering vis.
+            if debug.visible {
+                let ncr = npc.radius * TILE_SIZE;
+                draw_circle_lines(ncx, ncy, ncr, 1.0, color_u8!(255, 80, 80, 180));
+                // Facing line.
+                let fl = TILE_SIZE * 1.0;
+                draw_line(
+                    ncx, ncy,
+                    ncx + npc.facing.0 * fl,
+                    ncy + npc.facing.1 * fl,
+                    2.0,
+                    color_u8!(255, 255, 100, 200),
+                );
+
+                // Context steering rays (first NPC only).
+                if npc_idx == 0 && debug.npc_steer_open {
+                    let step = std::f32::consts::TAU / STEER_SLOTS as f32;
+                    // Find max score for normalisation.
+                    let max_score = npc.steer_scores.iter().cloned()
+                        .fold(0.01f32, f32::max);
+                    for i in 0..STEER_SLOTS {
+                        let angle = step * i as f32;
+                        let cdx = angle.cos();
+                        let cdy = angle.sin();
+                        let norm = npc.steer_scores[i] / max_score;
+                        let ray_len = TILE_SIZE * 1.2 * norm;
+                        // Color: low=dim blue, high=bright green.
+                        let g = (norm * 220.0) as u8;
+                        let b = ((1.0 - norm) * 180.0) as u8;
+                        let alpha = 80 + (norm * 150.0) as u8;
+                        draw_line(
+                            ncx, ncy,
+                            ncx + cdx * ray_len, ncy + cdy * ray_len,
+                            1.5,
+                            Color::from_rgba(40, g, b, alpha),
+                        );
+                    }
+                    // Chosen direction — white, thicker.
+                    let chosen_len = TILE_SIZE * 1.4;
+                    draw_line(
+                        ncx, ncy,
+                        ncx + npc.steer_chosen.0 * chosen_len,
+                        ncy + npc.steer_chosen.1 * chosen_len,
+                        2.5,
+                        color_u8!(255, 255, 255, 220),
+                    );
+                }
             }
         }
 
@@ -511,7 +651,7 @@ async fn main() {
             let bar_w = TILE_SIZE * 1.5;
             let bar_h = 6.0;
             let bx = cx - bar_w * 0.5;
-            let by = cy - state.visual_radius * TILE_SIZE - 14.0;
+            let by = cy - state.radius * TILE_SIZE - 14.0;
             draw_rectangle(bx, by, bar_w, bar_h, color_u8!(30, 30, 40, 200));
             draw_rectangle(bx, by, bar_w * hold_frac, bar_h, color_u8!(180, 140, 60, 255));
         }
@@ -601,7 +741,7 @@ async fn main() {
             let fade_out = ((b.lifetime - b.age) / 0.5).min(1.0).max(0.0);
             let alpha = fade_in * fade_out;
             let bx = cx + b.x_offset;
-            let by = cy - state.visual_radius * TILE_SIZE - 20.0 + b.y_offset;
+            let by = cy - state.radius * TILE_SIZE - 20.0 + b.y_offset;
             draw_text(&b.text, bx, by, 18.0, Color::new(1.0, 0.9, 0.5, alpha));
         }
 
@@ -642,40 +782,33 @@ async fn main() {
             );
             py += 24.0;
 
-            let mut physics_dirty = false;
-
             // Tick rate slider.
             {
                 let mut tick_f = state.tick_ms as f32;
                 if debug.slider(20, panel_x, py, pw, "tick_ms", &mut tick_f, 1.0, 200.0) {
                     state.tick_ms = tick_f.round().max(1.0) as u64;
-                    physics_dirty = true;
                 }
             }
             py += row_h;
 
-            physics_dirty |= debug.slider(
+            debug.slider(
                 0, panel_x, py, pw, "accel g/s²", &mut state.raw_accel, 1.0, 100.0,
             );
             py += row_h;
-            physics_dirty |= debug.slider(
+            debug.slider(
                 1, panel_x, py, pw, "friction", &mut state.raw_friction, 0.0, 0.99,
             );
             py += row_h;
-            physics_dirty |= debug.slider(
+            debug.slider(
                 21, panel_x, py, pw, "stop_friction", &mut state.raw_stop_friction, 0.0, 0.99,
             );
             py += row_h;
-            physics_dirty |= debug.slider(
+            debug.slider(
                 2, panel_x, py, pw, "max_speed", &mut state.max_speed, 0.1, 5.0,
             );
             py += row_h;
             debug.slider(
-                3, panel_x, py, pw, "collision_r", &mut state.collision_radius, 0.01, 0.49,
-            );
-            py += row_h;
-            debug.slider(
-                4, panel_x, py, pw, "visual_r", &mut state.visual_radius, 0.05, 0.5,
+                3, panel_x, py, pw, "radius", &mut state.radius, 0.05, 0.5,
             );
             py += row_h;
             debug.slider(
@@ -690,10 +823,6 @@ async fn main() {
                 22, panel_x, py, pw, "repulsion_push", &mut state.repulsion_push, 0.0, 1.0,
             );
             py += row_h;
-
-            if physics_dirty {
-                state.recompute_effective();
-            }
 
             // Gameplay sliders.
             py += 6.0;
@@ -821,6 +950,69 @@ async fn main() {
                     Color::new(0.4, 1.0, 0.5, alpha),
                 );
                 save_flash -= get_frame_time();
+                py += 18.0;
+            }
+
+            // --- Collapsible: NPC Steering ---
+            py += 6.0;
+            {
+                let header_label = if debug.npc_steer_open {
+                    "[-] NPC STEERING"
+                } else {
+                    "[+] NPC STEERING"
+                };
+                if debug.button(
+                    panel_x, py, pw, 20.0,
+                    header_label,
+                    color_u8!(30, 35, 55, 230),
+                ) {
+                    debug.npc_steer_open = !debug.npc_steer_open;
+                }
+                py += 22.0;
+            }
+            if debug.npc_steer_open {
+                debug.slider(
+                    30, panel_x, py, pw, "seek_w",
+                    &mut state.steer_weights.seek, 0.0, 3.0,
+                );
+                py += row_h;
+                debug.slider(
+                    31, panel_x, py, pw, "wall_w",
+                    &mut state.steer_weights.wall, 0.0, 3.0,
+                );
+                py += row_h;
+                debug.slider(
+                    32, panel_x, py, pw, "velocity_w",
+                    &mut state.steer_weights.velocity, 0.0, 3.0,
+                );
+                py += row_h;
+                py += 4.0;
+                draw_rectangle(panel_x, py, pw, 18.0, color_u8!(20, 22, 36, 230));
+                draw_text("PID", panel_x + 4.0, py + 14.0, 13.0, color_u8!(180, 150, 255, 255));
+                py += 20.0;
+                debug.slider(
+                    33, panel_x, py, pw, "pid_kp",
+                    &mut state.steer_weights.pid_kp, 0.0, 5.0,
+                );
+                py += row_h;
+                debug.slider(
+                    34, panel_x, py, pw, "pid_kd",
+                    &mut state.steer_weights.pid_kd, 0.0, 3.0,
+                );
+                py += row_h;
+                debug.slider(
+                    35, panel_x, py, pw, "pid_ki",
+                    &mut state.steer_weights.pid_ki, 0.0, 1.0,
+                );
+                py += row_h;
+                // Cross-track error display (first NPC).
+                if let Some(npc) = state.npcs.first() {
+                    debug.info_row(
+                        panel_x, py, pw,
+                        &format!("cross-track: {:.3}", npc.pid_cross_track),
+                    );
+                    py += 24.0;
+                }
             }
         }
 
