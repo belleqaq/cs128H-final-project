@@ -140,6 +140,21 @@ impl PartialEq for QteState {
 }
 
 // ---------------------------------------------------------------------------
+// Audio events
+// ---------------------------------------------------------------------------
+
+/// Discrete events that main.rs drains each frame and routes to AudioManager.
+#[derive(Clone, Copy, Debug)]
+pub enum AudioEvent {
+    QteCorrectKey,
+    QteWrongKey,
+    QteRoundComplete,
+    QteSessionComplete,
+    Victory,
+    GameOver,
+}
+
+// ---------------------------------------------------------------------------
 // Phase
 // ---------------------------------------------------------------------------
 
@@ -182,8 +197,8 @@ pub struct State {
     pub repulsion_push: f32,
     pub tick_ms: u64,
     // Input state.
-    input_x: i32,
-    input_y: i32,
+    pub input_x: i32,
+    pub input_y: i32,
     input_run: bool,
     /// E key currently held down (for hold-to-interact).
     input_e_down: bool,
@@ -228,6 +243,8 @@ pub struct State {
     pub dbg_clearance: f32,
     pub dbg_wall_nx: f32,
     pub dbg_wall_ny: f32,
+    /// Events emitted this tick — main.rs drains these to drive AudioManager.
+    pub audio_events: Vec<AudioEvent>,
     /// Active particles (celebration effects on QTE completion).
     pub particles: Vec<Particle>,
     /// Max screen-space shake radius in pixels at urgency=100%.
@@ -289,6 +306,7 @@ impl State {
             dbg_clearance: 0.0,
             dbg_wall_nx: 0.0,
             dbg_wall_ny: 0.0,
+            audio_events: Vec::new(),
             particles: Vec::new(),
             shake_intensity: 8.0,
             particle_count: 12,
@@ -596,29 +614,46 @@ impl State {
 
     /// Feed a QTE key press.  Ignored during fail-flash.
     pub fn qte_press(&mut self, key: QteKey) {
-        let qte = match self.move_state {
-            MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
-            _ => return,
-        };
+        let correct;
+        {
+            let qte = match self.move_state {
+                MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
+                _ => return,
+            };
 
-        if qte.round_failed {
-            return; // wait for auto-retry
-        }
-
-        let expected = qte.sequence[qte.progress];
-        if key == expected {
-            qte.progress += 1;
-            qte.timer = qte.time_per_key;
-            if qte.progress >= qte.sequence.len() {
-                // Round complete!
-                qte.rounds_completed += 1;
-                // Check if all rounds done — handled in tick_qte.
+            if qte.round_failed {
+                return; // wait for auto-retry
             }
-        } else {
-            // Wrong key → round fails, will auto-retry.
-            qte.round_failed = true;
-            qte.fail_timer = FAIL_FLASH_SECS;
+
+            let expected = qte.sequence[qte.progress];
+            correct = key == expected;
+            if correct {
+                qte.progress += 1;
+                qte.timer = qte.time_per_key;
+                if qte.progress >= qte.sequence.len() {
+                    qte.rounds_completed += 1;
+                }
+            } else {
+                qte.round_failed = true;
+                qte.fail_timer = FAIL_FLASH_SECS;
+            }
         }
+        self.audio_events.push(if correct {
+            AudioEvent::QteCorrectKey
+        } else {
+            AudioEvent::QteWrongKey
+        });
+    }
+
+    fn set_win(&mut self) {
+        self.phase = Phase::Win;
+        self.audio_events.push(AudioEvent::Victory);
+    }
+
+    fn set_lose(&mut self) {
+        self.urgency = 1.0;
+        self.phase = Phase::Lose;
+        self.audio_events.push(AudioEvent::GameOver);
     }
 
     /// Transition to StandingUp state with kaomoji toast.
@@ -685,13 +720,13 @@ impl State {
 
         match action {
             Action::SessionDone => {
-                // Apply urgency relief (star < toilet).
+                self.audio_events.push(AudioEvent::QteSessionComplete);
                 if is_pooping {
                     self.completed += 1;
                     self.urgency = (self.urgency - self.star_relief).max(0.0);
                     self.spawn_star();
                     if self.completed >= self.goal_count {
-                        self.phase = Phase::Win;
+                        self.set_win();
                     }
                 } else {
                     self.urgency = (self.urgency - self.toilet_relief).max(0.0);
@@ -700,6 +735,7 @@ impl State {
                 self.enter_standing_up();
             }
             Action::NewRound => {
+                self.audio_events.push(AudioEvent::QteRoundComplete);
                 let new_seq = self.random_key_sequence();
                 let tpk = self.qte_time_per_key;
                 if let MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) = self.move_state {
@@ -929,7 +965,7 @@ impl State {
             }
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
-            if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
+            if self.urgency >= 1.0 { self.set_lose(); }
             return; // Frozen — no movement.
         }
 
@@ -939,7 +975,7 @@ impl State {
             self.tick_bubbles(tick_s);
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
-            if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
+            if self.urgency >= 1.0 { self.set_lose(); }
             return; // Frozen — no movement.
         }
 
@@ -996,8 +1032,7 @@ impl State {
         let urg_mult = if running { self.run_urgency_mult } else { 1.0 };
         self.urgency += self.urgency_rate * urg_mult * dt_ratio_urg;
         if self.urgency >= 1.0 {
-            self.urgency = 1.0;
-            self.phase = Phase::Lose;
+            self.set_lose();
             return;
         }
 
@@ -1075,6 +1110,7 @@ impl State {
         self.bubbles.clear();
         self.bubble_timer = 0.0;
         self.particles.clear();
+        self.audio_events.clear();
         self.spawn_star();
     }
 
