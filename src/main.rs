@@ -344,8 +344,21 @@ async fn main() {
 
         let t = (tick_acc / tick_s).min(1.0) as f32;
         let (vx, vy) = state.player_visual_pos(t);
-        let cam_x = vx * TILE_SIZE - screen_width() / 2.0;
-        let cam_y = vy * TILE_SIZE - screen_height() / 2.0;
+
+        // Screen shake — scales linearly from 0 at 80% urgency to full at 100%.
+        let (shake_x, shake_y) = if state.urgency > 0.8 {
+            let intensity = ((state.urgency - 0.8) / 0.8) * state.shake_intensity;
+            let tt = get_time() as f32;
+            (
+                ((tt * 47.3).sin() + (tt * 83.1).sin() * 0.5) * intensity,
+                ((tt * 31.7).sin() + (tt * 67.9).sin() * 0.5) * intensity,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        let cam_x = vx * TILE_SIZE - screen_width() / 2.0 + shake_x;
+        let cam_y = vy * TILE_SIZE - screen_height() / 2.0 + shake_y;
 
         // --- Layer 1: Floor tiles ---
         for gy in 0..state.map_h {
@@ -423,6 +436,22 @@ async fn main() {
                     color_u8!(80, 220, 100, 180),
                 );
             }
+        }
+
+        // --- Particles (celebration effects, world-space) ---
+        for p in &state.particles {
+            let frac = ((p.lifetime - p.age) / p.lifetime).clamp(0.0, 1.0);
+            let px = p.pos.0 * TILE_SIZE - cam_x;
+            let py = p.pos.1 * TILE_SIZE - cam_y;
+            draw_circle(
+                px, py, 5.0 * frac,
+                Color::new(
+                    p.color.0 as f32 / 255.0,
+                    p.color.1 as f32 / 255.0,
+                    p.color.2 as f32 / 255.0,
+                    frac,
+                ),
+            );
         }
 
         // --- Layer 3: Wall tiles ---
@@ -749,6 +778,24 @@ async fn main() {
             debug.slider(
                 16, panel_x, py, pw, "run_urg_x", &mut state.run_urgency_mult, 1.0, 5.0,
             );
+            py += row_h;
+
+            // Effects sliders.
+            py += 6.0;
+            draw_rectangle(panel_x, py, pw, 18.0, color_u8!(20, 22, 36, 230));
+            draw_text("EFFECTS", panel_x + 4.0, py + 14.0, 13.0, color_u8!(255, 180, 80, 255));
+            py += 20.0;
+
+            debug.slider(
+                26, panel_x, py, pw, "shake_intensity", &mut state.shake_intensity, 0.0, 30.0,
+            );
+            py += row_h;
+            {
+                let mut pc = state.particle_count as f32;
+                if debug.slider(27, panel_x, py, pw, "particle_count", &mut pc, 0.0, 50.0) {
+                    state.particle_count = pc.round() as u32;
+                }
+            }
             py += row_h;
 
             // Telemetry.

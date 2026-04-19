@@ -56,6 +56,15 @@ const STANDUP_MSGS: &[&str] = &[
     "(；・∀・) ｾｰﾌ",
 ];
 
+/// A short-lived visual particle spawned on QTE session completion.
+pub struct Particle {
+    pub pos: (f32, f32),
+    pub vel: (f32, f32),
+    pub lifetime: f32,
+    pub age: f32,
+    pub color: (u8, u8, u8),
+}
+
 /// A floating kaomoji bubble that appears during pooping.
 pub struct KaomojiBubble {
     pub text: String,
@@ -219,6 +228,12 @@ pub struct State {
     pub dbg_clearance: f32,
     pub dbg_wall_nx: f32,
     pub dbg_wall_ny: f32,
+    /// Active particles (celebration effects on QTE completion).
+    pub particles: Vec<Particle>,
+    /// Max screen-space shake radius in pixels at urgency=100%.
+    pub shake_intensity: f32,
+    /// How many particles to spawn per QTE session completion.
+    pub particle_count: u32,
 }
 
 impl State {
@@ -274,6 +289,9 @@ impl State {
             dbg_clearance: 0.0,
             dbg_wall_nx: 0.0,
             dbg_wall_ny: 0.0,
+            particles: Vec::new(),
+            shake_intensity: 8.0,
+            particle_count: 12,
         };
         s.recompute_effective();
         s.spawn_star();
@@ -678,6 +696,7 @@ impl State {
                 } else {
                     self.urgency = (self.urgency - self.toilet_relief).max(0.0);
                 }
+                self.spawn_completion_particles();
                 self.enter_standing_up();
             }
             Action::NewRound => {
@@ -718,6 +737,39 @@ impl State {
             b.y_offset -= tick_s * 30.0;
         }
         self.bubbles.retain(|b| b.age < b.lifetime);
+    }
+
+    fn tick_particles(&mut self, tick_s: f32) {
+        for p in &mut self.particles {
+            p.age += tick_s;
+            p.pos.0 += p.vel.0;
+            p.pos.1 += p.vel.1;
+        }
+        self.particles.retain(|p| p.age < p.lifetime);
+    }
+
+    fn spawn_completion_particles(&mut self) {
+        let count = self.particle_count;
+        let px = self.pos.0;
+        let py = self.pos.1;
+        for _ in 0..count {
+            let angle = (self.xorshift() % 628) as f32 / 100.0;
+            let speed = 0.02 + (self.xorshift() % 80) as f32 / 1000.0;
+            let lifetime = 0.8 + (self.xorshift() % 800) as f32 / 1000.0;
+            let color = match self.xorshift() % 4 {
+                0 => (255u8, 220u8, 50u8),
+                1 => (50, 220, 100),
+                2 => (100, 180, 255),
+                _ => (255, 100, 200),
+            };
+            self.particles.push(Particle {
+                pos: (px, py),
+                vel: (angle.cos() * speed, angle.sin() * speed),
+                lifetime,
+                age: 0.0,
+                color,
+            });
+        }
     }
 
     fn spawn_bubble(&mut self) {
@@ -851,6 +903,8 @@ impl State {
         }
 
         let tick_s = self.tick_ms as f32 / 1000.0;
+
+        self.tick_particles(tick_s);
 
         // --- Toast timer ---
         if let Some((_, ref mut t)) = self.toast {
@@ -1020,6 +1074,7 @@ impl State {
         self.toast = None;
         self.bubbles.clear();
         self.bubble_timer = 0.0;
+        self.particles.clear();
         self.spawn_star();
     }
 
