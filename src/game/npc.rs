@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 
 use crate::game::cell::{idx, Cell, Terrain};
+use crate::game::chase::ChaseState;
 use crate::game::physics::{self, PhysicsParams, Body};
 use crate::game::BASELINE_TICK_MS;
 
@@ -167,12 +168,40 @@ pub fn auto_tune_pid(friction: f32, accel: f32, tick_ms: u64) -> (f32, f32, f32)
 // Debug log (thread-local file writer, writes to output/npc_debug.log)
 // ---------------------------------------------------------------------------
 
+/// Max log size in bytes (10 MB). Once exceeded, writes become no-ops.
+const NPC_LOG_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+struct CappedNpcLog {
+    inner: std::io::BufWriter<fs::File>,
+    written: usize,
+}
+
+impl std::io::Write for CappedNpcLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written >= NPC_LOG_MAX_BYTES {
+            return Ok(buf.len());
+        }
+        if self.written + buf.len() > NPC_LOG_MAX_BYTES {
+            let _ = self.inner.write_all(b"\n[LOG TRUNCATED]\n");
+            let _ = self.inner.flush();
+            self.written = NPC_LOG_MAX_BYTES;
+            return Ok(buf.len());
+        }
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 thread_local! {
-    static NPC_LOG: RefCell<Option<std::io::BufWriter<fs::File>>> = RefCell::new({
+    static NPC_LOG: RefCell<Option<CappedNpcLog>> = RefCell::new({
         let _ = fs::create_dir_all("output");
         fs::File::create("output/npc_debug.log")
             .ok()
-            .map(std::io::BufWriter::new)
+            .map(|f| CappedNpcLog { inner: std::io::BufWriter::new(f), written: 0 })
     });
 }
 
@@ -208,6 +237,8 @@ pub enum NpcActivity {
 pub enum ActivityPhase {
     Traveling,
     Performing,
+    /// Chasing the player (managed by chase module).
+    Chasing,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +261,8 @@ pub struct Npc {
     pub radius: f32,
     pub routine: NpcRoutine,
     pub alert_state: AlertState,
+    /// Chase state (managed by chase module; removable).
+    pub chase: ChaseState,
     pub path: Vec<(i32, i32)>,
     pub path_idx: usize,
     /// Per-slot scores from last context steering evaluation (for debug vis).
@@ -237,9 +270,9 @@ pub struct Npc {
     /// Final chosen steering direction (for debug vis).
     pub steer_chosen: (f32, f32),
     /// PID integrator (accumulated cross-track error).
-    pid_integral: f32,
+    pub(crate) pid_integral: f32,
     /// PID previous error (for derivative term).
-    pid_prev_error: f32,
+    pub(crate) pid_prev_error: f32,
     /// Last cross-track error for debug display.
     pub pid_cross_track: f32,
 }
@@ -254,6 +287,7 @@ impl Npc {
             radius: NPC_RADIUS_DEFAULT,
             routine,
             alert_state: AlertState::Unaware,
+            chase: ChaseState::default(),
             path: Vec::new(),
             path_idx: 0,
             steer_scores: [0.0; STEER_SLOTS],
@@ -301,7 +335,7 @@ impl Npc {
                 );
                 self.timer_tick(tick_s, map, map_w, map_h, rng);
             }
-            ActivityPhase::Traveling => {
+            ActivityPhase::Traveling | ActivityPhase::Chasing => {
                 self.follow_path(params, weights, map, map_w, map_h, tick_ms, rng);
             }
         }
@@ -396,7 +430,19 @@ impl Npc {
         tick_ms: u64,
         rng: &mut u32,
     ) {
+        // --- Chase direct pursuit: has LOS → steer straight to player ---
+        // LOS already confirmed by update_chase, so no walls between.
+        if self.routine.phase == ActivityPhase::Chasing && self.chase.has_los {
+            self.direct_chase(params, map, map_w, map_h, tick_ms);
+            return;
+        }
+
         if self.path_idx >= self.path.len() {
+            if self.routine.phase == ActivityPhase::Chasing {
+                // A* pursuit: path exhausted — coast while update_chase repaths.
+                self.chase_coast(params, map, map_w, map_h, tick_ms);
+                return;
+            }
             self.enter_performing(rng);
             return;
         }
@@ -434,12 +480,22 @@ impl Npc {
 
         if close_enough || passed_plane {
             if is_last {
+                if self.routine.phase == ActivityPhase::Chasing {
+                    // Exhaust path so update_chase detects it and repaths.
+                    self.path_idx = self.path.len();
+                    self.chase_coast(params, map, map_w, map_h, tick_ms);
+                    return;
+                }
                 self.velocity = (0.0, 0.0);
                 self.enter_performing(rng);
                 return;
             }
             self.path_idx += 1;
             if self.path_idx >= self.path.len() {
+                if self.routine.phase == ActivityPhase::Chasing {
+                    self.chase_coast(params, map, map_w, map_h, tick_ms);
+                    return;
+                }
                 self.enter_performing(rng);
                 return;
             }
@@ -469,6 +525,10 @@ impl Npc {
             }
             // Use recomputed path for this tick.
             if self.path_idx >= self.path.len() {
+                if self.routine.phase == ActivityPhase::Chasing {
+                    self.chase_coast(params, map, map_w, map_h, tick_ms);
+                    return;
+                }
                 self.enter_performing(rng);
                 return;
             }
@@ -482,6 +542,22 @@ impl Npc {
         let dy = ty - self.pos.1;
         let dist = (dx * dx + dy * dy).sqrt();
         let is_last = self.path_idx == self.path.len() - 1;
+
+        // --- Update chase_dir from path segment (stable, never oscillates) ---
+        if self.routine.phase == ActivityPhase::Chasing {
+            if self.path_idx > 0 {
+                let prev = self.path[self.path_idx - 1];
+                let seg_x = tx - (prev.0 as f32 + 0.5);
+                let seg_y = ty - (prev.1 as f32 + 0.5);
+                let seg_len = (seg_x * seg_x + seg_y * seg_y).sqrt();
+                if seg_len > 1e-4 {
+                    self.chase.chase_dir = (seg_x / seg_len, seg_y / seg_len);
+                }
+            } else if dist > 1e-4 {
+                // First waypoint — use direction to it.
+                self.chase.chase_dir = (dx / dist, dy / dist);
+            }
+        }
 
         // --- Seek target: adaptive pure-pursuit lookahead ---
         // Lookahead scales with braking distance so the NPC anticipates turns
@@ -662,7 +738,7 @@ impl Npc {
                     w,
                     "pos=({:.3},{:.3}) vel=({:.4},{:.4}) spd={:.4} dist_wp={:.2} \
                      steer=({:.2},{:.2}) thr={:.2} wall={:.2} cte={:.3} pid={:.3} \
-                     passed_plane={} idx={}/{}",
+                     passed_plane={} idx={}/{} chase={} los={}",
                     self.pos.0, self.pos.1,
                     self.velocity.0, self.velocity.1,
                     cur_speed, dist,
@@ -672,6 +748,7 @@ impl Npc {
                     cross_track_error, corr,
                     passed_plane,
                     self.path_idx, self.path.len(),
+                    self.chase.active, self.chase.has_los,
                 );
             }
         });
@@ -731,6 +808,115 @@ impl Npc {
         } else {
             (0.0, 0.0)
         }
+    }
+
+    /// Direct pursuit (has LOS confirmed): steer toward `chase.last_seen_pos`.
+    /// Only called when `chase.has_los == true` — update_chase verified clear
+    /// line-of-sight via Bresenham, so no wall between NPC and player.
+    /// Uses seek + wall avoidance (for wall-adjacent corners), no PID.
+    fn direct_chase(
+        &mut self,
+        params: &PhysicsParams,
+        map: &[Cell],
+        map_w: i32,
+        map_h: i32,
+        tick_ms: u64,
+    ) {
+        let target = self.chase.last_seen_pos;
+        let dx = target.0 - self.pos.0;
+        let dy = target.1 - self.pos.1;
+        let dist = (dx * dx + dy * dy).sqrt();
+
+        if dist < self.radius * WP_FINAL_ARRIVE_MULT {
+            // On top of player — coast (friction slows naturally).
+            self.chase_coast(params, map, map_w, map_h, tick_ms);
+            return;
+        }
+
+        // Seek direction toward player.
+        let seek_dx = dx / dist;
+        let seek_dy = dy / dist;
+
+        // Wall avoidance for wall-adjacent corners.
+        let (clearance, wall_nx, wall_ny) =
+            physics::nearest_wall(self.pos, self.radius, map, map_w, map_h);
+
+        let cur_speed = (self.velocity.0 * self.velocity.0
+            + self.velocity.1 * self.velocity.1).sqrt();
+        let dt_ratio = tick_ms as f32 / BASELINE_TICK_MS;
+        let eff_friction = params.friction.powf(dt_ratio);
+        let brake_dist = if eff_friction < 1.0 - 1e-6 {
+            cur_speed * eff_friction / (1.0 - eff_friction)
+        } else {
+            cur_speed * 20.0
+        };
+        let wall_danger_cap = (0.5 - self.radius).max(0.1) * WALL_DANGER_CAP_PASSAGE_MULT
+            + self.radius;
+        let wall_danger_range = (self.radius * WALL_DANGER_RADIUS_MULT
+            + brake_dist * WALL_DANGER_BRAKE_MULT)
+            .min(wall_danger_cap);
+
+        // Simple blend: seek + wall avoidance.
+        let (steer_dx, steer_dy) = if clearance < wall_danger_range && clearance >= 0.0 {
+            let proximity = (1.0 - clearance / wall_danger_range).clamp(0.0, 1.0);
+            let rx = seek_dx * (1.0 - proximity) + wall_nx * proximity;
+            let ry = seek_dy * (1.0 - proximity) + wall_ny * proximity;
+            let rlen = (rx * rx + ry * ry).sqrt();
+            if rlen > 1e-6 { (rx / rlen, ry / rlen) } else { (seek_dx, seek_dy) }
+        } else {
+            (seek_dx, seek_dy)
+        };
+
+        self.steer_chosen = (steer_dx, steer_dy);
+
+        let mut body = Body {
+            pos: &mut self.pos,
+            velocity: &mut self.velocity,
+            radius: self.radius,
+        };
+        physics::apply_movement(
+            &mut body, params, (steer_dx, steer_dy), 1.0,
+            false, 1.0, 1.0, tick_ms, map, map_w, map_h,
+        );
+
+        // Update facing and chase_dir from post-physics velocity.
+        let spd = (self.velocity.0 * self.velocity.0 + self.velocity.1 * self.velocity.1).sqrt();
+        if spd > 1e-4 {
+            self.facing = (self.velocity.0 / spd, self.velocity.1 / spd);
+
+            // Only update chase_dir when velocity has converged toward seek.
+            // If velocity still diverges (NPC is mid-turn), keep the previous
+            // stable direction so that a sudden LOS loss doesn't store a
+            // transient direction that points through a wall.
+            let vel_dx = self.velocity.0 / spd;
+            let vel_dy = self.velocity.1 / spd;
+            let align = vel_dx * seek_dx + vel_dy * seek_dy;
+            if align > 0.7 { // ~45° — velocity has caught up to seek
+                self.chase.chase_dir = (vel_dx, vel_dy);
+            }
+        }
+    }
+
+    /// Coast during chase: apply physics with zero steering input.
+    /// Velocity decays naturally via friction. Does NOT zero velocity.
+    /// Used when A* path is exhausted (update_chase repaths next tick).
+    fn chase_coast(
+        &mut self,
+        params: &PhysicsParams,
+        map: &[Cell],
+        map_w: i32,
+        map_h: i32,
+        tick_ms: u64,
+    ) {
+        let mut body = Body {
+            pos: &mut self.pos,
+            velocity: &mut self.velocity,
+            radius: self.radius,
+        };
+        physics::apply_movement(
+            &mut body, params, (0.0, 0.0), 0.0,
+            false, 1.0, 1.0, tick_ms, map, map_w, map_h,
+        );
     }
 
     /// Interpolated visual position for smooth rendering between ticks.
@@ -951,7 +1137,7 @@ fn line_of_sight_thick(map: &[Cell], map_w: i32, map_h: i32, a: (i32, i32), b: (
 /// Remove redundant intermediate waypoints: if we can walk straight from
 /// point A to point C, drop B.  Uses thick LOS to ensure the smoothed
 /// path has clearance for the NPC collision radius.
-fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, map_h: i32) {
+pub(crate) fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, map_h: i32) {
     if path.len() <= 2 {
         return;
     }
@@ -974,7 +1160,7 @@ fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, map_h: i32)
 /// Keep only semantically important waypoints: doors, significant turns,
 /// and the destination.  Straight corridor segments are dropped — context
 /// steering handles wall avoidance on its own.
-fn filter_waypoints(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32) {
+pub(crate) fn filter_waypoints(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32) {
     if path.len() <= 2 {
         return;
     }

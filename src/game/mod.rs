@@ -1,6 +1,7 @@
 //! Platform-agnostic game logic for Brownshock.
 
 pub mod cell;
+pub mod chase;
 pub mod config;
 pub mod npc;
 pub mod physics;

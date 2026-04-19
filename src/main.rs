@@ -345,6 +345,10 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) {
             debug.toggle();
         }
+        // -- Toggle NPC chase (debug feature) --
+        if is_key_pressed(KeyCode::F3) {
+            state.chase_config.enabled = !state.chase_config.enabled;
+        }
 
         // -- Input (suppressed while editing a slider value) --
         let in_qte = matches!(state.move_state, MoveState::Pooping(_) | MoveState::UsingToilet(_));
@@ -501,18 +505,27 @@ async fn main() {
             let nvr = npc.radius * TILE_SIZE;
             // Shadow.
             draw_circle(ncx, ncy + nvr * 0.3, nvr * 0.7, color_u8!(10, 10, 20, 80));
-            // Body (red-tinted to distinguish from player).
-            draw_circle(ncx, ncy, nvr, color_u8!(200, 100, 100, 255));
+            // Body: red when chasing, normal when patrolling.
+            let npc_body_color = if npc.chase.active {
+                color_u8!(255, 50, 50, 255)
+            } else {
+                color_u8!(200, 100, 100, 255)
+            };
+            draw_circle(ncx, ncy, nvr, npc_body_color);
 
             // Alert indicator above head.
-            match npc.alert_state {
-                AlertState::Suspicious => {
-                    draw_text("?", ncx - 5.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 220, 50, 255));
+            if npc.chase.active {
+                draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
+            } else {
+                match npc.alert_state {
+                    AlertState::Suspicious => {
+                        draw_text("?", ncx - 5.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 220, 50, 255));
+                    }
+                    AlertState::Alert => {
+                        draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
+                    }
+                    _ => {}
                 }
-                AlertState::Alert => {
-                    draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
-                }
-                _ => {}
             }
 
             // Debug: collision circle + facing direction + context steering vis.
@@ -1011,6 +1024,48 @@ async fn main() {
                         panel_x, py, pw,
                         &format!("cross-track: {:.3}", npc.pid_cross_track),
                     );
+                    py += 24.0;
+                }
+            }
+
+            // --- Chase debug section ---
+            py += 6.0;
+            {
+                let chase_label = if state.chase_config.enabled {
+                    "CHASE: ON  [F3]"
+                } else {
+                    "CHASE: OFF [F3]"
+                };
+                let chase_color = if state.chase_config.enabled {
+                    color_u8!(80, 40, 40, 230)
+                } else {
+                    color_u8!(30, 35, 55, 230)
+                };
+                if debug.button(panel_x, py, pw, 20.0, chase_label, chase_color) {
+                    state.chase_config.enabled = !state.chase_config.enabled;
+                }
+                py += 22.0;
+            }
+            if state.chase_config.enabled {
+                debug.slider(
+                    40, panel_x, py, pw, "linger_s",
+                    &mut state.chase_config.linger_s, 0.0, 5.0,
+                );
+                py += row_h;
+                debug.slider(
+                    41, panel_x, py, pw, "fov_dot",
+                    &mut state.chase_config.fov_dot, -1.0, 1.0,
+                );
+                py += row_h;
+                // Show chase status of first NPC.
+                if let Some(npc) = state.npcs.first() {
+                    let status = if npc.chase.active {
+                        let mode = if npc.chase.has_los { "LOS" } else { "A*" };
+                        format!("CHASING [{}] ({:.1}s)", mode, npc.chase.timer)
+                    } else {
+                        "patrol".to_string()
+                    };
+                    debug.info_row(panel_x, py, pw, &format!("npc0: {}", status));
                     py += 24.0;
                 }
             }

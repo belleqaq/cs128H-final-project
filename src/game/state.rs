@@ -9,7 +9,7 @@
 //!   3. Integrate position (sub-stepped to prevent tunnelling)
 //!   4. Hard resolve: AABB-Circle correction along surface normal
 
-use crate::game::cell::{idx, Cell, Terrain};
+use crate::game::cell::{idx, Cell, Terrain, compute_passage_width, build_subgoal_graph, SubgoalGraph};
 use crate::game::config::{DebugPreset, GameConfig};
 use crate::game::npc::{self as npc_mod, Npc, SteerWeights};
 use crate::game::physics;
@@ -209,6 +209,12 @@ pub struct State {
     // --- Phase 3: NPCs ---
     pub npcs: Vec<Npc>,
     pub steer_weights: SteerWeights,
+    /// Chase feature config (removable — see chase.rs).
+    pub chase_config: crate::game::chase::ChaseConfig,
+    /// Per-tile passage width (min of vertical/horizontal span). Precomputed.
+    pub passage_width: Vec<u8>,
+    /// Subgoal graph for fast cross-room pathfinding (corner subgoals).
+    pub subgoal_graph: SubgoalGraph,
     // Debug telemetry (updated each tick).
     pub dbg_clearance: f32,
     pub dbg_wall_nx: f32,
@@ -218,6 +224,8 @@ pub struct State {
 impl State {
     pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32) -> Self {
         let start = (15.5, 10.5); // corridor centre
+        let pw = compute_passage_width(&map, w, h);
+        let sg = build_subgoal_graph(&map, w, h);
         let mut s = Self {
             map,
             map_w: w,
@@ -262,6 +270,9 @@ impl State {
             rng_state: 12345,
             npcs: Vec::new(),
             steer_weights: SteerWeights::default(),
+            chase_config: crate::game::chase::ChaseConfig::default(),
+            passage_width: pw,
+            subgoal_graph: sg,
             dbg_clearance: 0.0,
             dbg_wall_nx: 0.0,
             dbg_wall_ny: 0.0,
@@ -617,6 +628,17 @@ impl State {
         self.steer_weights.pid_kp = kp;
         self.steer_weights.pid_kd = kd;
         self.steer_weights.pid_ki = ki;
+        // Chase update: check vision, manage chase state (before movement).
+        crate::game::chase::update_chase(
+            &mut self.npcs,
+            &self.chase_config,
+            self.pos,
+            &self.map,
+            self.map_w,
+            self.map_h,
+            tick_s,
+            &self.subgoal_graph,
+        );
         Self::tick_npcs(&mut self.npcs, &npc_params, &self.steer_weights, &self.map, self.map_w, self.map_h, self.tick_ms, &mut self.rng_state);
 
         // ========================================================
