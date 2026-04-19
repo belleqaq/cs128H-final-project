@@ -1,4 +1,6 @@
 //! config.toml loading + defaults.
+//!
+//! All player measurements are pixel-space (rooms live in ~960×640 world).
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -16,7 +18,7 @@ impl Default for GameConfig {
     fn default() -> Self {
         Self {
             window: WindowSettings::default(),
-            tick_ms: 150,
+            tick_ms: 16,
             player: PlayerSettings::default(),
             gameplay: GameplaySettings::default(),
         }
@@ -26,19 +28,12 @@ impl Default for GameConfig {
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct GameplaySettings {
-    /// Urgency increase per tick (0.0–1.0 scale).
     pub urgency_rate: f32,
-    /// Urgency reduced when using a toilet.
     pub toilet_relief: f32,
-    /// Urgency reduced when completing a star poop (less than toilet).
     pub star_relief: f32,
-    /// Number of star objectives to win.
     pub goal_count: u32,
-    /// QTE sequence length (number of keys per round).
     pub qte_length: u32,
-    /// Seconds allowed per QTE key press.
     pub qte_time_per_key: f32,
-    /// Rounds of QTE needed per poop session.
     pub poop_rounds: u32,
 }
 
@@ -77,30 +72,27 @@ impl Default for WindowSettings {
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct PlayerSettings {
+    /// Max speed in pixels per baseline tick (150ms).
     pub max_speed: f32,
-    /// Acceleration in grid/s² (tick-independent unit).
+    /// Acceleration in px/s² (tick-independent).
     pub acceleration: f32,
     pub friction: f32,
     pub stop_friction: f32,
+    /// Collision radius in pixels.
     pub collision_radius: f32,
+    /// Visual body radius in pixels.
     pub visual_radius: f32,
-    pub repulsion_power: f32,
-    pub repulsion_range: f32,
-    pub repulsion_push: f32,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            max_speed: 1.0,
-            acceleration: 13.33,
+            max_speed: 32.0,
+            acceleration: 600.0,
             friction: 0.85,
             stop_friction: 0.5,
-            collision_radius: 0.15,
-            visual_radius: 0.35,
-            repulsion_power: 2.0,
-            repulsion_range: 0.5,
-            repulsion_push: 0.15,
+            collision_radius: 18.0,
+            visual_radius: 22.0,
         }
     }
 }
@@ -121,10 +113,9 @@ pub fn load_config() -> GameConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Debug preset — separate file so it never collides with config.toml.
+// Debug preset — tunables the debug panel can save/load.
 // ---------------------------------------------------------------------------
 
-/// Subset of tunable values that the debug panel can save/load.
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct DebugPreset {
@@ -134,9 +125,6 @@ pub struct DebugPreset {
     pub stop_friction: f32,
     pub collision_radius: f32,
     pub visual_radius: f32,
-    pub repulsion_power: f32,
-    pub repulsion_range: f32,
-    pub repulsion_push: f32,
 }
 
 impl Default for DebugPreset {
@@ -149,9 +137,6 @@ impl Default for DebugPreset {
             stop_friction: p.stop_friction,
             collision_radius: p.collision_radius,
             visual_radius: p.visual_radius,
-            repulsion_power: p.repulsion_power,
-            repulsion_range: p.repulsion_range,
-            repulsion_push: p.repulsion_push,
         }
     }
 }

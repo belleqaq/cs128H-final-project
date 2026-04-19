@@ -1,23 +1,21 @@
 # Brownshock — config.toml
-# Phase 1: movement tuning only.
+# Pixel-space tuning (rooms live in ~960×640 world coords).
 
 [window]
 width = 1280
 height = 720
 title = "Brownshock"
 
-tick_ms = 8
+# Game-logic tick interval. Smaller = smoother physics.
+tick_ms = 16
 
 [player]
-max_speed = 1.0
-acceleration = 13.33   # grid/s²
+max_speed = 32.0       # px per baseline (150ms) tick
+acceleration = 600.0   # px/s²
 friction = 0.85
 stop_friction = 0.5
-collision_radius = 0.15
-visual_radius = 0.35
-repulsion_power = 2.0
-repulsion_range = 0.5
-repulsion_push = 0.15
+collision_radius = 18.0
+visual_radius = 22.0
 
 [gameplay]
 urgency_rate = 0.002

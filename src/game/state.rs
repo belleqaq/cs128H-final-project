@@ -1,35 +1,25 @@
-//! Game state: continuous 2D physics with SDF-based wall collision.
+//! Game state: continuous 2D physics on a multi-room World.
 //!
-//! Player position is continuous `(f32, f32)` in grid units.  The tile
-//! grid serves as map data and is queried for collision geometry.
-//!
-//! Collision pipeline each tick:
-//!   1. Friction + input acceleration        (velocity update)
-//!   2. Soft repulsion: damp velocity toward nearest wall via SDF distance
-//!   3. Integrate position (sub-stepped to prevent tunnelling)
-//!   4. Hard resolve: AABB-Circle correction along surface normal
+//! All positions are world pixels.  Collision is axis-separated against
+//! `World::walls`, closed `World::doors`, and per-room furniture colliders.
 
-use crate::game::cell::{idx, Cell, Terrain};
+use macroquad::prelude::*;
+
 use crate::game::config::{DebugPreset, GameConfig};
+use crate::game::room::{Toilet, World};
 use crate::game::{BASELINE_TICK_MS, SPEED_EPSILON};
 
-/// Max collision-resolution iterations per sub-step.
-const COLLISION_ITERS: usize = 3;
-/// Max movement per sub-step (grid units) to prevent tunnelling.
-const MAX_SUBSTEP: f32 = 0.5;
-
 // ---------------------------------------------------------------------------
-// Move state
+// Tunables
 // ---------------------------------------------------------------------------
 
-/// Duration player must hold E to start pooping (seconds).
 const INTERACT_HOLD_TIME: f32 = 1.0;
-/// Duration to show "round failed" flash before auto-retry (seconds).
 const FAIL_FLASH_SECS: f32 = 0.15;
-/// Duration of the standing-up stun after QTE (seconds).
 const STANDUP_DURATION: f32 = 0.5;
+pub const STAR_RADIUS: f32 = 28.0;
+/// Player can press E to open a door if its rect is within this distance.
+pub const DOOR_INTERACT_RADIUS: f32 = 30.0;
 
-/// Kaomoji messages when trying to poop on invalid tile.
 const CANT_POOP_MSGS: &[&str] = &[
     "(╯°□°)╯︵ ┻━┻",
     "щ(ﾟДﾟщ) !?",
@@ -41,13 +31,11 @@ const CANT_POOP_MSGS: &[&str] = &[
     "( ˘ω˘ ) zzZ",
 ];
 
-/// Kaomoji for floating bubbles during pooping.
 const BUBBLE_MSGS: &[&str] = &[
     "(>_<)", "(*´∀`)", "(≧▽≦)", "(~_~;)", "(◎_◎;)",
     "(°▽°)", "(⊙_⊙)", "(´;ω;`)", "(ノ∀`)", "(꒪⌓꒪)",
 ];
 
-/// Kaomoji shown during standing-up stun (pulling up pants).
 const STANDUP_MSGS: &[&str] = &[
     "(；´∀`) ﾌｩ",
     "(*´ー`*) ...",
@@ -56,16 +44,18 @@ const STANDUP_MSGS: &[&str] = &[
     "(；・∀・) ｾｰﾌ",
 ];
 
-/// A short-lived visual particle spawned on QTE session completion.
+// ---------------------------------------------------------------------------
+// Visual / particle structures
+// ---------------------------------------------------------------------------
+
 pub struct Particle {
-    pub pos: (f32, f32),
-    pub vel: (f32, f32),
+    pub pos: Vec2,
+    pub vel: Vec2,
     pub lifetime: f32,
     pub age: f32,
     pub color: (u8, u8, u8),
 }
 
-/// A floating kaomoji bubble that appears during pooping.
 pub struct KaomojiBubble {
     pub text: String,
     pub x_offset: f32,
@@ -74,37 +64,24 @@ pub struct KaomojiBubble {
     pub lifetime: f32,
 }
 
-/// QTE state for the round-based rhythm key-press minigame.
-/// Each round = qte_length keys.  Fail → auto-retry same round.
-/// Success → rounds_completed++.  All rounds done → objective complete.
-/// Player can press E at any time to stand up (abort).
+// ---------------------------------------------------------------------------
+// QTE
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug)]
 pub struct QteState {
-    /// Current round's key sequence.
     pub sequence: Vec<QteKey>,
-    /// Keys completed in current round.
     pub progress: usize,
-    /// Countdown timer for the current key (seconds).
     pub timer: f32,
-    /// Seconds allowed per key.
     pub time_per_key: f32,
-    /// Successful rounds completed.
     pub rounds_completed: u32,
-    /// Total rounds needed.
     pub rounds_needed: u32,
-    /// Current round failed — showing flash before auto-retry.
     pub round_failed: bool,
-    /// Countdown until auto-retry after fail.
     pub fail_timer: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QteKey {
-    W,
-    A,
-    S,
-    D,
-}
+pub enum QteKey { W, A, S, D }
 
 impl QteKey {
     pub fn label(self) -> &'static str {
@@ -121,13 +98,9 @@ impl QteKey {
 pub enum MoveState {
     Walking,
     Running,
-    /// Player is holding E, preparing to poop (decelerating).
     Preparing,
-    /// Player is pooping at a star location — QTE active.
     Pooping(QteState),
-    /// Player is using a toilet to relieve urgency (QTE).
     UsingToilet(QteState),
-    /// Post-QTE stun: pulling up pants (remaining seconds).
     StandingUp(f32),
 }
 
@@ -139,115 +112,71 @@ impl PartialEq for QteState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Playing,
-    Win,
-    Lose,
-}
+pub enum Phase { Playing, Win, Lose }
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 pub struct State {
-    pub map: Vec<Cell>,
-    pub map_w: i32,
-    pub map_h: i32,
-    /// Continuous position of the collision-circle centre (grid units).
-    pub pos: (f32, f32),
+    pub world: World,
+    pub pos: Vec2,
+    prev_pos: Vec2,
+    pub velocity: Vec2,
     pub phase: Phase,
     pub move_state: MoveState,
-    pub velocity: (f32, f32),
-    /// Previous position — for frame interpolation.
-    prev_pos: (f32, f32),
-    // Effective per-tick values (derived from raw + tick_ms).
     eff_accel: f32,
     eff_friction: f32,
     eff_stop_friction: f32,
     eff_max_speed: f32,
-    // Tunable parameters — debug panel writes directly.
     pub max_speed: f32,
     pub raw_accel: f32,
     pub raw_friction: f32,
     pub raw_stop_friction: f32,
     pub collision_radius: f32,
     pub visual_radius: f32,
-    pub repulsion_power: f32,
-    pub repulsion_range: f32,
-    pub repulsion_push: f32,
     pub tick_ms: u64,
-    // Input state.
     input_x: i32,
     input_y: i32,
     input_run: bool,
-    /// E key currently held down (for hold-to-interact).
     input_e_down: bool,
-    /// E key just pressed this frame (for stand-up during QTE).
     input_e_pressed: bool,
-    // --- Phase 2: Gameplay ---
-    /// Urgency level 0.0–1.0.  Rises each tick; >= 1.0 → Lose.
     pub urgency: f32,
     pub urgency_rate: f32,
     pub toilet_relief: f32,
     pub star_relief: f32,
-    /// Current star objective position (top-left of 2×2 area), or None.
-    pub star_pos: Option<(i32, i32)>,
-    /// Number of objectives completed so far.
+    /// Active star: (room_idx, world position).
+    pub star: Option<(usize, Vec2)>,
     pub completed: u32,
-    /// Total objectives needed to win.
     pub goal_count: u32,
-    /// QTE config.
     pub qte_length: u32,
     pub qte_time_per_key: f32,
-    /// Rounds per QTE session (configurable).
     pub poop_rounds: u32,
-    /// Speed multiplier when running (max speed cap).
     pub run_speed_mult: f32,
-    /// Acceleration multiplier when running.
     pub run_accel_mult: f32,
-    /// Urgency multiplier when running.
     pub run_urgency_mult: f32,
-    /// How long E has been held (seconds).
     pub interact_hold: f32,
-    /// Whether E was released at least once since entering QTE.
     qte_e_up_seen: bool,
-    /// Toast message + remaining display time.
     pub toast: Option<(String, f32)>,
-    /// Floating kaomoji bubbles during pooping.
     pub bubbles: Vec<KaomojiBubble>,
-    /// Timer until next bubble spawn.
     bubble_timer: f32,
-    /// Simple RNG state (xorshift32).
     rng_state: u32,
-    // Debug telemetry (updated each tick).
-    pub dbg_clearance: f32,
-    pub dbg_wall_nx: f32,
-    pub dbg_wall_ny: f32,
-    /// Active particles (celebration effects on QTE completion).
     pub particles: Vec<Particle>,
-    /// Max screen-space shake radius in pixels at urgency=100%.
     pub shake_intensity: f32,
-    /// How many particles to spawn per QTE session completion.
     pub particle_count: u32,
 }
 
 impl State {
-    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32) -> Self {
-        let start = (2.5, 2.5);
+    pub fn new(config: &GameConfig, world: World) -> Self {
+        let start = vec2(1000.0, 550.0);  // bottom of Living Room (clear of furniture)
         let mut s = Self {
-            map,
-            map_w: w,
-            map_h: h,
+            world,
             pos: start,
+            prev_pos: start,
+            velocity: Vec2::ZERO,
             phase: Phase::Playing,
             move_state: MoveState::Walking,
-            velocity: (0.0, 0.0),
-            prev_pos: start,
             eff_accel: 0.0,
             eff_friction: 0.0,
             eff_stop_friction: 0.0,
@@ -258,9 +187,6 @@ impl State {
             raw_stop_friction: config.player.stop_friction,
             collision_radius: config.player.collision_radius,
             visual_radius: config.player.visual_radius,
-            repulsion_power: config.player.repulsion_power,
-            repulsion_range: config.player.repulsion_range,
-            repulsion_push: config.player.repulsion_push,
             tick_ms: config.tick_ms,
             input_x: 0,
             input_y: 0,
@@ -271,7 +197,7 @@ impl State {
             urgency_rate: config.gameplay.urgency_rate,
             toilet_relief: config.gameplay.toilet_relief,
             star_relief: config.gameplay.star_relief,
-            star_pos: None,
+            star: None,
             completed: 0,
             goal_count: config.gameplay.goal_count,
             qte_length: config.gameplay.qte_length,
@@ -286,9 +212,6 @@ impl State {
             bubbles: Vec::new(),
             bubble_timer: 0.0,
             rng_state: 12345,
-            dbg_clearance: 0.0,
-            dbg_wall_nx: 0.0,
-            dbg_wall_ny: 0.0,
             particles: Vec::new(),
             shake_intensity: 8.0,
             particle_count: 12,
@@ -298,20 +221,6 @@ impl State {
         s
     }
 
-    pub fn apply_config(&mut self, config: &GameConfig) {
-        self.raw_accel = config.player.acceleration;
-        self.raw_friction = config.player.friction;
-        self.raw_stop_friction = config.player.stop_friction;
-        self.max_speed = config.player.max_speed;
-        self.collision_radius = config.player.collision_radius;
-        self.visual_radius = config.player.visual_radius;
-        self.repulsion_power = config.player.repulsion_power;
-        self.repulsion_range = config.player.repulsion_range;
-        self.repulsion_push = config.player.repulsion_push;
-        self.tick_ms = config.tick_ms;
-        self.recompute_effective();
-    }
-
     pub fn apply_preset(&mut self, p: &DebugPreset) {
         self.raw_accel = p.acceleration;
         self.raw_friction = p.friction;
@@ -319,9 +228,6 @@ impl State {
         self.max_speed = p.max_speed;
         self.collision_radius = p.collision_radius;
         self.visual_radius = p.visual_radius;
-        self.repulsion_power = p.repulsion_power;
-        self.repulsion_range = p.repulsion_range;
-        self.repulsion_push = p.repulsion_push;
         self.recompute_effective();
     }
 
@@ -333,16 +239,9 @@ impl State {
             stop_friction: self.raw_stop_friction,
             collision_radius: self.collision_radius,
             visual_radius: self.visual_radius,
-            repulsion_power: self.repulsion_power,
-            repulsion_range: self.repulsion_range,
-            repulsion_push: self.repulsion_push,
         }
     }
 
-    /// Recompute effective per-tick values from raw values + tick_ms.
-    ///
-    /// raw_accel is in grid/s² (tick-independent).
-    /// Conversion: eff_accel = raw_accel × dt² where dt = tick_ms / 1000.
     pub fn recompute_effective(&mut self) {
         let dt = self.tick_ms as f32 / 1000.0;
         let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
@@ -352,14 +251,24 @@ impl State {
         self.eff_max_speed = self.max_speed * dt_ratio;
     }
 
-    /// Which grid tile the player is currently in.
-    pub fn player_tile(&self) -> (i32, i32) {
-        (self.pos.0.floor() as i32, self.pos.1.floor() as i32)
+    pub fn current_room_idx(&self) -> Option<usize> {
+        self.world.room_index_at(self.pos)
+    }
+
+    pub fn current_room_name(&self) -> &'static str {
+        match self.current_room_idx() {
+            Some(i) => self.world.rooms[i].name,
+            None => "Hallway",
+        }
     }
 
     // -- Input --
 
-    pub fn set_input(&mut self, left: bool, right: bool, up: bool, down: bool, run: bool, e_down: bool, e_pressed: bool) {
+    pub fn set_input(
+        &mut self,
+        left: bool, right: bool, up: bool, down: bool,
+        run: bool, e_down: bool, e_pressed: bool,
+    ) {
         self.input_x = right as i32 - left as i32;
         self.input_y = down as i32 - up as i32;
         self.input_run = run;
@@ -367,17 +276,19 @@ impl State {
         self.input_e_pressed = e_pressed;
     }
 
-    // -- Per-frame discrete E-press handling (NOT per-tick) --
+    // -- E-press handlers --
 
-    /// Called from main loop when E is just pressed while Walking/Running.
-    /// Checks tile and enters Preparing or shows toast.
     pub fn handle_e_press(&mut self) {
         if !matches!(self.move_state, MoveState::Walking | MoveState::Running) {
             return;
         }
-        let terrain = self.current_terrain();
-        let on_star = self.is_on_star();
-        if terrain == Terrain::Toilet || on_star {
+        // Door interaction takes priority over toilet/star.
+        if let Some(idx) = self.world.nearest_closed_door(self.pos, DOOR_INTERACT_RADIUS + self.collision_radius) {
+            self.world.doors[idx].open = true;
+            self.toast = Some(("(o´∀`o) ぎぃー...".to_string(), 1.5));
+            return;
+        }
+        if self.is_on_toilet() || self.is_on_star() {
             self.move_state = MoveState::Preparing;
             self.interact_hold = 0.0;
         } else {
@@ -386,145 +297,68 @@ impl State {
         }
     }
 
-    /// Called from main loop when E is just pressed during QTE.
-    /// Triggers stand-up (abort QTE).
     pub fn handle_e_press_qte(&mut self) {
         if matches!(self.move_state, MoveState::Pooping(_) | MoveState::UsingToilet(_)) {
             self.enter_standing_up();
         }
     }
 
-    // -- Collision helpers --
+    /// True when player is close enough to a closed door to open it.
+    pub fn near_closed_door(&self) -> bool {
+        self.world
+            .nearest_closed_door(self.pos, DOOR_INTERACT_RADIUS + self.collision_radius)
+            .is_some()
+    }
 
-    fn is_blocked(&self, x: i32, y: i32) -> bool {
-        if x < 0 || x >= self.map_w || y < 0 || y >= self.map_h {
+    // -- Geometry / collision --
+
+    fn player_rect_at(&self, p: Vec2) -> Rect {
+        let r = self.collision_radius;
+        Rect::new(p.x - r, p.y - r, r * 2.0, r * 2.0)
+    }
+
+    fn collides_at(&self, p: Vec2) -> bool {
+        let pr = self.player_rect_at(p);
+        if self.world.walls.iter().any(|w| pr.overlaps(w)) {
             return true;
         }
-        !self.map[idx(x, y, self.map_w)].terrain.is_walkable()
+        if self.world.doors.iter().any(|d| !d.open && pr.overlaps(&d.rect)) {
+            return true;
+        }
+        if self.world.rooms.iter().any(|r| r.colliders.iter().any(|c| pr.overlaps(c))) {
+            return true;
+        }
+        false
     }
 
-    /// Distance from `self.pos` to the nearest surface point on a tile AABB.
-    /// Returns `(distance, normal_x, normal_y)` where normal points from
-    /// the tile surface toward the player.
-    fn dist_to_tile(&self, tx: i32, ty: i32) -> (f32, f32, f32) {
-        let ax = tx as f32;
-        let ay = ty as f32;
-        let nearest_x = self.pos.0.clamp(ax, ax + 1.0);
-        let nearest_y = self.pos.1.clamp(ay, ay + 1.0);
-        let diff_x = self.pos.0 - nearest_x;
-        let diff_y = self.pos.1 - nearest_y;
-        let dist_sq = diff_x * diff_x + diff_y * diff_y;
+    fn try_move_axis(&mut self, dx: f32, dy: f32) -> bool {
+        let next = self.pos + vec2(dx, dy);
+        if self.collides_at(next) {
+            return false;
+        }
+        self.pos = next;
+        true
+    }
 
-        if dist_sq > 1e-8 {
-            let dist = dist_sq.sqrt();
-            (dist, diff_x / dist, diff_y / dist)
+    // -- Interaction checks --
+
+    fn is_on_toilet(&self) -> bool {
+        let pr = self.player_rect_at(self.pos);
+        self.world.rooms.iter().any(|r| r.toilets.iter().any(|t: &Toilet| pr.overlaps(&t.rect)))
+    }
+
+    fn is_on_star(&self) -> bool {
+        if let Some((room_idx, sp)) = self.star {
+            // Only valid if player is in the same room (or close enough)
+            let d = self.pos - sp;
+            if d.length_squared() > STAR_RADIUS * STAR_RADIUS {
+                return false;
+            }
+            // Make sure player is actually in that room (avoid wall edge cases)
+            self.world.room_index_at(self.pos) == Some(room_idx)
         } else {
-            // Centre is inside the tile — push toward nearest walkable neighbour.
-            let dl = self.pos.0 - ax;
-            let dr = (ax + 1.0) - self.pos.0;
-            let dt = self.pos.1 - ay;
-            let db = (ay + 1.0) - self.pos.1;
-            let itx = tx;
-            let ity = ty;
-
-            let candidates: [(f32, f32, f32, i32, i32); 4] = [
-                (-1.0, 0.0, dl, itx - 1, ity),
-                ( 1.0, 0.0, dr, itx + 1, ity),
-                ( 0.0,-1.0, dt, itx, ity - 1),
-                ( 0.0, 1.0, db, itx, ity + 1),
-            ];
-
-            let mut best: Option<(f32, f32, f32)> = None;
-            for &(cnx, cny, edge_d, ntx, nty) in &candidates {
-                if self.is_blocked(ntx, nty) {
-                    continue;
-                }
-                if best.is_none() || edge_d < best.unwrap().2 {
-                    best = Some((cnx, cny, edge_d));
-                }
-            }
-
-            if let Some((bnx, bny, _)) = best {
-                (0.0, bnx, bny)
-            } else {
-                // All blocked — fallback to nearest edge.
-                let min_d = dl.min(dr).min(dt).min(db);
-                let (fnx, fny) = if (min_d - dl).abs() < 1e-8 {
-                    (-1.0f32, 0.0f32)
-                } else if (min_d - dr).abs() < 1e-8 {
-                    (1.0, 0.0)
-                } else if (min_d - dt).abs() < 1e-8 {
-                    (0.0, -1.0)
-                } else {
-                    (0.0, 1.0)
-                };
-                (0.0, fnx, fny)
-            }
+            false
         }
-    }
-
-    /// Find the nearest wall surface relative to the collision circle.
-    /// Returns `(clearance, normal_x, normal_y)` where
-    /// `clearance = dist_to_surface - collision_radius`.
-    fn nearest_wall(&self) -> (f32, f32, f32) {
-        let gx = self.pos.0.floor() as i32;
-        let gy = self.pos.1.floor() as i32;
-        let mut best_dist = f32::MAX;
-        let mut best_nx = 0.0f32;
-        let mut best_ny = 0.0f32;
-
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let tx = gx + dx;
-                let ty = gy + dy;
-                if !self.is_blocked(tx, ty) {
-                    continue;
-                }
-                let (dist, nx, ny) = self.dist_to_tile(tx, ty);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_nx = nx;
-                    best_ny = ny;
-                }
-            }
-        }
-
-        (best_dist - self.collision_radius, best_nx, best_ny)
-    }
-
-    /// Soft layer: wall-bound repulsion zone.
-    /// Within the zone (wall surface + repulsion_range), two effects:
-    ///   1. Damp velocity component moving toward the wall.
-    ///   2. Push player away from wall (position-based, always active).
-    /// Outside the zone: force = 0 immediately.
-    fn soft_repulsion(&mut self) {
-        let (clearance, nx, ny) = self.nearest_wall();
-        let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
-
-        // Update debug telemetry.
-        self.dbg_clearance = clearance;
-        self.dbg_wall_nx = nx;
-        self.dbg_wall_ny = ny;
-
-        if clearance >= self.repulsion_range || clearance < 0.0 {
-            return;
-        }
-
-        let t = (clearance / self.repulsion_range).max(0.0); // 0=at surface, 1=zone edge
-
-        // 1. Damp toward-wall velocity.
-        let dot = self.velocity.0 * nx + self.velocity.1 * ny;
-        if dot < 0.0 {
-            let damping = t.powf(self.repulsion_power);
-            let correction = dot * (damping - 1.0);
-            self.velocity.0 += correction * nx;
-            self.velocity.1 += correction * ny;
-        }
-
-        // 2. Position-based push away from wall (tick-scaled).
-        let push = (1.0 - t).powf(self.repulsion_power) * self.repulsion_push * dt_ratio;
-        self.velocity.0 += nx * push;
-        self.velocity.1 += ny * push;
     }
 
     // -- RNG --
@@ -538,36 +372,47 @@ impl State {
         x
     }
 
-    /// Pick a random 2×2 Floor area for the star objective.
-    fn spawn_star(&mut self) {
-        // Collect top-left corners where all 4 tiles are Floor.
-        let candidates: Vec<(i32, i32)> = (0..self.map_h - 1)
-            .flat_map(|y| (0..self.map_w - 1).map(move |x| (x, y)))
-            .filter(|&(x, y)| {
-                self.map[idx(x, y, self.map_w)].terrain == Terrain::Floor
-                    && self.map[idx(x + 1, y, self.map_w)].terrain == Terrain::Floor
-                    && self.map[idx(x, y + 1, self.map_w)].terrain == Terrain::Floor
-                    && self.map[idx(x + 1, y + 1, self.map_w)].terrain == Terrain::Floor
-            })
-            .collect();
+    fn random_unit(&mut self) -> f32 {
+        (self.xorshift() % 10000) as f32 / 10000.0
+    }
 
-        if candidates.is_empty() {
-            self.star_pos = None;
+    fn spawn_star(&mut self) {
+        let n_rooms = self.world.rooms.len();
+        if n_rooms == 0 {
+            self.star = None;
             return;
         }
-        let i = self.xorshift() as usize % candidates.len();
-        self.star_pos = Some(candidates[i]);
+        for _ in 0..400 {
+            let room_idx = (self.xorshift() as usize) % n_rooms;
+            let bounds = self.world.rooms[room_idx].bounds;
+            let pad = self.collision_radius + 12.0;
+            let rx = self.random_unit();
+            let ry = self.random_unit();
+            let x = bounds.x + pad + rx * (bounds.w - 2.0 * pad);
+            let y = bounds.y + pad + ry * (bounds.h - 2.0 * pad);
+            let candidate = vec2(x, y);
+
+            // Reject if collision at the spot.
+            if self.collides_at(candidate) {
+                continue;
+            }
+            // Reject if too close to a toilet (let toilet be its own thing).
+            let tol_r = self.collision_radius + 30.0;
+            let tol_rect = Rect::new(x - tol_r, y - tol_r, tol_r * 2.0, tol_r * 2.0);
+            let near_toilet = self.world.rooms[room_idx]
+                .toilets
+                .iter()
+                .any(|t| tol_rect.overlaps(&t.rect));
+            if near_toilet {
+                continue;
+            }
+            self.star = Some((room_idx, candidate));
+            return;
+        }
+        self.star = None;
     }
 
-    /// Check if player tile is within the current 2×2 star area.
-    fn is_on_star(&self) -> bool {
-        if let Some((sx, sy)) = self.star_pos {
-            let (tx, ty) = self.player_tile();
-            tx >= sx && tx <= sx + 1 && ty >= sy && ty <= sy + 1
-        } else {
-            false
-        }
-    }
+    // -- QTE --
 
     fn generate_qte(&mut self, rounds_needed: u32) -> QteState {
         let seq = self.random_key_sequence();
@@ -594,39 +439,32 @@ impl State {
         seq
     }
 
-    /// Feed a QTE key press.  Ignored during fail-flash.
     pub fn qte_press(&mut self, key: QteKey) {
         let qte = match self.move_state {
             MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
             _ => return,
         };
-
         if qte.round_failed {
-            return; // wait for auto-retry
+            return;
         }
-
         let expected = qte.sequence[qte.progress];
         if key == expected {
             qte.progress += 1;
             qte.timer = qte.time_per_key;
             if qte.progress >= qte.sequence.len() {
-                // Round complete!
                 qte.rounds_completed += 1;
-                // Check if all rounds done — handled in tick_qte.
             }
         } else {
-            // Wrong key → round fails, will auto-retry.
             qte.round_failed = true;
             qte.fail_timer = FAIL_FLASH_SECS;
         }
     }
 
-    /// Transition to StandingUp state with kaomoji toast.
     fn enter_standing_up(&mut self) {
         let i = self.xorshift() as usize % STANDUP_MSGS.len();
         self.toast = Some((STANDUP_MSGS[i].to_string(), STANDUP_DURATION + 0.3));
         self.move_state = MoveState::StandingUp(STANDUP_DURATION);
-        self.velocity = (0.0, 0.0);
+        self.velocity = Vec2::ZERO;
         self.prev_pos = self.pos;
         self.interact_hold = 0.0;
         self.bubbles.clear();
@@ -634,18 +472,12 @@ impl State {
         self.qte_e_up_seen = false;
     }
 
-    /// QTE tick logic — timer, fail-retry, round/session completion.
     fn tick_qte(&mut self, tick_s: f32) {
         let is_pooping = matches!(self.move_state, MoveState::Pooping(_));
 
-        // Track E release so re-press can trigger stand-up
-        // (user holds E through Preparing→QTE, must release first).
         if !self.input_e_down {
             self.qte_e_up_seen = true;
         }
-
-        // Stand-up via held E after release (per-tick continuous check).
-        // Discrete E press stand-up is handled per-frame by handle_e_press_qte().
         if self.qte_e_up_seen && self.input_e_down {
             self.enter_standing_up();
             return;
@@ -658,7 +490,6 @@ impl State {
                 MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
                 _ => return,
             };
-
             if qte.round_failed {
                 qte.fail_timer -= tick_s;
                 if qte.fail_timer <= 0.0 {
@@ -685,7 +516,6 @@ impl State {
 
         match action {
             Action::SessionDone => {
-                // Apply urgency relief (star < toilet).
                 if is_pooping {
                     self.completed += 1;
                     self.urgency = (self.urgency - self.star_relief).max(0.0);
@@ -712,26 +542,12 @@ impl State {
         }
     }
 
-    /// Terrain under the player's feet.
-    pub fn current_terrain(&self) -> Terrain {
-        let (tx, ty) = self.player_tile();
-        if tx >= 0 && tx < self.map_w && ty >= 0 && ty < self.map_h {
-            self.map[idx(tx, ty, self.map_w)].terrain
-        } else {
-            Terrain::Wall
-        }
-    }
-
-    // -- Bubbles --
-
     fn tick_bubbles(&mut self, tick_s: f32) {
-        // Spawn new bubbles periodically.
         self.bubble_timer -= tick_s;
         if self.bubble_timer <= 0.0 {
             self.spawn_bubble();
             self.bubble_timer = 0.4 + (self.xorshift() % 600) as f32 / 1000.0;
         }
-        // Age and float upward.
         for b in &mut self.bubbles {
             b.age += tick_s;
             b.y_offset -= tick_s * 30.0;
@@ -742,19 +558,18 @@ impl State {
     fn tick_particles(&mut self, tick_s: f32) {
         for p in &mut self.particles {
             p.age += tick_s;
-            p.pos.0 += p.vel.0;
-            p.pos.1 += p.vel.1;
+            p.pos.x += p.vel.x;
+            p.pos.y += p.vel.y;
         }
         self.particles.retain(|p| p.age < p.lifetime);
     }
 
     fn spawn_completion_particles(&mut self) {
         let count = self.particle_count;
-        let px = self.pos.0;
-        let py = self.pos.1;
+        let origin = self.pos;
         for _ in 0..count {
             let angle = (self.xorshift() % 628) as f32 / 100.0;
-            let speed = 0.02 + (self.xorshift() % 80) as f32 / 1000.0;
+            let speed = 1.0 + (self.xorshift() % 200) as f32 / 100.0;
             let lifetime = 0.8 + (self.xorshift() % 800) as f32 / 1000.0;
             let color = match self.xorshift() % 4 {
                 0 => (255u8, 220u8, 50u8),
@@ -763,8 +578,8 @@ impl State {
                 _ => (255, 100, 200),
             };
             self.particles.push(Particle {
-                pos: (px, py),
-                vel: (angle.cos() * speed, angle.sin() * speed),
+                pos: origin,
+                vel: vec2(angle.cos() * speed, angle.sin() * speed),
                 lifetime,
                 age: 0.0,
                 color,
@@ -785,128 +600,14 @@ impl State {
         });
     }
 
-    /// Hard layer: resolve AABB-Circle penetrations for all nearby wall tiles.
-    fn resolve_collision(&mut self) {
-        let cr = self.collision_radius;
-
-        for _ in 0..COLLISION_ITERS {
-            let gx = self.pos.0.floor() as i32;
-            let gy = self.pos.1.floor() as i32;
-            let mut resolved_any = false;
-
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let tx = gx + dx;
-                    let ty = gy + dy;
-                    if !self.is_blocked(tx, ty) {
-                        continue;
-                    }
-
-                    let ax = tx as f32;
-                    let ay = ty as f32;
-                    let nearest_x = self.pos.0.clamp(ax, ax + 1.0);
-                    let nearest_y = self.pos.1.clamp(ay, ay + 1.0);
-                    let diff_x = self.pos.0 - nearest_x;
-                    let diff_y = self.pos.1 - nearest_y;
-                    let dist_sq = diff_x * diff_x + diff_y * diff_y;
-
-                    // No penetration.
-                    if dist_sq >= cr * cr && dist_sq > 0.0 {
-                        continue;
-                    }
-
-                    let (nx, ny, pen);
-
-                    if dist_sq > 1e-8 {
-                        // Circle centre outside AABB but overlapping.
-                        let dist = dist_sq.sqrt();
-                        nx = diff_x / dist;
-                        ny = diff_y / dist;
-                        pen = cr - dist;
-                    } else {
-                        // Circle centre inside AABB — push toward the
-                        // nearest WALKABLE neighbour, not just nearest edge.
-                        let dl = self.pos.0 - ax;
-                        let dr = (ax + 1.0) - self.pos.0;
-                        let dt = self.pos.1 - ay;
-                        let db = (ay + 1.0) - self.pos.1;
-
-                        // Candidates: (normal_x, normal_y, edge_dist, neighbour tile).
-                        let candidates: [(f32, f32, f32, i32, i32); 4] = [
-                            (-1.0, 0.0, dl, tx - 1, ty),
-                            ( 1.0, 0.0, dr, tx + 1, ty),
-                            ( 0.0,-1.0, dt, tx, ty - 1),
-                            ( 0.0, 1.0, db, tx, ty + 1),
-                        ];
-
-                        // Pick shortest push toward a walkable tile.
-                        let mut best_push: Option<(f32, f32, f32)> = None;
-                        for &(cnx, cny, edge_d, ntx, nty) in &candidates {
-                            if self.is_blocked(ntx, nty) {
-                                continue;
-                            }
-                            let cpen = cr + edge_d;
-                            if best_push.is_none() || cpen < best_push.unwrap().2 {
-                                best_push = Some((cnx, cny, cpen));
-                            }
-                        }
-
-                        if let Some((bnx, bny, bpen)) = best_push {
-                            nx = bnx;
-                            ny = bny;
-                            pen = bpen;
-                        } else {
-                            // All neighbours blocked — fallback nearest edge.
-                            let min_d = dl.min(dr).min(dt).min(db);
-                            let (fnx, fny) = if (min_d - dl).abs() < 1e-8 {
-                                (-1.0f32, 0.0f32)
-                            } else if (min_d - dr).abs() < 1e-8 {
-                                (1.0, 0.0)
-                            } else if (min_d - dt).abs() < 1e-8 {
-                                (0.0, -1.0)
-                            } else {
-                                (0.0, 1.0)
-                            };
-                            nx = fnx;
-                            ny = fny;
-                            pen = cr + min_d;
-                        }
-                    }
-
-                    // Push out along normal.
-                    self.pos.0 += nx * pen;
-                    self.pos.1 += ny * pen;
-
-                    // Project velocity: remove component into wall.
-                    let vel_dot = self.velocity.0 * nx + self.velocity.1 * ny;
-                    if vel_dot < 0.0 {
-                        self.velocity.0 -= vel_dot * nx;
-                        self.velocity.1 -= vel_dot * ny;
-                    }
-
-                    resolved_any = true;
-                }
-            }
-
-            if !resolved_any {
-                break;
-            }
-        }
-    }
-
-    // -- Tick --
-
     pub fn tick(&mut self) {
-
         if self.phase != Phase::Playing {
             return;
         }
-
         let tick_s = self.tick_ms as f32 / 1000.0;
 
         self.tick_particles(tick_s);
 
-        // --- Toast timer ---
         if let Some((_, ref mut t)) = self.toast {
             *t -= tick_s;
         }
@@ -914,75 +615,55 @@ impl State {
             self.toast = None;
         }
 
-        // ========================================================
-        // State machine: frozen states return early, others fall
-        // through to the shared urgency + movement-physics tail.
-        // ========================================================
-
-        // [1] StandingUp — frozen, countdown to Walking.
         if let MoveState::StandingUp(remaining) = self.move_state {
             let r = remaining - tick_s;
-            if r <= 0.0 {
-                self.move_state = MoveState::Walking;
-            } else {
-                self.move_state = MoveState::StandingUp(r);
-            }
+            self.move_state = if r <= 0.0 { MoveState::Walking } else { MoveState::StandingUp(r) };
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
             if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
-            return; // Frozen — no movement.
+            return;
         }
 
-        // [2] QTE active (Pooping / UsingToilet) — frozen.
         if matches!(self.move_state, MoveState::Pooping(_) | MoveState::UsingToilet(_)) {
             self.tick_qte(tick_s);
             self.tick_bubbles(tick_s);
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
             if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
-            return; // Frozen — no movement.
+            return;
         }
 
-        // [3] Preparing (holding E, decelerating via physics).
         if matches!(self.move_state, MoveState::Preparing) {
             if !self.input_e_down {
-                // Released E → cancel, fall through to normal movement.
                 self.move_state = MoveState::Walking;
                 self.interact_hold = 0.0;
             } else {
                 self.interact_hold += tick_s;
                 if self.interact_hold >= INTERACT_HOLD_TIME {
                     self.interact_hold = 0.0;
-                    let terrain = self.current_terrain();
-                    let on_star = self.is_on_star();
-                    if terrain == Terrain::Toilet {
+                    if self.is_on_toilet() {
                         let qte = self.generate_qte(self.poop_rounds);
                         self.move_state = MoveState::UsingToilet(qte);
-                        self.velocity = (0.0, 0.0);
+                        self.velocity = Vec2::ZERO;
                         self.prev_pos = self.pos;
                         self.qte_e_up_seen = false;
                         return;
-                    } else if on_star {
+                    } else if self.is_on_star() {
                         let qte = self.generate_qte(self.poop_rounds);
                         self.move_state = MoveState::Pooping(qte);
-                        self.velocity = (0.0, 0.0);
+                        self.velocity = Vec2::ZERO;
                         self.prev_pos = self.pos;
                         self.qte_e_up_seen = false;
                         return;
                     } else {
-                        // Slid off valid area — cancel.
                         let i = self.xorshift() as usize % CANT_POOP_MSGS.len();
                         self.toast = Some((CANT_POOP_MSGS[i].to_string(), 2.0));
                         self.move_state = MoveState::Walking;
                     }
                 }
-                // Fall through to physics (deceleration, no directional input).
             }
         }
 
-        // [4] E-press handling moved to handle_e_press() — called per-frame from main.
-
-        // [5] Running state (skip if Preparing).
         let running = if matches!(self.move_state, MoveState::Preparing) {
             false
         } else {
@@ -991,7 +672,6 @@ impl State {
             r
         };
 
-        // --- Urgency (tick-scaled) ---
         let dt_ratio_urg = self.tick_ms as f32 / BASELINE_TICK_MS;
         let urg_mult = if running { self.run_urgency_mult } else { 1.0 };
         self.urgency += self.urgency_rate * urg_mult * dt_ratio_urg;
@@ -1001,13 +681,11 @@ impl State {
             return;
         }
 
-        // --- Movement physics ---
         self.prev_pos = self.pos;
 
         let (ix, iy) = (self.input_x as f32, self.input_y as f32);
         let no_input = self.input_x == 0 && self.input_y == 0;
 
-        // Normalize diagonal input.
         let len_sq = ix * ix + iy * iy;
         let (nx, ny) = if len_sq > 1.0 {
             let inv = 1.0 / len_sq.sqrt();
@@ -1016,55 +694,40 @@ impl State {
             (ix, iy)
         };
 
-        // Choose friction: stop_friction when no input, regular when moving.
         let friction = if no_input { self.eff_stop_friction } else { self.eff_friction };
         let accel = if running { self.eff_accel * self.run_accel_mult } else { self.eff_accel };
-        self.velocity.0 = self.velocity.0 * friction + accel * nx;
-        self.velocity.1 = self.velocity.1 * friction + accel * ny;
+        self.velocity.x = self.velocity.x * friction + accel * nx;
+        self.velocity.y = self.velocity.y * friction + accel * ny;
 
-        // Clamp speed (tick-scaled max, with running multiplier).
         let eff_max = if running { self.eff_max_speed * self.run_speed_mult } else { self.eff_max_speed };
-        let speed_sq = self.velocity.0 * self.velocity.0 + self.velocity.1 * self.velocity.1;
+        let speed_sq = self.velocity.length_squared();
         if eff_max > 0.0 && speed_sq > eff_max * eff_max {
             let scale = eff_max / speed_sq.sqrt();
-            self.velocity.0 *= scale;
-            self.velocity.1 *= scale;
+            self.velocity *= scale;
         }
 
-        // Snap to zero when coasting.
         let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
         let eps = SPEED_EPSILON * dt_ratio;
         if no_input && speed_sq < eps * eps {
-            self.velocity = (0.0, 0.0);
+            self.velocity = Vec2::ZERO;
         }
 
-        // Soft repulsion.
-        self.soft_repulsion();
-
-        // Integrate with sub-stepping to prevent tunnelling.
-        let vlen = (self.velocity.0 * self.velocity.0 + self.velocity.1 * self.velocity.1).sqrt();
-        let steps = ((vlen / MAX_SUBSTEP).ceil() as usize).max(1);
-        let inv_steps = 1.0 / steps as f32;
-        let step_vx = self.velocity.0 * inv_steps;
-        let step_vy = self.velocity.1 * inv_steps;
-
-        for _ in 0..steps {
-            self.pos.0 += step_vx;
-            self.pos.1 += step_vy;
-            self.resolve_collision();
+        if self.velocity.x != 0.0 {
+            if !self.try_move_axis(self.velocity.x, 0.0) {
+                self.velocity.x = 0.0;
+            }
         }
-
-        // Safety clamp — keep inside map bounds.
-        let pad = self.collision_radius + 0.01;
-        self.pos.0 = self.pos.0.clamp(pad, self.map_w as f32 - pad);
-        self.pos.1 = self.pos.1.clamp(pad, self.map_h as f32 - pad);
+        if self.velocity.y != 0.0 {
+            if !self.try_move_axis(0.0, self.velocity.y) {
+                self.velocity.y = 0.0;
+            }
+        }
     }
 
-    /// Reset player to a safe starting position.
     pub fn reset_position(&mut self) {
-        self.pos = (2.5, 2.5);
-        self.velocity = (0.0, 0.0);
+        self.pos = vec2(1000.0, 550.0);
         self.prev_pos = self.pos;
+        self.velocity = Vec2::ZERO;
         self.move_state = MoveState::Walking;
         self.urgency = 0.0;
         self.completed = 0;
@@ -1075,16 +738,14 @@ impl State {
         self.bubbles.clear();
         self.bubble_timer = 0.0;
         self.particles.clear();
+        // Reset doors to closed.
+        for d in &mut self.world.doors {
+            d.open = false;
+        }
         self.spawn_star();
     }
 
-    // -- Rendering helpers --
-
-    /// Interpolated visual position for smooth rendering between ticks.
-    pub fn player_visual_pos(&self, t: f32) -> (f32, f32) {
-        (
-            self.prev_pos.0 + (self.pos.0 - self.prev_pos.0) * t,
-            self.prev_pos.1 + (self.pos.1 - self.prev_pos.1) * t,
-        )
+    pub fn player_visual_pos(&self, t: f32) -> Vec2 {
+        self.prev_pos + (self.pos - self.prev_pos) * t
     }
 }
