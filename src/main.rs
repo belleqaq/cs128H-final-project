@@ -7,7 +7,7 @@ mod game;
 use game::cell::{idx, Cell, Terrain};
 use game::npc::{ActivityPhase, AlertState, Npc, NpcActivity, NpcRoutine, STEER_SLOTS};
 use game::state::{MoveState, Phase, QteKey};
-use game::{load_config, load_debug_preset, save_debug_preset, GameConfig, State};
+use game::{load_config, save_config, State};
 use macroquad::prelude::*;
 
 const TILE_SIZE: f32 = 32.0;
@@ -89,13 +89,13 @@ fn test_map() -> (Vec<Cell>, i32, i32) {
     }
 
     // Door openings (2 tiles wide) in y=8 wall.
-    for &dx in &[4, 5] { map[idx(dx, 8, w)].terrain = Terrain::Floor; }   // NPC room door
-    for &dx in &[13, 14] { map[idx(dx, 8, w)].terrain = Terrain::Floor; } // Toilet door
-    for &dx in &[22, 23] { map[idx(dx, 8, w)].terrain = Terrain::Floor; } // Trash room door
+    for &dx in &[4, 5] { map[idx(dx, 8, w)].terrain = Terrain::DoorOpen; }   // NPC room door
+    for &dx in &[13, 14] { map[idx(dx, 8, w)].terrain = Terrain::DoorOpen; } // Toilet door
+    for &dx in &[22, 23] { map[idx(dx, 8, w)].terrain = Terrain::DoorOpen; } // Trash room door
 
     // Door openings in y=12 wall (access to lower area).
-    for &dx in &[7, 8] { map[idx(dx, 12, w)].terrain = Terrain::Floor; }
-    for &dx in &[20, 21] { map[idx(dx, 12, w)].terrain = Terrain::Floor; }
+    for &dx in &[7, 8] { map[idx(dx, 12, w)].terrain = Terrain::DoorOpen; }
+    for &dx in &[20, 21] { map[idx(dx, 12, w)].terrain = Terrain::DoorOpen; }
 
     // Toilet room floor tiles.
     for y in 1..=7 {
@@ -120,6 +120,8 @@ struct DebugPanel {
     edit_buf: String,
     /// Whether the NPC Steering section is expanded.
     npc_steer_open: bool,
+    /// Whether NPC path/waypoint visualization is shown.
+    show_npc_paths: bool,
 }
 
 impl DebugPanel {
@@ -130,6 +132,7 @@ impl DebugPanel {
             editing: None,
             edit_buf: String::new(),
             npc_steer_open: false,
+            show_npc_paths: false,
         }
     }
 
@@ -311,11 +314,6 @@ async fn main() {
     let config = load_config();
     let (map, w, h) = test_map();
     let mut state = State::new(&config, map, w, h);
-
-    // Load debug preset if it exists.
-    if let Some(preset) = load_debug_preset() {
-        state.apply_preset(&preset);
-    }
 
     // Spawn one test NPC in NPC Room (x=1-8, y=1-7), center ≈ (4.5, 4.5).
     {
@@ -513,10 +511,20 @@ async fn main() {
             };
             draw_circle(ncx, ncy, nvr, npc_body_color);
 
-            // Alert indicator above head.
-            if npc.chase.active {
-                draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
-            } else {
+            // Alert indicator / expression bubble above head.
+            if let Some(ref expr) = npc.chase.expression {
+                let fade_in = (expr.age / 0.3).min(1.0);
+                let fade_out = ((expr.lifetime - expr.age) / 0.5).min(1.0).max(0.0);
+                let alpha = fade_in * fade_out;
+                let tw = measure_text(&expr.text, None, 16, 1.0);
+                draw_text(
+                    &expr.text,
+                    ncx - tw.width * 0.5,
+                    ncy - nvr - 12.0,
+                    16.0,
+                    Color::new(1.0, 0.9, 0.5, alpha),
+                );
+            } else if !npc.chase.active {
                 match npc.alert_state {
                     AlertState::Suspicious => {
                         draw_text("?", ncx - 5.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 220, 50, 255));
@@ -541,6 +549,67 @@ async fn main() {
                     2.0,
                     color_u8!(255, 255, 100, 200),
                 );
+
+                // NPC path / waypoint visualization.
+                if debug.show_npc_paths && !npc.path.is_empty() {
+                    let path = &npc.path;
+                    let pi = npc.path_idx;
+
+                    // Draw path line: NPC → W0 → W1 → ... → Wn
+                    let mut prev_sx = ncx;
+                    let mut prev_sy = ncy;
+                    for (wi, &(wx, wy)) in path.iter().enumerate() {
+                        let sx = (wx as f32 + 0.5) * TILE_SIZE - cam_x;
+                        let sy = (wy as f32 + 0.5) * TILE_SIZE - cam_y;
+
+                        // Line color: past=dim, current segment=bright, future=medium
+                        let (line_col, line_w) = if wi < pi {
+                            (color_u8!(80, 80, 80, 100), 1.0)
+                        } else if wi == pi {
+                            (color_u8!(50, 255, 50, 200), 2.5)
+                        } else {
+                            (color_u8!(50, 180, 255, 150), 1.5)
+                        };
+                        draw_line(prev_sx, prev_sy, sx, sy, line_w, line_col);
+
+                        // Waypoint circle + label
+                        let r = if wi == pi { 5.0 } else { 3.0 };
+                        let circle_col = if wi == pi {
+                            color_u8!(50, 255, 50, 230)
+                        } else if wi < pi {
+                            color_u8!(120, 120, 120, 150)
+                        } else {
+                            color_u8!(50, 180, 255, 200)
+                        };
+                        draw_circle(sx, sy, r, circle_col);
+                        let label = format!("W{}", wi);
+                        draw_text(&label, sx + 6.0, sy - 4.0, 12.0, color_u8!(255, 255, 255, 200));
+
+                        prev_sx = sx;
+                        prev_sy = sy;
+                    }
+
+                    // Target tile: dashed indicator
+                    if let Some((tx, ty)) = npc.chase.target_tile {
+                        let tsx = (tx as f32 + 0.5) * TILE_SIZE - cam_x;
+                        let tsy = (ty as f32 + 0.5) * TILE_SIZE - cam_y;
+                        draw_circle_lines(tsx, tsy, 8.0, 2.0, color_u8!(255, 100, 50, 200));
+                        draw_text("TGT", tsx + 10.0, tsy - 2.0, 12.0, color_u8!(255, 100, 50, 220));
+                    }
+
+                    // Info label near NPC: phase, idx/total, timer
+                    let phase_str = match &npc.chase.phase {
+                        game::chase::ChasePhase::Pursuit => "Pursuit",
+                        game::chase::ChasePhase::Navigate { .. } => "Nav",
+                        game::chase::ChasePhase::Search { .. } => "Search",
+                    };
+                    let info = if npc.chase.active {
+                        format!("{} [{}/{}] {:.1}s", phase_str, pi, path.len(), npc.chase.timer)
+                    } else {
+                        format!("patrol [{}/{}]", pi, path.len())
+                    };
+                    draw_text(&info, ncx + 14.0, ncy + 14.0, 11.0, color_u8!(255, 255, 200, 220));
+                }
 
                 // Context steering rays (first NPC only).
                 if npc_idx == 0 && debug.npc_steer_open {
@@ -931,17 +1000,16 @@ async fn main() {
                 "Save preset",
                 color_u8!(30, 80, 50, 230),
             ) {
-                save_debug_preset(&state.to_preset());
+                save_config(&state.to_config());
                 save_flash = 1.5;
             }
             if debug.button(
                 panel_x + btn_w + 5.0, py, btn_w, btn_h,
-                "Load preset",
+                "Load config",
                 color_u8!(50, 40, 80, 230),
             ) {
-                if let Some(p) = load_debug_preset() {
-                    state.apply_preset(&p);
-                }
+                let cfg = load_config();
+                state.apply_config(&cfg);
             }
             if debug.button(
                 panel_x + (btn_w + 5.0) * 2.0, py, btn_w, btn_h,
@@ -956,7 +1024,7 @@ async fn main() {
             if save_flash > 0.0 {
                 let alpha = save_flash.min(1.0);
                 draw_text(
-                    "Saved to debug_preset.toml",
+                    "Saved to config.toml",
                     panel_x + 4.0,
                     py + 14.0,
                     14.0,
@@ -964,6 +1032,20 @@ async fn main() {
                 );
                 save_flash -= get_frame_time();
                 py += 18.0;
+            }
+
+            // --- Toggle: Show NPC paths ---
+            {
+                let label = if debug.show_npc_paths { "[x] NPC paths" } else { "[ ] NPC paths" };
+                let col = if debug.show_npc_paths {
+                    color_u8!(40, 100, 60, 230)
+                } else {
+                    color_u8!(50, 50, 60, 230)
+                };
+                if debug.button(panel_x, py, pw * 0.5, btn_h, label, col) {
+                    debug.show_npc_paths = !debug.show_npc_paths;
+                }
+                py += btn_h + 4.0;
             }
 
             // --- Collapsible: NPC Steering ---
@@ -1060,7 +1142,11 @@ async fn main() {
                 // Show chase status of first NPC.
                 if let Some(npc) = state.npcs.first() {
                     let status = if npc.chase.active {
-                        let mode = if npc.chase.has_los { "LOS" } else { "A*" };
+                        let mode = match &npc.chase.phase {
+                            game::chase::ChasePhase::Pursuit => "Pursuit",
+                            game::chase::ChasePhase::Navigate { .. } => "Navigate",
+                            game::chase::ChasePhase::Search { .. } => "Search",
+                        };
                         format!("CHASING [{}] ({:.1}s)", mode, npc.chase.timer)
                     } else {
                         "patrol".to_string()

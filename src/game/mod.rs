@@ -5,9 +5,10 @@ pub mod chase;
 pub mod config;
 pub mod npc;
 pub mod physics;
+pub mod room;
 pub mod state;
 
-pub use config::{load_config, load_debug_preset, save_debug_preset, DebugPreset, GameConfig, GameplaySettings};
+pub use config::{load_config, save_config, GameConfig, GameplaySettings};
 pub use state::State;
 
 /// Baseline tick duration that config friction/acceleration values are

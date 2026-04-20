@@ -432,7 +432,7 @@ impl Npc {
     ) {
         // --- Chase direct pursuit: has LOS → steer straight to player ---
         // LOS already confirmed by update_chase, so no walls between.
-        if self.routine.phase == ActivityPhase::Chasing && self.chase.has_los {
+        if self.routine.phase == ActivityPhase::Chasing && self.chase.has_los() {
             self.direct_chase(params, map, map_w, map_h, tick_ms);
             return;
         }
@@ -748,7 +748,7 @@ impl Npc {
                     cross_track_error, corr,
                     passed_plane,
                     self.path_idx, self.path.len(),
-                    self.chase.active, self.chase.has_los,
+                    self.chase.active, self.chase.has_los(),
                 );
             }
         });
@@ -774,18 +774,63 @@ impl Npc {
     /// Compute a lookahead target point along the path for pure-pursuit seek.
     /// Walks forward from current position along waypoints until `lookahead`
     /// distance is consumed, then returns the normalised direction to that point.
+    ///
+    /// Corner cutting: when the lookahead walk passes through a waypoint that
+    /// forms a sharp turn (>60°) and both adjacent segments span ≥ 2 grid
+    /// cells, the walker cuts diagonally across the corner instead of following
+    /// the right angle. Single-cell corners are kept (discrete grid limit).
     fn lookahead_target(&self, lookahead: f32) -> (f32, f32) {
         let mut remaining = lookahead;
         let mut from = self.pos;
 
         for i in self.path_idx..self.path.len() {
             let wp = (self.path[i].0 as f32 + 0.5, self.path[i].1 as f32 + 0.5);
-            let dx = wp.0 - from.0;
-            let dy = wp.1 - from.1;
+
+            // Corner-cutting check: if this waypoint is a sharp big turn,
+            // replace the corner with a diagonal shortcut.
+            let effective_wp = if i > 0 && i + 1 < self.path.len() {
+                let next = (self.path[i + 1].0 as f32 + 0.5,
+                            self.path[i + 1].1 as f32 + 0.5);
+                let in_dx = wp.0 - from.0;
+                let in_dy = wp.1 - from.1;
+                let out_dx = next.0 - wp.0;
+                let out_dy = next.1 - wp.1;
+                let in_len = (in_dx * in_dx + in_dy * in_dy).sqrt();
+                let out_len = (out_dx * out_dx + out_dy * out_dy).sqrt();
+
+                // Both segments must span >= 2 cells (1.5 in continuous coords
+                // to account for center-of-tile positioning).
+                if in_len >= 1.5 && out_len >= 1.5 {
+                    let cos_angle = if in_len > 0.01 && out_len > 0.01 {
+                        (in_dx * out_dx + in_dy * out_dy) / (in_len * out_len)
+                    } else {
+                        1.0
+                    };
+                    // Sharp turn: cos < 0.5 means angle > 60°.
+                    if cos_angle < 0.5 {
+                        // Cut point: midpoint of the triangle's hypotenuse
+                        // from 0.7 cells before the corner to 0.7 cells after.
+                        let cut_dist = 0.7f32;
+                        let before = (wp.0 - in_dx / in_len * cut_dist,
+                                      wp.1 - in_dy / in_len * cut_dist);
+                        let after = (wp.0 + out_dx / out_len * cut_dist,
+                                     wp.1 + out_dy / out_len * cut_dist);
+                        ((before.0 + after.0) * 0.5, (before.1 + after.1) * 0.5)
+                    } else {
+                        wp
+                    }
+                } else {
+                    wp // Small corner — keep as-is.
+                }
+            } else {
+                wp
+            };
+
+            let dx = effective_wp.0 - from.0;
+            let dy = effective_wp.1 - from.1;
             let seg_len = (dx * dx + dy * dy).sqrt();
 
             if seg_len >= remaining && seg_len > 1e-4 {
-                // Target is partway along this segment.
                 let t = remaining / seg_len;
                 let tx = from.0 + dx * t;
                 let ty = from.1 + dy * t;
@@ -796,7 +841,7 @@ impl Npc {
             }
 
             remaining -= seg_len;
-            from = wp;
+            from = effective_wp;
         }
 
         // Ran out of path — aim at the last waypoint.
@@ -811,7 +856,7 @@ impl Npc {
     }
 
     /// Direct pursuit (has LOS confirmed): steer toward `chase.last_seen_pos`.
-    /// Only called when `chase.has_los == true` — update_chase verified clear
+    /// Only called when `chase.has_los()` — update_chase verified clear
     /// line-of-sight via Bresenham, so no wall between NPC and player.
     /// Uses seek + wall avoidance (for wall-adjacent corners), no PID.
     fn direct_chase(
@@ -1172,14 +1217,15 @@ pub(crate) fn filter_waypoints(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: 
         matches!(map[idx(x, y, map_w)].terrain, Terrain::DoorOpen | Terrain::DoorClosed)
     };
 
-    // Check tile itself or any 4-neighbour for a door (catches tiles
-    // immediately before/after a doorway).
+    // Check if any 4-neighbour is a door (catches tiles immediately
+    // before/after a doorway). Excludes self — tiles ON the door itself
+    // are not kept, avoiding a redundant 3rd waypoint in the doorway.
     let near_door = |x: i32, y: i32| -> bool {
-        is_door(x, y)
-            || is_door(x - 1, y)
-            || is_door(x + 1, y)
-            || is_door(x, y - 1)
-            || is_door(x, y + 1)
+        !is_door(x, y)
+            && (is_door(x - 1, y)
+                || is_door(x + 1, y)
+                || is_door(x, y - 1)
+                || is_door(x, y + 1))
     };
 
     let mut keep = Vec::with_capacity(path.len());

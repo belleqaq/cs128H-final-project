@@ -10,9 +10,10 @@
 //!   4. Hard resolve: AABB-Circle correction along surface normal
 
 use crate::game::cell::{idx, Cell, Terrain, compute_passage_width, build_subgoal_graph, SubgoalGraph};
-use crate::game::config::{DebugPreset, GameConfig};
+use crate::game::config::GameConfig;
 use crate::game::npc::{self as npc_mod, Npc, SteerWeights};
 use crate::game::physics;
+use crate::game::room::{self, Room};
 use crate::game::BASELINE_TICK_MS;
 
 // ---------------------------------------------------------------------------
@@ -215,6 +216,9 @@ pub struct State {
     pub passage_width: Vec<u8>,
     /// Subgoal graph for fast cross-room pathfinding (corner subgoals).
     pub subgoal_graph: SubgoalGraph,
+    /// Detected rooms and per-tile room assignment.
+    pub rooms: Vec<Room>,
+    pub tile_to_room: Vec<usize>,
     // Debug telemetry (updated each tick).
     pub dbg_clearance: f32,
     pub dbg_wall_nx: f32,
@@ -226,6 +230,7 @@ impl State {
         let start = (15.5, 10.5); // corridor centre
         let pw = compute_passage_width(&map, w, h);
         let sg = build_subgoal_graph(&map, w, h);
+        let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg);
         let mut s = Self {
             map,
             map_w: w,
@@ -273,6 +278,8 @@ impl State {
             chase_config: crate::game::chase::ChaseConfig::default(),
             passage_width: pw,
             subgoal_graph: sg,
+            rooms,
+            tile_to_room,
             dbg_clearance: 0.0,
             dbg_wall_nx: 0.0,
             dbg_wall_ny: 0.0,
@@ -293,28 +300,19 @@ impl State {
         self.tick_ms = config.tick_ms;
     }
 
-    pub fn apply_preset(&mut self, p: &DebugPreset) {
-        self.raw_accel = p.acceleration;
-        self.raw_friction = p.friction;
-        self.raw_stop_friction = p.stop_friction;
-        self.max_speed = p.max_speed;
-        self.radius = p.radius;
-        self.repulsion_power = p.repulsion_power;
-        self.repulsion_range = p.repulsion_range;
-        self.repulsion_push = p.repulsion_push;
-    }
-
-    pub fn to_preset(&self) -> DebugPreset {
-        DebugPreset {
-            max_speed: self.max_speed,
-            acceleration: self.raw_accel,
-            friction: self.raw_friction,
-            stop_friction: self.raw_stop_friction,
-            radius: self.radius,
-            repulsion_power: self.repulsion_power,
-            repulsion_range: self.repulsion_range,
-            repulsion_push: self.repulsion_push,
-        }
+    /// Snapshot current tunable values back into a GameConfig for saving.
+    pub fn to_config(&self) -> GameConfig {
+        let mut cfg = GameConfig::default();
+        cfg.player.max_speed = self.max_speed;
+        cfg.player.acceleration = self.raw_accel;
+        cfg.player.friction = self.raw_friction;
+        cfg.player.stop_friction = self.raw_stop_friction;
+        cfg.player.radius = self.radius;
+        cfg.player.repulsion_power = self.repulsion_power;
+        cfg.player.repulsion_range = self.repulsion_range;
+        cfg.player.repulsion_push = self.repulsion_push;
+        cfg.tick_ms = self.tick_ms;
+        cfg
     }
 
     /// Which grid tile the player is currently in.
@@ -638,6 +636,8 @@ impl State {
             self.map_h,
             tick_s,
             &self.subgoal_graph,
+            &self.rooms,
+            &self.tile_to_room,
         );
         Self::tick_npcs(&mut self.npcs, &npc_params, &self.steer_weights, &self.map, self.map_w, self.map_h, self.tick_ms, &mut self.rng_state);
 

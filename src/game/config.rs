@@ -103,14 +103,25 @@ impl Default for PlayerSettings {
     }
 }
 
+/// Resolve config.toml path next to the executable (immune to working-dir changes).
+fn config_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config.toml")))
+        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"))
+}
+
 pub fn load_config() -> GameConfig {
-    let path = Path::new("config.toml");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!("[config] config.toml not found; using defaults");
+    let path = config_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("[config] {} not found; using defaults", path.display());
         return GameConfig::default();
     };
     match toml::from_str::<GameConfig>(&text) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => {
+            eprintln!("[config] loaded {}", path.display());
+            cfg
+        }
         Err(e) => {
             eprintln!("[config] parse error: {e}; using defaults");
             GameConfig::default()
@@ -118,65 +129,16 @@ pub fn load_config() -> GameConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Debug preset — separate file so it never collides with config.toml.
-// ---------------------------------------------------------------------------
-
-/// Subset of tunable values that the debug panel can save/load.
-#[derive(Deserialize, Serialize, Clone)]
-#[serde(default)]
-pub struct DebugPreset {
-    pub max_speed: f32,
-    pub acceleration: f32,
-    pub friction: f32,
-    pub stop_friction: f32,
-    pub radius: f32,
-    pub repulsion_power: f32,
-    pub repulsion_range: f32,
-    pub repulsion_push: f32,
-}
-
-impl Default for DebugPreset {
-    fn default() -> Self {
-        let p = PlayerSettings::default();
-        Self {
-            max_speed: p.max_speed,
-            acceleration: p.acceleration,
-            friction: p.friction,
-            stop_friction: p.stop_friction,
-            radius: p.radius,
-            repulsion_power: p.repulsion_power,
-            repulsion_range: p.repulsion_range,
-            repulsion_push: p.repulsion_push,
-        }
-    }
-}
-
-const PRESET_PATH: &str = "debug_preset.toml";
-
-pub fn load_debug_preset() -> Option<DebugPreset> {
-    let text = std::fs::read_to_string(PRESET_PATH).ok()?;
-    match toml::from_str::<DebugPreset>(&text) {
-        Ok(p) => {
-            eprintln!("[preset] loaded {PRESET_PATH}");
-            Some(p)
-        }
-        Err(e) => {
-            eprintln!("[preset] parse error: {e}");
-            None
-        }
-    }
-}
-
-pub fn save_debug_preset(preset: &DebugPreset) {
-    match toml::to_string_pretty(preset) {
+pub fn save_config(config: &GameConfig) {
+    let path = config_path();
+    match toml::to_string_pretty(config) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(PRESET_PATH, text) {
-                eprintln!("[preset] write error: {e}");
+            if let Err(e) = std::fs::write(&path, &text) {
+                eprintln!("[config] write error: {e}");
             } else {
-                eprintln!("[preset] saved to {PRESET_PATH}");
+                eprintln!("[config] saved to {}", path.display());
             }
         }
-        Err(e) => eprintln!("[preset] serialize error: {e}"),
+        Err(e) => eprintln!("[config] serialize error: {e}"),
     }
 }
