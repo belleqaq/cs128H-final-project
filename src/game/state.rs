@@ -53,6 +53,15 @@ const STANDUP_MSGS: &[&str] = &[
     "(；・∀・) ｾｰﾌ",
 ];
 
+/// A short-lived visual particle spawned on QTE session completion.
+pub struct Particle {
+    pub pos: (f32, f32),
+    pub vel: (f32, f32),
+    pub lifetime: f32,
+    pub age: f32,
+    pub color: (u8, u8, u8),
+}
+
 /// A floating kaomoji bubble that appears during pooping.
 pub struct KaomojiBubble {
     pub text: String,
@@ -128,6 +137,21 @@ impl PartialEq for QteState {
 }
 
 // ---------------------------------------------------------------------------
+// Audio events
+// ---------------------------------------------------------------------------
+
+/// Discrete events that main.rs drains each frame and routes to AudioManager.
+#[derive(Clone, Copy, Debug)]
+pub enum AudioEvent {
+    QteCorrectKey,
+    QteWrongKey,
+    QteRoundComplete,
+    QteSessionComplete,
+    Victory,
+    GameOver,
+}
+
+// ---------------------------------------------------------------------------
 // Phase
 // ---------------------------------------------------------------------------
 
@@ -164,8 +188,8 @@ pub struct State {
     pub repulsion_push: f32,
     pub tick_ms: u64,
     // Input state.
-    input_x: i32,
-    input_y: i32,
+    pub input_x: i32,
+    pub input_y: i32,
     input_run: bool,
     /// E key currently held down (for hold-to-interact).
     input_e_down: bool,
@@ -219,6 +243,14 @@ pub struct State {
     pub dbg_clearance: f32,
     pub dbg_wall_nx: f32,
     pub dbg_wall_ny: f32,
+    /// Events emitted this tick — main.rs drains these to drive AudioManager.
+    pub audio_events: Vec<AudioEvent>,
+    /// Active particles (celebration effects on QTE completion).
+    pub particles: Vec<Particle>,
+    /// Max screen-space shake radius in pixels at urgency=100%.
+    pub shake_intensity: f32,
+    /// How many particles to spawn per QTE session completion.
+    pub particle_count: u32,
 }
 
 impl State {
@@ -276,6 +308,10 @@ impl State {
             dbg_clearance: 0.0,
             dbg_wall_nx: 0.0,
             dbg_wall_ny: 0.0,
+            audio_events: Vec::new(),
+            particles: Vec::new(),
+            shake_intensity: 8.0,
+            particle_count: 12,
         };
         s.spawn_star();
         s
@@ -428,29 +464,46 @@ impl State {
 
     /// Feed a QTE key press.  Ignored during fail-flash.
     pub fn qte_press(&mut self, key: QteKey) {
-        let qte = match self.move_state {
-            MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
-            _ => return,
-        };
+        let correct;
+        {
+            let qte = match self.move_state {
+                MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) => q,
+                _ => return,
+            };
 
-        if qte.round_failed {
-            return; // wait for auto-retry
-        }
-
-        let expected = qte.sequence[qte.progress];
-        if key == expected {
-            qte.progress += 1;
-            qte.timer = qte.time_per_key;
-            if qte.progress >= qte.sequence.len() {
-                // Round complete!
-                qte.rounds_completed += 1;
-                // Check if all rounds done — handled in tick_qte.
+            if qte.round_failed {
+                return; // wait for auto-retry
             }
-        } else {
-            // Wrong key → round fails, will auto-retry.
-            qte.round_failed = true;
-            qte.fail_timer = FAIL_FLASH_SECS;
+
+            let expected = qte.sequence[qte.progress];
+            correct = key == expected;
+            if correct {
+                qte.progress += 1;
+                qte.timer = qte.time_per_key;
+                if qte.progress >= qte.sequence.len() {
+                    qte.rounds_completed += 1;
+                }
+            } else {
+                qte.round_failed = true;
+                qte.fail_timer = FAIL_FLASH_SECS;
+            }
         }
+        self.audio_events.push(if correct {
+            AudioEvent::QteCorrectKey
+        } else {
+            AudioEvent::QteWrongKey
+        });
+    }
+
+    fn set_win(&mut self) {
+        self.phase = Phase::Win;
+        self.audio_events.push(AudioEvent::Victory);
+    }
+
+    fn set_lose(&mut self) {
+        self.urgency = 1.0;
+        self.phase = Phase::Lose;
+        self.audio_events.push(AudioEvent::GameOver);
     }
 
     /// Transition to StandingUp state with kaomoji toast.
@@ -517,20 +570,22 @@ impl State {
 
         match action {
             Action::SessionDone => {
-                // Apply urgency relief (star < toilet).
+                self.audio_events.push(AudioEvent::QteSessionComplete);
                 if is_pooping {
                     self.completed += 1;
                     self.urgency = (self.urgency - self.star_relief).max(0.0);
                     self.spawn_star();
                     if self.completed >= self.goal_count {
-                        self.phase = Phase::Win;
+                        self.set_win();
                     }
                 } else {
                     self.urgency = (self.urgency - self.toilet_relief).max(0.0);
                 }
+                self.spawn_completion_particles();
                 self.enter_standing_up();
             }
             Action::NewRound => {
+                self.audio_events.push(AudioEvent::QteRoundComplete);
                 let new_seq = self.random_key_sequence();
                 let tpk = self.qte_time_per_key;
                 if let MoveState::Pooping(ref mut q) | MoveState::UsingToilet(ref mut q) = self.move_state {
@@ -570,6 +625,39 @@ impl State {
         self.bubbles.retain(|b| b.age < b.lifetime);
     }
 
+    fn tick_particles(&mut self, tick_s: f32) {
+        for p in &mut self.particles {
+            p.age += tick_s;
+            p.pos.0 += p.vel.0;
+            p.pos.1 += p.vel.1;
+        }
+        self.particles.retain(|p| p.age < p.lifetime);
+    }
+
+    fn spawn_completion_particles(&mut self) {
+        let count = self.particle_count;
+        let px = self.pos.0;
+        let py = self.pos.1;
+        for _ in 0..count {
+            let angle = (self.xorshift() % 628) as f32 / 100.0;
+            let speed = 0.02 + (self.xorshift() % 80) as f32 / 1000.0;
+            let lifetime = 0.8 + (self.xorshift() % 800) as f32 / 1000.0;
+            let color = match self.xorshift() % 4 {
+                0 => (255u8, 220u8, 50u8),
+                1 => (50, 220, 100),
+                2 => (100, 180, 255),
+                _ => (255, 100, 200),
+            };
+            self.particles.push(Particle {
+                pos: (px, py),
+                vel: (angle.cos() * speed, angle.sin() * speed),
+                lifetime,
+                age: 0.0,
+                color,
+            });
+        }
+    }
+
     fn spawn_bubble(&mut self) {
         let i = self.xorshift() as usize % BUBBLE_MSGS.len();
         let x_off = (self.xorshift() % 80) as f32 - 40.0;
@@ -600,6 +688,8 @@ impl State {
         }
 
         let tick_s = self.tick_ms as f32 / 1000.0;
+
+        self.tick_particles(tick_s);
 
         // --- Toast timer ---
         if let Some((_, ref mut t)) = self.toast {
@@ -656,7 +746,7 @@ impl State {
             }
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
-            if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
+            if self.urgency >= 1.0 { self.set_lose(); }
             return; // Frozen — no movement.
         }
 
@@ -666,7 +756,7 @@ impl State {
             self.tick_bubbles(tick_s);
             let dt_ratio = self.tick_ms as f32 / BASELINE_TICK_MS;
             self.urgency += self.urgency_rate * dt_ratio;
-            if self.urgency >= 1.0 { self.urgency = 1.0; self.phase = Phase::Lose; }
+            if self.urgency >= 1.0 { self.set_lose(); }
             return; // Frozen — no movement.
         }
 
@@ -723,8 +813,7 @@ impl State {
         let urg_mult = if running { self.run_urgency_mult } else { 1.0 };
         self.urgency += self.urgency_rate * urg_mult * dt_ratio_urg;
         if self.urgency >= 1.0 {
-            self.urgency = 1.0;
-            self.phase = Phase::Lose;
+            self.set_lose();
             return;
         }
 
@@ -794,6 +883,8 @@ impl State {
         self.toast = None;
         self.bubbles.clear();
         self.bubble_timer = 0.0;
+        self.particles.clear();
+        self.audio_events.clear();
         self.spawn_star();
     }
 

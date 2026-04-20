@@ -10,6 +10,7 @@ pub struct GameConfig {
     pub tick_ms: u64,
     pub player: PlayerSettings,
     pub gameplay: GameplaySettings,
+    pub audio: AudioConfig,
 }
 
 impl Default for GameConfig {
@@ -19,6 +20,31 @@ impl Default for GameConfig {
             tick_ms: 150,
             player: PlayerSettings::default(),
             gameplay: GameplaySettings::default(),
+            audio: AudioConfig::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub master_volume: f32,
+    pub music_volume: f32,
+    pub sfx_volume: f32,
+    /// Seconds between footstep sounds.
+    pub footstep_interval: f32,
+    /// Crossfade duration when switching music tracks (0 = instant).
+    pub crossfade_duration: f32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            master_volume: 1.0,
+            music_volume: 0.7,
+            sfx_volume: 1.0,
+            footstep_interval: 0.35,
+            crossfade_duration: 0.5,
         }
     }
 }

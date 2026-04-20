@@ -2,11 +2,13 @@
 //!
 //! Phase 2: movement + urgency + star objectives + QTE.
 
+mod audio;
 mod game;
 
+use audio::{AudioManager, MusicTrack, SoundEffect};
 use game::cell::{idx, Cell, Terrain};
 use game::npc::{ActivityPhase, AlertState, Npc, NpcActivity, NpcRoutine, STEER_SLOTS};
-use game::state::{MoveState, Phase, QteKey};
+use game::state::{AudioEvent, MoveState, Phase, QteKey};
 use game::{load_config, load_debug_preset, save_debug_preset, GameConfig, State};
 use macroquad::prelude::*;
 
@@ -146,8 +148,7 @@ impl DebugPanel {
     }
 
     /// Draw one slider row with drag + numeric input.
-    /// Slider drag clamps to `[min, max]`.  Direct numeric input does NOT clamp.
-    /// Returns `true` if the value changed.
+    /// Delegates to `ui_slider` using this panel's drag/edit state.
     fn slider(
         &mut self,
         id: usize,
@@ -159,121 +160,12 @@ impl DebugPanel {
         min: f32,
         max: f32,
     ) -> bool {
-        let h = 24.0;
-        let (mx, my) = mouse_position();
-        let pressed = is_mouse_button_pressed(MouseButton::Left);
-        let down = is_mouse_button_down(MouseButton::Left);
-
-        // Row background.
-        draw_rectangle(x, y, w, h, color_u8!(20, 22, 36, 230));
-
-        // Bar track.
-        let bar_x = x + 130.0;
-        let bar_w = w - 200.0;
-        let bar_y = y + 7.0;
-        let bar_h = 10.0;
-        let frac = ((*value - min) / (max - min)).clamp(0.0, 1.0);
-
-        draw_rectangle(bar_x, bar_y, bar_w, bar_h, color_u8!(50, 52, 70, 255));
-        draw_rectangle(bar_x, bar_y, bar_w * frac, bar_h, color_u8!(80, 130, 220, 255));
-
-        // Handle.
-        let hx = bar_x + bar_w * frac;
-        draw_circle(hx, y + h * 0.5, 6.0, color_u8!(180, 200, 255, 255));
-
-        // Label.
-        draw_text(label, x + 4.0, y + 17.0, 15.0, WHITE);
-
-        // --- Value area (right side) ---
-        let val_x = x + w - 65.0;
-        let val_w = 61.0;
-
-        let mut changed = false;
-
-        if self.editing == Some(id) {
-            // ---- Text-edit mode ----
-            draw_rectangle(val_x, y + 2.0, val_w, h - 4.0, color_u8!(40, 42, 60, 255));
-            draw_rectangle_lines(val_x, y + 2.0, val_w, h - 4.0, 1.0, color_u8!(100, 150, 255, 255));
-            let display = format!("{}|", self.edit_buf);
-            draw_text(&display, val_x + 2.0, y + 17.0, 15.0, color_u8!(255, 255, 200, 255));
-
-            // Consume typed characters.
-            while let Some(c) = get_char_pressed() {
-                if c.is_ascii_digit() || c == '.' || c == '-' {
-                    self.edit_buf.push(c);
-                }
-            }
-            // Backspace.
-            if is_key_pressed(KeyCode::Backspace) {
-                self.edit_buf.pop();
-            }
-            // Confirm with Enter.
-            if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
-                if let Ok(v) = self.edit_buf.parse::<f32>() {
-                    *value = v; // NO clamp — intentional
-                    changed = true;
-                }
-                self.editing = None;
-                self.edit_buf.clear();
-            }
-            // Cancel with Escape.
-            if is_key_pressed(KeyCode::Escape) {
-                self.editing = None;
-                self.edit_buf.clear();
-            }
-            // Click outside value box → confirm.
-            if pressed && !(mx >= val_x && mx <= val_x + val_w && my >= y && my <= y + h) {
-                if let Ok(v) = self.edit_buf.parse::<f32>() {
-                    *value = v;
-                    changed = true;
-                }
-                self.editing = None;
-                self.edit_buf.clear();
-            }
-        } else {
-            // ---- Display mode ----
-            draw_text(
-                &format!("{:.3}", *value),
-                val_x + 2.0,
-                y + 17.0,
-                15.0,
-                color_u8!(200, 200, 200, 255),
-            );
-
-            // Click value text → enter edit mode.
-            if pressed && mx >= val_x && mx <= val_x + val_w && my >= y && my <= y + h {
-                self.editing = Some(id);
-                self.edit_buf = format!("{:.3}", *value);
-            }
-        }
-
-        // --- Slider drag (only outside value area) ---
-        if self.editing.is_none() {
-            if pressed
-                && mx >= bar_x - 8.0
-                && mx <= bar_x + bar_w + 8.0
-                && my >= y
-                && my <= y + h
-                && mx < val_x
-            {
-                self.dragging = Some(id);
-            }
-        }
-
-        if self.dragging == Some(id) {
-            if down {
-                let new_frac = ((mx - bar_x) / bar_w).clamp(0.0, 1.0);
-                let new_val = min + new_frac * (max - min); // slider DOES clamp
-                if (*value - new_val).abs() > f32::EPSILON {
-                    *value = new_val;
-                    changed = true;
-                }
-            } else {
-                self.dragging = None;
-            }
-        }
-
-        changed
+        ui_slider(
+            &mut self.dragging,
+            &mut self.editing,
+            &mut self.edit_buf,
+            id, x, y, w, label, value, min, max,
+        )
     }
 
     /// Draw a clickable button.  Returns `true` on click.
@@ -299,6 +191,275 @@ impl DebugPanel {
     fn info_row(&self, x: f32, y: f32, w: f32, text: &str) {
         draw_rectangle(x, y, w, 22.0, color_u8!(20, 22, 36, 230));
         draw_text(text, x + 4.0, y + 16.0, 14.0, color_u8!(150, 150, 150, 255));
+    }
+}
+
+/// Slider renderer shared by all panels. `dragging`/`editing`/`edit_buf` are
+/// the caller's own state so multiple panels don't fight over one set.
+/// Slider drag clamps to `[min, max]`; direct numeric input does NOT clamp.
+fn ui_slider(
+    dragging: &mut Option<usize>,
+    editing: &mut Option<usize>,
+    edit_buf: &mut String,
+    id: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+) -> bool {
+    let h = 24.0;
+    let (mx, my) = mouse_position();
+    let pressed = is_mouse_button_pressed(MouseButton::Left);
+    let down = is_mouse_button_down(MouseButton::Left);
+
+    draw_rectangle(x, y, w, h, color_u8!(20, 22, 36, 230));
+
+    let bar_x = x + 130.0;
+    let bar_w = w - 200.0;
+    let bar_y = y + 7.0;
+    let bar_h = 10.0;
+    let frac = ((*value - min) / (max - min)).clamp(0.0, 1.0);
+
+    draw_rectangle(bar_x, bar_y, bar_w, bar_h, color_u8!(50, 52, 70, 255));
+    draw_rectangle(bar_x, bar_y, bar_w * frac, bar_h, color_u8!(80, 130, 220, 255));
+
+    let hx = bar_x + bar_w * frac;
+    draw_circle(hx, y + h * 0.5, 6.0, color_u8!(180, 200, 255, 255));
+
+    draw_text(label, x + 4.0, y + 17.0, 15.0, WHITE);
+
+    let val_x = x + w - 65.0;
+    let val_w = 61.0;
+
+    let mut changed = false;
+
+    if *editing == Some(id) {
+        draw_rectangle(val_x, y + 2.0, val_w, h - 4.0, color_u8!(40, 42, 60, 255));
+        draw_rectangle_lines(val_x, y + 2.0, val_w, h - 4.0, 1.0, color_u8!(100, 150, 255, 255));
+        let display = format!("{}|", edit_buf);
+        draw_text(&display, val_x + 2.0, y + 17.0, 15.0, color_u8!(255, 255, 200, 255));
+
+        while let Some(c) = get_char_pressed() {
+            if c.is_ascii_digit() || c == '.' || c == '-' {
+                edit_buf.push(c);
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) {
+            edit_buf.pop();
+        }
+        if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+            if let Ok(v) = edit_buf.parse::<f32>() {
+                *value = v;
+                changed = true;
+            }
+            *editing = None;
+            edit_buf.clear();
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            *editing = None;
+            edit_buf.clear();
+        }
+        if pressed && !(mx >= val_x && mx <= val_x + val_w && my >= y && my <= y + h) {
+            if let Ok(v) = edit_buf.parse::<f32>() {
+                *value = v;
+                changed = true;
+            }
+            *editing = None;
+            edit_buf.clear();
+        }
+    } else {
+        draw_text(
+            &format!("{:.3}", *value),
+            val_x + 2.0,
+            y + 17.0,
+            15.0,
+            color_u8!(200, 200, 200, 255),
+        );
+
+        if pressed && mx >= val_x && mx <= val_x + val_w && my >= y && my <= y + h {
+            *editing = Some(id);
+            *edit_buf = format!("{:.3}", *value);
+        }
+    }
+
+    if editing.is_none()
+        && pressed
+        && mx >= bar_x - 8.0
+        && mx <= bar_x + bar_w + 8.0
+        && my >= y
+        && my <= y + h
+        && mx < val_x
+    {
+        *dragging = Some(id);
+    }
+
+    if *dragging == Some(id) {
+        if down {
+            let new_frac = ((mx - bar_x) / bar_w).clamp(0.0, 1.0);
+            let new_val = min + new_frac * (max - min);
+            if (*value - new_val).abs() > f32::EPSILON {
+                *value = new_val;
+                changed = true;
+            }
+        } else {
+            *dragging = None;
+        }
+    }
+
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Audio panel — standalone volume controls (toggle with M)
+// ---------------------------------------------------------------------------
+
+struct AudioPanel {
+    visible: bool,
+    dragging: Option<usize>,
+    editing: Option<usize>,
+    edit_buf: String,
+}
+
+impl AudioPanel {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            dragging: None,
+            editing: None,
+            edit_buf: String::new(),
+        }
+    }
+
+    fn toggle(&mut self) {
+        self.visible = !self.visible;
+        self.dragging = None;
+        self.editing = None;
+        self.edit_buf.clear();
+    }
+
+    fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    fn draw(&mut self, audio: &mut AudioManager) {
+        if !self.visible {
+            return;
+        }
+
+        // Dim backdrop.
+        draw_rectangle(0.0, 0.0, screen_width(), screen_height(), color_u8!(0, 0, 0, 140));
+
+        let music_tracks = [
+            MusicTrack::MainTheme,
+            MusicTrack::TenseLoop,
+            MusicTrack::VictoryStinger,
+            MusicTrack::DefeatStinger,
+        ];
+        let sfx_effects = [
+            SoundEffect::FootstepWalk,
+            SoundEffect::FootstepRun,
+            SoundEffect::QteCorrect,
+            SoundEffect::QteWrong,
+            SoundEffect::QteRoundComplete,
+            SoundEffect::QteSessionComplete,
+            SoundEffect::UrgencyWarning,
+            SoundEffect::UrgencyCritical,
+            SoundEffect::Victory,
+            SoundEffect::GameOver,
+        ];
+
+        let row_h = 26.0;
+        let section_gap = 18.0;
+        // Title + 3 category sliders + 2 section headers + music rows + sfx rows + hint.
+        let rows_total = 3.0 + music_tracks.len() as f32 + sfx_effects.len() as f32;
+        let ph = 30.0 + rows_total * row_h + section_gap * 2.0 + 26.0;
+        let pw = 420.0;
+        let panel_x = (screen_width() - pw) * 0.5;
+        let panel_y = ((screen_height() - ph) * 0.5).max(10.0);
+
+        draw_rectangle(panel_x, panel_y, pw, ph, color_u8!(24, 26, 40, 245));
+        draw_rectangle_lines(panel_x, panel_y, pw, ph, 2.0, color_u8!(120, 140, 200, 200));
+
+        draw_text(
+            "AUDIO  (M to close)",
+            panel_x + 12.0,
+            panel_y + 22.0,
+            18.0,
+            color_u8!(255, 200, 100, 255),
+        );
+
+        let mut py = panel_y + 32.0;
+        let sx = panel_x + 10.0;
+        let sw = pw - 20.0;
+        let mut id: usize = 0;
+
+        // --- Category sliders ---
+        {
+            let mut v = audio.master_volume;
+            if ui_slider(&mut self.dragging, &mut self.editing, &mut self.edit_buf,
+                         id, sx, py, sw, "Master", &mut v, 0.0, 1.0) {
+                audio.set_master_volume(v);
+            }
+            id += 1;
+            py += row_h;
+        }
+        {
+            let mut v = audio.music_volume;
+            if ui_slider(&mut self.dragging, &mut self.editing, &mut self.edit_buf,
+                         id, sx, py, sw, "Music", &mut v, 0.0, 1.0) {
+                audio.set_music_volume(v);
+            }
+            id += 1;
+            py += row_h;
+        }
+        {
+            let mut v = audio.sfx_volume;
+            if ui_slider(&mut self.dragging, &mut self.editing, &mut self.edit_buf,
+                         id, sx, py, sw, "SFX", &mut v, 0.0, 1.0) {
+                audio.set_sfx_volume(v);
+            }
+            id += 1;
+            py += row_h;
+        }
+
+        // --- Music section ---
+        py += section_gap * 0.5;
+        draw_text("MUSIC", panel_x + 12.0, py + 12.0, 14.0, color_u8!(255, 180, 80, 255));
+        py += section_gap;
+        for track in music_tracks {
+            let mut v = audio.music_gain(track);
+            if ui_slider(&mut self.dragging, &mut self.editing, &mut self.edit_buf,
+                         id, sx, py, sw, track.label(), &mut v, 0.0, track.max_gain()) {
+                audio.set_music_gain(track, v);
+            }
+            id += 1;
+            py += row_h;
+        }
+
+        // --- SFX section ---
+        py += section_gap * 0.5;
+        draw_text("SFX", panel_x + 12.0, py + 12.0, 14.0, color_u8!(255, 180, 80, 255));
+        py += section_gap;
+        for effect in sfx_effects {
+            let mut v = audio.sfx_gain(effect);
+            if ui_slider(&mut self.dragging, &mut self.editing, &mut self.edit_buf,
+                         id, sx, py, sw, effect.label(), &mut v, 0.0, effect.max_gain()) {
+                audio.set_sfx_gain(effect, v);
+            }
+            id += 1;
+            py += row_h;
+        }
+
+        draw_text(
+            "Drag to set. Click value to type exact. Each slider has its own max.",
+            panel_x + 12.0,
+            py + 16.0,
+            12.0,
+            color_u8!(150, 150, 160, 255),
+        );
     }
 }
 
@@ -337,8 +498,15 @@ async fn main() {
     let mut tick_acc: f64 = 0.0;
 
     let mut debug = DebugPanel::new();
+    let mut audio_panel = AudioPanel::new();
     let mut save_flash: f32 = 0.0;
     let mut prev_e_down = false;
+
+    let mut audio = AudioManager::load_all(&config.audio).await;
+    audio.play_music(MusicTrack::MainTheme);
+
+    let mut prev_urgency: f32 = 0.0;
+    let mut footstep_timer: f32 = 0.0;
 
     loop {
         // -- Toggle debug panel --
@@ -348,6 +516,10 @@ async fn main() {
         // -- Toggle NPC chase (debug feature) --
         if is_key_pressed(KeyCode::F3) {
             state.chase_config.enabled = !state.chase_config.enabled;
+        }
+        // -- Toggle audio panel -- (ignore M while typing a slider value)
+        if is_key_pressed(KeyCode::M) && !debug.is_editing() && !audio_panel.is_editing() {
+            audio_panel.toggle();
         }
 
         // -- Input (suppressed while editing a slider value) --
@@ -371,7 +543,7 @@ async fn main() {
         } else if preparing {
             // Preparing: no movement, just track E state.
             state.set_input(false, false, false, false, false, e_down, e_pressed);
-        } else if !debug.is_editing() {
+        } else if !debug.is_editing() && !audio_panel.is_editing() {
             // Walking/Running: full input.
             let left = is_key_down(KeyCode::A) || is_key_down(KeyCode::Left);
             let right = is_key_down(KeyCode::D) || is_key_down(KeyCode::Right);
@@ -380,7 +552,7 @@ async fn main() {
             let run = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
             state.set_input(left, right, up, down, run, e_down, e_pressed);
         } else {
-            // Debug editing: suppress all.
+            // Panel editing: suppress all game input.
             state.set_input(false, false, false, false, false, false, false);
         }
 
@@ -388,7 +560,7 @@ async fn main() {
         if e_pressed {
             if in_qte {
                 state.handle_e_press_qte();
-            } else if !frozen && !preparing && !debug.is_editing() {
+            } else if !frozen && !preparing && !debug.is_editing() && !audio_panel.is_editing() {
                 state.handle_e_press();
             }
         }
@@ -406,13 +578,99 @@ async fn main() {
             tick_acc = 0.0; // drop excess to prevent death spiral
         }
 
+        // -- Audio --
+        let frame_dt = get_frame_time();
+        audio.update(frame_dt);
+
+        // Drain discrete events from state.
+        for event in state.audio_events.drain(..) {
+            match event {
+                AudioEvent::QteCorrectKey     => audio.play_sfx(SoundEffect::QteCorrect),
+                AudioEvent::QteWrongKey       => audio.play_sfx(SoundEffect::QteWrong),
+                AudioEvent::QteRoundComplete  => audio.play_sfx(SoundEffect::QteRoundComplete),
+                AudioEvent::QteSessionComplete => audio.play_sfx(SoundEffect::QteSessionComplete),
+                AudioEvent::Victory => {
+                    audio.stop_music();
+                    audio.play_sfx(SoundEffect::Victory);
+                }
+                AudioEvent::GameOver => {
+                    audio.stop_music();
+                    audio.play_sfx(SoundEffect::GameOver);
+                }
+            }
+        }
+
+        // Urgency threshold one-shots.
+        if prev_urgency < 0.7 && state.urgency >= 0.7 {
+            audio.play_sfx(SoundEffect::UrgencyWarning);
+        }
+        if prev_urgency < 0.9 && state.urgency >= 0.9 {
+            audio.play_sfx(SoundEffect::UrgencyCritical);
+        }
+        prev_urgency = state.urgency;
+
+        // Footsteps — cadence driven externally; AudioManager has no cooldown for these.
+        let has_input = state.input_x != 0 || state.input_y != 0;
+        let moving = matches!(state.move_state, MoveState::Walking | MoveState::Running)
+            && has_input;
+        if moving {
+            footstep_timer -= frame_dt;
+            if footstep_timer <= 0.0 {
+                let sfx = if matches!(state.move_state, MoveState::Running) {
+                    SoundEffect::FootstepRun
+                } else {
+                    SoundEffect::FootstepWalk
+                };
+                audio.play_sfx(sfx);
+                footstep_timer = config.audio.footstep_interval;
+            }
+        } else {
+            audio.stop_sfx(SoundEffect::FootstepWalk);
+            audio.stop_sfx(SoundEffect::FootstepRun);
+            footstep_timer = 0.0; // reset so first step after stillness plays immediately
+        }
+
+        // Dynamic music: tense loop above 50% urgency, main theme below 40% (hysteresis).
+        // If nothing is playing (e.g. after a post-victory restart), kick off main theme.
+        if state.phase == Phase::Playing {
+            match audio.current_track() {
+                None => {
+                    audio.play_music(MusicTrack::MainTheme);
+                }
+                Some(MusicTrack::MainTheme) => {
+                    if state.urgency >= 0.5 {
+                        audio.play_music(MusicTrack::TenseLoop);
+                    }
+                }
+                Some(MusicTrack::TenseLoop) => {
+                    if state.urgency < 0.4 {
+                        audio.play_music(MusicTrack::MainTheme);
+                    }
+                }
+                _ => {} // victory/defeat stingers — don't override
+            }
+        }
+
         // -- Render --
         clear_background(color_u8!(16, 18, 30, 255));
 
         let t = (tick_acc / tick_s).min(1.0) as f32;
         let (vx, vy) = state.player_visual_pos(t);
-        let cam_x = vx * TILE_SIZE - screen_width() / 2.0;
-        let cam_y = vy * TILE_SIZE - screen_height() / 2.0;
+
+        // Screen shake — scales linearly from 0 at 80% urgency to full at 100%.
+        let (shake_x, shake_y) = if state.urgency > 0.8 {
+            let intensity = ((state.urgency - 0.8) / 0.8) * state.shake_intensity;
+            let tt = get_time() as f32;
+            (
+                ((tt * 47.3).sin() + (tt * 83.1).sin() * 0.5) * intensity,
+                ((tt * 31.7).sin() + (tt * 67.9).sin() * 0.5) * intensity,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        let cam_x = vx * TILE_SIZE - screen_width() / 2.0 + shake_x;
+        let cam_y = vy * TILE_SIZE - screen_height() / 2.0 + shake_y;
 
         // --- Layer 1: Floor tiles ---
         for gy in 0..state.map_h {
@@ -578,6 +836,22 @@ async fn main() {
             }
         }
 
+        // --- Particles (celebration effects, world-space) ---
+        for p in &state.particles {
+            let frac = ((p.lifetime - p.age) / p.lifetime).clamp(0.0, 1.0);
+            let px = p.pos.0 * TILE_SIZE - cam_x;
+            let py = p.pos.1 * TILE_SIZE - cam_y;
+            draw_circle(
+                px, py, 5.0 * frac,
+                Color::new(
+                    p.color.0 as f32 / 255.0,
+                    p.color.1 as f32 / 255.0,
+                    p.color.2 as f32 / 255.0,
+                    frac,
+                ),
+            );
+        }
+
         // --- Layer 3: Wall tiles ---
         for gy in 0..state.map_h {
             for gx in 0..state.map_w {
@@ -651,7 +925,7 @@ async fn main() {
         );
 
         draw_text(
-            "WASD move | Shift run | Hold E to poop | Tab debug",
+            "WASD move | Shift run | Hold E to poop | Tab debug | M audio",
             10.0,
             screen_height() - 6.0,
             14.0,
@@ -893,6 +1167,52 @@ async fn main() {
             );
             py += row_h;
 
+            // Effects sliders.
+            py += 6.0;
+            draw_rectangle(panel_x, py, pw, 18.0, color_u8!(20, 22, 36, 230));
+            draw_text("EFFECTS", panel_x + 4.0, py + 14.0, 13.0, color_u8!(255, 180, 80, 255));
+            py += 20.0;
+
+            debug.slider(
+                26, panel_x, py, pw, "shake_intensity", &mut state.shake_intensity, 0.0, 30.0,
+            );
+            py += row_h;
+            {
+                let mut pc = state.particle_count as f32;
+                if debug.slider(27, panel_x, py, pw, "particle_count", &mut pc, 0.0, 50.0) {
+                    state.particle_count = pc.round() as u32;
+                }
+            }
+            py += row_h;
+
+            // Audio volume sliders.
+            py += 6.0;
+            draw_rectangle(panel_x, py, pw, 18.0, color_u8!(20, 22, 36, 230));
+            draw_text("AUDIO", panel_x + 4.0, py + 14.0, 13.0, color_u8!(255, 180, 80, 255));
+            py += 20.0;
+
+            {
+                let mut v = audio.master_volume;
+                if debug.slider(28, panel_x, py, pw, "master_vol", &mut v, 0.0, 1.0) {
+                    audio.set_master_volume(v);
+                }
+            }
+            py += row_h;
+            {
+                let mut v = audio.music_volume;
+                if debug.slider(29, panel_x, py, pw, "music_vol", &mut v, 0.0, 1.0) {
+                    audio.set_music_volume(v);
+                }
+            }
+            py += row_h;
+            {
+                let mut v = audio.sfx_volume;
+                if debug.slider(30, panel_x, py, pw, "sfx_vol", &mut v, 0.0, 1.0) {
+                    audio.set_sfx_volume(v);
+                }
+            }
+            py += row_h;
+
             // Telemetry.
             py += 4.0;
             debug.info_row(
@@ -1070,6 +1390,9 @@ async fn main() {
                 }
             }
         }
+
+        // --- Audio panel (drawn last so it sits on top) ---
+        audio_panel.draw(&mut audio);
 
         next_frame().await;
     }
