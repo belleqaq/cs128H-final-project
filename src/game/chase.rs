@@ -659,7 +659,7 @@ pub fn update_chase(
                         clog!("CHASE_ROOM_CLEAR npc={} room={} searched={:?}",
                             i, room_id, npc.chase.searched_rooms);
 
-                        if npc.chase.searched_rooms.len() >= 1 {
+                        if npc.chase.searched_rooms.len() >= 2 {
                             clog!("CHASE_END_MAX_ROOMS npc={}", i);
                             end_chase(npc, map, map_w, map_h);
                             continue;
