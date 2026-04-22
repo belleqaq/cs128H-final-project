@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Terrain {
+    /// Empty space outside the playable map.  Not walkable, not rendered.
+    Void,
     Floor,
     Wall,
     DoorOpen,
@@ -16,15 +18,15 @@ pub enum Terrain {
 
 impl Terrain {
     pub fn is_walkable(self) -> bool {
-        !matches!(self, Terrain::Wall)
+        !matches!(self, Terrain::Wall | Terrain::Void)
     }
 
     pub fn blocks_vision(self) -> bool {
-        matches!(self, Terrain::Wall | Terrain::DoorClosed)
+        matches!(self, Terrain::Wall | Terrain::DoorOpen | Terrain::DoorClosed | Terrain::Void)
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Furniture {
     Chair,
     Table,
@@ -37,12 +39,27 @@ impl Furniture {
     pub fn blocks_vision(self) -> bool {
         matches!(self, Furniture::Shelf | Furniture::Bed)
     }
+
+    /// Whether this furniture prevents movement through the cell.
+    /// Bed acts as a solid obstacle similar to an internal wall.
+    pub fn blocks_movement(self) -> bool {
+        matches!(self, Furniture::Bed)
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub terrain: Terrain,
     pub furniture: Option<Furniture>,
+}
+
+impl Cell {
+    /// Whether a character can walk through this cell.
+    /// Checks both terrain and furniture — a Floor tile with a Bed is impassable.
+    pub fn is_walkable(&self) -> bool {
+        self.terrain.is_walkable()
+            && !self.furniture.map_or(false, |f| f.blocks_movement())
+    }
 }
 
 impl Default for Cell {
@@ -79,10 +96,10 @@ pub fn compute_passage_width(map: &[Cell], w: i32, h: i32) -> Vec<u8> {
     for x in 0..w {
         for y in 0..h {
             let i = idx(x, y, w);
-            if map[i].terrain.is_walkable() {
+            if map[i].is_walkable() {
                 dn[i] = if y == 0 { 0 } else {
                     let above = idx(x, y - 1, w);
-                    if map[above].terrain.is_walkable() { dn[above] + 1 } else { 0 }
+                    if map[above].is_walkable() { dn[above] + 1 } else { 0 }
                 };
             }
         }
@@ -91,10 +108,10 @@ pub fn compute_passage_width(map: &[Cell], w: i32, h: i32) -> Vec<u8> {
     for x in 0..w {
         for y in (0..h).rev() {
             let i = idx(x, y, w);
-            if map[i].terrain.is_walkable() {
+            if map[i].is_walkable() {
                 ds[i] = if y == h - 1 { 0 } else {
                     let below = idx(x, y + 1, w);
-                    if map[below].terrain.is_walkable() { ds[below] + 1 } else { 0 }
+                    if map[below].is_walkable() { ds[below] + 1 } else { 0 }
                 };
             }
         }
@@ -103,10 +120,10 @@ pub fn compute_passage_width(map: &[Cell], w: i32, h: i32) -> Vec<u8> {
     for y in 0..h {
         for x in 0..w {
             let i = idx(x, y, w);
-            if map[i].terrain.is_walkable() {
+            if map[i].is_walkable() {
                 dw[i] = if x == 0 { 0 } else {
                     let left = idx(x - 1, y, w);
-                    if map[left].terrain.is_walkable() { dw[left] + 1 } else { 0 }
+                    if map[left].is_walkable() { dw[left] + 1 } else { 0 }
                 };
             }
         }
@@ -115,10 +132,10 @@ pub fn compute_passage_width(map: &[Cell], w: i32, h: i32) -> Vec<u8> {
     for y in 0..h {
         for x in (0..w).rev() {
             let i = idx(x, y, w);
-            if map[i].terrain.is_walkable() {
+            if map[i].is_walkable() {
                 de[i] = if x == w - 1 { 0 } else {
                     let right = idx(x + 1, y, w);
-                    if map[right].terrain.is_walkable() { de[right] + 1 } else { 0 }
+                    if map[right].is_walkable() { de[right] + 1 } else { 0 }
                 };
             }
         }
@@ -127,7 +144,7 @@ pub fn compute_passage_width(map: &[Cell], w: i32, h: i32) -> Vec<u8> {
     // Combine: passage_width = min(dn+ds+1, de+dw+1), clamped to u8.
     let mut pw = vec![0u8; n];
     for i in 0..n {
-        if map[i].terrain.is_walkable() {
+        if map[i].is_walkable() {
             let vert = dn[i] + ds[i] + 1;
             let horiz = de[i] + dw[i] + 1;
             pw[i] = vert.min(horiz).min(255) as u8;
@@ -168,10 +185,10 @@ pub fn build_subgoal_graph(map: &[Cell], w: i32, h: i32) -> SubgoalGraph {
     let mut subgoals: Vec<(i32, i32)> = Vec::new();
 
     let walkable = |x: i32, y: i32| -> bool {
-        x >= 0 && x < w && y >= 0 && y < h && map[idx(x, y, w)].terrain.is_walkable()
+        x >= 0 && x < w && y >= 0 && y < h && map[idx(x, y, w)].is_walkable()
     };
     let blocked = |x: i32, y: i32| -> bool {
-        x < 0 || x >= w || y < 0 || y >= h || !map[idx(x, y, w)].terrain.is_walkable()
+        x < 0 || x >= w || y < 0 || y >= h || !map[idx(x, y, w)].is_walkable()
     };
 
     // Pass 1: find subgoals at convex obstacle corners.
@@ -238,7 +255,7 @@ impl SubgoalGraph {
         }
 
         let walkable = |px: i32, py: i32| -> bool {
-            px >= 0 && px < w && py >= 0 && py < h && map[idx(px, py, w)].terrain.is_walkable()
+            px >= 0 && px < w && py >= 0 && py < h && map[idx(px, py, w)].is_walkable()
         };
 
         let mut result = Vec::new();
@@ -402,7 +419,7 @@ fn cardinal_los(a: (i32, i32), b: (i32, i32), map: &[Cell], w: i32, h: i32) -> b
             if x < 0 || x >= w || y < 0 || y >= h {
                 return false;
             }
-            if !map[idx(x, y, w)].terrain.is_walkable() {
+            if !map[idx(x, y, w)].is_walkable() {
                 return false;
             }
         }
@@ -414,7 +431,7 @@ fn cardinal_los(a: (i32, i32), b: (i32, i32), map: &[Cell], w: i32, h: i32) -> b
             if x < 0 || x >= w || y < 0 || y >= h {
                 return false;
             }
-            if !map[idx(x, y, w)].terrain.is_walkable() {
+            if !map[idx(x, y, w)].is_walkable() {
                 return false;
             }
         }

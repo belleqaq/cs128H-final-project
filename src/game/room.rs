@@ -15,6 +15,9 @@ use crate::game::cell::{idx, Cell, SubgoalGraph, Terrain};
 pub enum RoomKind {
     Normal,
     Toilet,
+    /// Trash room: smallest non-Corridor rooms (configurable count).
+    /// Rendered with dark green floor, used as NPC patrol destination.
+    Trash,
     Corridor,
 }
 
@@ -36,11 +39,17 @@ pub struct Room {
 
 /// Detect rooms by flood-filling walkable non-door tiles.
 /// Returns the room list and a flat tile→room_id map (usize::MAX = no room).
+///
+/// `cell_kinds`: per-cell RoomKind from map_gen (unified classification).
+/// Non-Corridor rooms derive their kind from majority vote of cell_kinds
+/// within their tiles.  If `cell_kinds` is empty, all non-Corridor rooms
+/// default to Normal.
 pub fn build_rooms(
     map: &[Cell],
     w: i32,
     h: i32,
     sg: &SubgoalGraph,
+    cell_kinds: &[Option<RoomKind>],
 ) -> (Vec<Room>, Vec<usize>) {
     let n = (w * h) as usize;
     let mut tile_to_room = vec![usize::MAX; n];
@@ -66,13 +75,8 @@ pub fn build_rooms(
             queue.push_back((x, y));
             tile_to_room[i] = room_id;
 
-            let mut has_toilet = false;
-
             while let Some((cx, cy)) = queue.pop_front() {
                 tiles.push((cx, cy));
-                if map[idx(cx, cy, w)].terrain == Terrain::Toilet {
-                    has_toilet = true;
-                }
 
                 for &(dx, dy) in &[(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let nx = cx + dx;
@@ -93,12 +97,9 @@ pub fn build_rooms(
                 }
             }
 
-            // Classify room.
-            let kind = if has_toilet {
-                RoomKind::Toilet
-            } else {
-                // Corridor heuristic: bounding box aspect ratio > 3:1
-                // or one dimension <= 2.
+            // Classify: Corridor if very narrow/elongated, else Normal.
+            // Toilet assignment happens below after all rooms are detected.
+            let kind = {
                 let (mut min_x, mut max_x) = (w, 0);
                 let (mut min_y, mut max_y) = (h, 0);
                 for &(tx, ty) in &tiles {
@@ -186,6 +187,37 @@ pub fn build_rooms(
             if !room.adjacent_rooms.iter().any(|&(r, p)| r == to && p == door_pos) {
                 room.adjacent_rooms.push((to, door_pos));
             }
+        }
+    }
+
+    // Assign RoomKind from cell_kinds (unified classification from map_gen).
+    // For each non-Corridor room, count cell_kinds votes and pick the majority.
+    if !cell_kinds.is_empty() {
+        for room in rooms.iter_mut() {
+            if room.kind == RoomKind::Corridor {
+                continue;
+            }
+            let mut normal = 0usize;
+            let mut toilet = 0usize;
+            let mut trash = 0usize;
+            for &(tx, ty) in &room.tiles {
+                let ci = idx(tx, ty, w);
+                if let Some(kind) = cell_kinds[ci] {
+                    match kind {
+                        RoomKind::Normal => normal += 1,
+                        RoomKind::Toilet => toilet += 1,
+                        RoomKind::Trash => trash += 1,
+                        RoomKind::Corridor => {}
+                    }
+                }
+            }
+            // Majority vote (ties favour special kinds over Normal).
+            if toilet >= trash && toilet >= normal && toilet > 0 {
+                room.kind = RoomKind::Toilet;
+            } else if trash >= toilet && trash >= normal && trash > 0 {
+                room.kind = RoomKind::Trash;
+            }
+            // else: stays Normal (the flood-fill default).
         }
     }
 

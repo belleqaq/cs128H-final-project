@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::io::Write;
 
-use crate::game::cell::{idx, Cell, Terrain};
+use crate::game::cell::{idx, Cell};
 use crate::game::chase::ChaseState;
 use crate::game::physics::{self, PhysicsParams, Body};
 use crate::game::BASELINE_TICK_MS;
@@ -24,9 +24,9 @@ const REF_FRICTION: f32 = 0.85;
 const REF_ACCEL: f32 = 13.33;
 
 // PID gain base values and clamp ranges.
-const PID_BASE_KP: f32 = 0.5;
+const PID_BASE_KP: f32 = 0.7;
 const PID_BASE_KD_RATIO: f32 = 0.3;   // Kd = Kp * this (critical damping)
-const PID_BASE_KI: f32 = 0.03;
+const PID_BASE_KI: f32 = 0.05;
 const PID_SCALE_CLAMP: (f32, f32) = (0.1, 10.0);
 const PID_KP_CLAMP: (f32, f32) = (0.1, 3.0);
 const PID_KD_CLAMP: (f32, f32) = (0.02, 2.0);
@@ -52,10 +52,6 @@ const WP_PROJ_RANGE_MULT: f32 = 4.0;       // ≈1.40 at radius=0.35
 // ---------------------------------------------------------------------------
 // Context steering parameters
 // ---------------------------------------------------------------------------
-/// Minimum direction change (dot product threshold) to count as a turn.
-/// cos(30°) ≈ 0.866 — sharper turns are kept, gentler ones dropped.
-const TURN_DOT_THRESHOLD: f32 = 0.866;
-
 // ---------------------------------------------------------------------------
 // Adaptive ranges — each is (radius component) + (brake_dist component).
 //   radius  → base clearance for NPC body size
@@ -81,7 +77,7 @@ const SOFTMAX_SHARPNESS: f32 = 8.0;
 /// Lookahead base (always-on): radius_mult * radius.
 const LOOKAHEAD_BASE_RADIUS_MULT: f32 = 2.86;
 /// Lookahead dynamic: brake_mult * brake_dist.
-const LOOKAHEAD_BRAKE_MULT: f32 = 2.0;
+const LOOKAHEAD_BRAKE_MULT: f32 = 1.2;
 /// Lookahead cap: radius_mult * radius + brake_mult * brake_dist.
 const LOOKAHEAD_CAP_RADIUS_MULT: f32 = 4.0;
 const LOOKAHEAD_CAP_BRAKE_MULT: f32 = 2.0;
@@ -112,7 +108,7 @@ pub struct SteerWeights {
 impl Default for SteerWeights {
     fn default() -> Self {
         Self {
-            seek: 1.1, wall: 0.8, velocity: 0.15,
+            seek: 1.1, wall: 0.8, velocity: 0.25,
             pid_kp: 0.5, pid_kd: 0.15, pid_ki: 0.03,
         }
     }
@@ -367,15 +363,13 @@ impl Npc {
         self.routine.current = (self.routine.current + 1) % self.routine.activities.len();
         let dest = self.destination();
         let from = (self.pos.0.floor() as i32, self.pos.1.floor() as i32);
-        if let Some(mut p) = astar(map, map_w, map_h, from, dest) {
-            // Smooth: drop intermediate waypoints reachable via straight line.
-            smooth_path(&mut p, map, map_w, map_h);
-            // Semantic filter: keep only doors, turns, and destination.
-            filter_waypoints(&mut p, map, map_w);
-            // Skip the start tile (NPC is already there).
-            if p.len() > 1 {
-                p.remove(0);
-            }
+        if let Some(raw) = astar(map, map_w, map_h, from, dest) {
+            let vel_spd = (self.velocity.0 * self.velocity.0
+                         + self.velocity.1 * self.velocity.1).sqrt();
+            let dir = if vel_spd > 1e-4 {
+                (self.velocity.0 / vel_spd, self.velocity.1 / vel_spd)
+            } else { (0.0, 0.0) };
+            let p = build_path(raw, self.radius, dir, map, map_w, map_h);
             // Log new path.
             NPC_LOG.with(|log| {
                 if let Some(ref mut w) = *log.borrow_mut() {
@@ -514,11 +508,13 @@ impl Npc {
                     );
                 }
             });
-            if let Some(mut p) = astar(map, map_w, map_h, my_tile, final_dest) {
-                smooth_path(&mut p, map, map_w, map_h);
-                filter_waypoints(&mut p, map, map_w);
-                if p.len() > 1 { p.remove(0); }
-                self.path = p;
+            if let Some(raw) = astar(map, map_w, map_h, my_tile, final_dest) {
+                let vel_spd = (self.velocity.0 * self.velocity.0
+                             + self.velocity.1 * self.velocity.1).sqrt();
+                let dir = if vel_spd > 1e-4 {
+                    (self.velocity.0 / vel_spd, self.velocity.1 / vel_spd)
+                } else { (0.0, 0.0) };
+                self.path = build_path(raw, self.radius, dir, map, map_w, map_h);
                 self.path_idx = 0;
                 self.pid_integral = 0.0;
                 self.pid_prev_error = 0.0;
@@ -1075,7 +1071,7 @@ pub fn astar(
             if closed[ni] {
                 continue;
             }
-            if !map[ni].terrain.is_walkable() {
+            if !map[ni].is_walkable() {
                 continue;
             }
             let ng = current.g + 1;
@@ -1114,7 +1110,7 @@ fn line_of_sight(map: &[Cell], map_w: i32, map_h: i32, a: (i32, i32), b: (i32, i
         if x < 0 || x >= map_w || y < 0 || y >= map_h {
             return false;
         }
-        if !map[idx(x, y, map_w)].terrain.is_walkable() {
+        if !map[idx(x, y, map_w)].is_walkable() {
             return false;
         }
         if x == b.0 && y == b.1 {
@@ -1138,7 +1134,7 @@ fn line_of_sight(map: &[Cell], map_w: i32, map_h: i32, a: (i32, i32), b: (i32, i
 fn line_of_sight_thick(map: &[Cell], map_w: i32, map_h: i32, a: (i32, i32), b: (i32, i32)) -> bool {
     let is_walkable = |x: i32, y: i32| -> bool {
         x >= 0 && x < map_w && y >= 0 && y < map_h
-            && map[idx(x, y, map_w)].terrain.is_walkable()
+            && map[idx(x, y, map_w)].is_walkable()
     };
 
     let mut x = a.0;
@@ -1182,7 +1178,7 @@ fn line_of_sight_thick(map: &[Cell], map_w: i32, map_h: i32, a: (i32, i32), b: (
 /// Remove redundant intermediate waypoints: if we can walk straight from
 /// point A to point C, drop B.  Uses thick LOS to ensure the smoothed
 /// path has clearance for the NPC collision radius.
-pub(crate) fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, map_h: i32) {
+fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, map_h: i32) {
     if path.len() <= 2 {
         return;
     }
@@ -1202,64 +1198,228 @@ pub(crate) fn smooth_path(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32, 
     *path = smoothed;
 }
 
-/// Keep only semantically important waypoints: doors, significant turns,
-/// and the destination.  Straight corridor segments are dropped — context
-/// steering handles wall avoidance on its own.
-pub(crate) fn filter_waypoints(path: &mut Vec<(i32, i32)>, map: &[Cell], map_w: i32) {
-    if path.len() <= 2 {
-        return;
+// ---------------------------------------------------------------------------
+// Unified path building: smooth_path → radius-aware resimplify → widen corners
+// ---------------------------------------------------------------------------
+
+/// Radius-aware line-of-sight: sample a straight line and check that every
+/// sample has at least `radius` wall clearance.
+fn radius_clear(
+    a: (f32, f32), b: (f32, f32), radius: f32,
+    map: &[Cell], map_w: i32, map_h: i32,
+) -> bool {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-4 { return true; }
+    let steps = (len * 2.0).ceil() as usize;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let (clearance, _, _) = physics::nearest_wall(
+            (a.0 + dx * t, a.1 + dy * t), radius, map, map_w, map_h,
+        );
+        if clearance < 0.0 { return false; }
     }
+    true
+}
 
-    let map_h = map.len() as i32 / map_w;
+/// Re-simplify a skeleton using radius-aware float LOS — strictly more
+/// permissive than the grid-based `smooth_path`.
+///
+/// Additionally prevents simplification through **constrictions** (doors,
+/// narrow openings).  A constriction is detected when the minimum raw
+/// wall distance along the line drops well below `radius` AND at least
+/// one endpoint is in an open area.  This preserves the intermediate
+/// waypoint so the path is guided through the narrow opening instead
+/// of cutting straight across.
+fn resimplify_skeleton(
+    skeleton: &[(i32, i32)], radius: f32,
+    map: &[Cell], map_w: i32, map_h: i32,
+) -> Vec<(i32, i32)> {
+    /// Raw wall-distance threshold for a "narrow" sample point.
+    /// 2× body radius means the passage width ≈ 4× radius (two
+    /// walls).  A 1-tile door (raw dist ≈ 0.5) is narrow for
+    /// radius ≈ 0.35 (threshold = 0.7 > 0.5).  A 2-tile corridor
+    /// (raw dist ≈ 1.0) is NOT narrow (1.0 > 0.7).
+    const CONSTRICTION_NARROW_MULT: f32 = 2.0;
 
-    let is_door = |x: i32, y: i32| -> bool {
-        if x < 0 || x >= map_w || y < 0 || y >= map_h { return false; }
-        matches!(map[idx(x, y, map_w)].terrain, Terrain::DoorOpen | Terrain::DoorClosed)
-    };
+    /// Raw wall-distance threshold for an "open" endpoint.  If
+    /// neither endpoint exceeds this, both sides are already in a
+    /// narrow area (corridor) and simplification is safe.  4× radius
+    /// requires ≈ 2.8 tiles of total passage width for radius 0.35.
+    const CONSTRICTION_WIDE_MULT: f32 = 4.0;
 
-    // Check if any 4-neighbour is a door (catches tiles immediately
-    // before/after a doorway). Excludes self — tiles ON the door itself
-    // are not kept, avoiding a redundant 3rd waypoint in the doorway.
-    let near_door = |x: i32, y: i32| -> bool {
-        !is_door(x, y)
-            && (is_door(x - 1, y)
-                || is_door(x + 1, y)
-                || is_door(x, y - 1)
-                || is_door(x, y + 1))
-    };
-
-    let mut keep = Vec::with_capacity(path.len());
-    keep.push(path[0]); // always keep first
-
-    for i in 1..path.len() - 1 {
-        let (px, py) = path[i];
-
-        // 1. Near a door → keep.
-        if near_door(px, py) {
-            keep.push(path[i]);
-            continue;
-        }
-
-        // 2. Significant turn → keep.
-        // Compare direction (prev→current) vs (current→next).
-        let prev = path[i - 1];
-        let next = path[i + 1];
-        let ax = (px - prev.0) as f32;
-        let ay = (py - prev.1) as f32;
-        let bx = (next.0 - px) as f32;
-        let by = (next.1 - py) as f32;
-        let alen = (ax * ax + ay * ay).sqrt();
-        let blen = (bx * bx + by * by).sqrt();
-        if alen > 1e-4 && blen > 1e-4 {
-            let dot = (ax * bx + ay * by) / (alen * blen);
-            if dot < TURN_DOT_THRESHOLD {
-                keep.push(path[i]);
+    if skeleton.len() <= 2 { return skeleton.to_vec(); }
+    let tc = |t: (i32, i32)| -> (f32, f32) { (t.0 as f32 + 0.5, t.1 as f32 + 0.5) };
+    let mut simplified = vec![skeleton[0]];
+    let mut anchor = 0;
+    while anchor < skeleton.len() - 1 {
+        let mut farthest = anchor + 1;
+        for probe in (anchor + 2)..skeleton.len() {
+            let a = tc(skeleton[anchor]);
+            let b = tc(skeleton[probe]);
+            if !radius_clear(a, b, radius, map, map_w, map_h) {
                 continue;
             }
+            // Constriction check: does the line pass through a narrow
+            // spot (door) between an open area and elsewhere?
+            let (a_cl, _, _) = physics::nearest_wall(a, 0.0, map, map_w, map_h);
+            let (b_cl, _, _) = physics::nearest_wall(b, 0.0, map, map_w, map_h);
+            let narrow_thr = radius * CONSTRICTION_NARROW_MULT;
+            let wide_thr = radius * CONSTRICTION_WIDE_MULT;
+            if a_cl.max(b_cl) > wide_thr {
+                // At least one endpoint is in open space — sample line.
+                let dx = b.0 - a.0;
+                let dy = b.1 - a.1;
+                let len = (dx * dx + dy * dy).sqrt();
+                let steps = (len * 2.0).ceil() as usize;
+                let mut min_cl = f32::MAX;
+                for s in 0..=steps {
+                    let t = s as f32 / steps as f32;
+                    let (d, _, _) = physics::nearest_wall(
+                        (a.0 + dx * t, a.1 + dy * t), 0.0, map, map_w, map_h,
+                    );
+                    if d < min_cl { min_cl = d; }
+                }
+                if min_cl < narrow_thr {
+                    // Line passes through a constriction — don't
+                    // simplify.  Keep intermediate waypoint.
+                    continue;
+                }
+            }
+            farthest = probe;
         }
-        // Otherwise: straight corridor segment — drop.
+        simplified.push(skeleton[farthest]);
+        anchor = farthest;
     }
+    simplified
+}
 
-    keep.push(*path.last().unwrap()); // always keep last
-    *path = keep;
+/// Shift sharp corner waypoints toward the outside of the turn so the
+/// runtime PID+context steering has room to carve a smooth arc.
+///
+/// For each interior point with a turn sharper than `WIDEN_ANGLE_COS`,
+/// compute the "outside" direction (opposite of the angle bisector —
+/// away from the inner wall) and try shifting 1 tile in that direction.
+/// All shifts are computed from original positions first, then applied,
+/// preventing cascading distortions.
+fn widen_tight_corners(
+    path: &mut Vec<(i32, i32)>,
+    radius: f32,
+    map: &[Cell], map_w: i32, _map_h: i32,
+) {
+    /// cos(150°) ≈ -0.866.  Dot product of normalised incoming/outgoing
+    /// below this means the turn is sharper than 150° and needs widening.
+    /// 150° is roughly where a 1-tile corridor L-turn sits.
+    const WIDEN_ANGLE_COS: f32 = 0.0;
+
+    /// Minimum wall clearance (as multiple of body radius) before a
+    /// corner is considered "tight" and eligible for widening.  2× body
+    /// radius means ≈ 1 tile of breathing room on each side.
+    const TIGHT_CLEARANCE_MULT: f32 = 2.0;
+
+    if path.len() <= 2 { return; }
+    let tc = |t: (i32, i32)| -> (f32, f32) { (t.0 as f32 + 0.5, t.1 as f32 + 0.5) };
+    let map_h_i = map.len() as i32 / map_w;
+
+    // Collect shifts from original positions to avoid cascading.
+    let orig = path.clone();
+    for i in 1..orig.len() - 1 {
+        let a = tc(orig[i - 1]);
+        let b = tc(orig[i]);
+        let c = tc(orig[i + 1]);
+
+        let ba = (a.0 - b.0, a.1 - b.1);
+        let bc = (c.0 - b.0, c.1 - b.1);
+        let ba_len = (ba.0 * ba.0 + ba.1 * ba.1).sqrt();
+        let bc_len = (bc.0 * bc.0 + bc.1 * bc.1).sqrt();
+        if ba_len < 1e-4 || bc_len < 1e-4 { continue; }
+        let ba_n = (ba.0 / ba_len, ba.1 / ba_len);
+        let bc_n = (bc.0 / bc_len, bc.1 / bc_len);
+
+        // cos(turn) where turn is the angle you actually turn through.
+        // dot(ba_n, bc_n) > 0 means nearly straight (small turn).
+        let dot = ba_n.0 * bc_n.0 + ba_n.1 * bc_n.1;
+        if dot > WIDEN_ANGLE_COS { continue; }
+
+        // Only widen if the corner is tight against a wall.
+        let (cl, _, _) = physics::nearest_wall(b, 0.0, map, map_w, map_h_i);
+        if cl >= radius * TIGHT_CLEARANCE_MULT { continue; }
+
+        // Outside direction = opposite of bisector (away from inner wall).
+        let bis = (ba_n.0 + bc_n.0, ba_n.1 + bc_n.1);
+        let bis_len = (bis.0 * bis.0 + bis.1 * bis.1).sqrt();
+        if bis_len < 1e-4 { continue; }
+        // Shift 1 tile in the outside direction.
+        let dx = (-bis.0 / bis_len).round() as i32;
+        let dy = (-bis.1 / bis_len).round() as i32;
+        if dx == 0 && dy == 0 { continue; }
+
+        let nx = orig[i].0 + dx;
+        let ny = orig[i].1 + dy;
+        // Bounds + walkability check.
+        if nx < 0 || nx >= map_w || ny < 0 || ny >= map_h_i { continue; }
+        if !map[idx(nx, ny, map_w)].is_walkable() { continue; }
+
+        // Verify radius-clear connectivity to both neighbours.
+        let cand = tc((nx, ny));
+        if !radius_clear(tc(orig[i - 1]), cand, radius, map, map_w, map_h_i) { continue; }
+        if !radius_clear(cand, tc(orig[i + 1]), radius, map, map_w, map_h_i) { continue; }
+
+        path[i] = (nx, ny);
+        NPC_LOG.with(|log| {
+            if let Some(ref mut w) = *log.borrow_mut() {
+                let _ = writeln!(
+                    w, "  [widen] corner {} ({},{}) -> ({},{})",
+                    i, orig[i].0, orig[i].1, nx, ny,
+                );
+            }
+        });
+    }
+}
+
+/// Build a ready-to-follow path from a raw A*/SG result.
+///
+/// Pipeline: grid LOS simplify → radius-aware resimplify → widen tight
+/// corners.  First waypoint (NPC's current tile) is removed so the NPC
+/// immediately walks toward waypoint 0.  Runtime PID+context steering
+/// handles the actual smooth curves.
+///
+/// `initial_dir` is accepted for API compatibility but unused — smooth
+/// curves come from runtime steering, not waypoint-level splines.
+pub(crate) fn build_path(
+    mut raw: Vec<(i32, i32)>,
+    radius: f32,
+    _initial_dir: (f32, f32),
+    map: &[Cell],
+    map_w: i32,
+    map_h: i32,
+) -> Vec<(i32, i32)> {
+    NPC_LOG.with(|log| {
+        if let Some(ref mut w) = *log.borrow_mut() {
+            let _ = writeln!(w, "  [build] raw A*         ({} pts): {:?}", raw.len(), raw);
+        }
+    });
+    smooth_path(&mut raw, map, map_w, map_h);
+    NPC_LOG.with(|log| {
+        if let Some(ref mut w) = *log.borrow_mut() {
+            let _ = writeln!(w, "  [build] after smooth   ({} pts): {:?}", raw.len(), raw);
+        }
+    });
+    let mut p = resimplify_skeleton(&raw, radius, map, map_w, map_h);
+    NPC_LOG.with(|log| {
+        if let Some(ref mut w) = *log.borrow_mut() {
+            let _ = writeln!(w, "  [build] after resimplify ({} pts): {:?}", p.len(), p);
+        }
+    });
+    widen_tight_corners(&mut p, radius, map, map_w, map_h);
+    NPC_LOG.with(|log| {
+        if let Some(ref mut w) = *log.borrow_mut() {
+            let _ = writeln!(w, "  [build] after widen    ({} pts): {:?}", p.len(), p);
+        }
+    });
+    if p.len() > 1 {
+        p.remove(0);
+    }
+    p
 }

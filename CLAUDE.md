@@ -60,6 +60,16 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. No Magic Numbers
+
+**Every literal must be traceable to a physical quantity or a named constant.**
+
+- Never hardcode thresholds, multipliers, or limits as bare literals in logic.
+- Extract them as `const` with a descriptive name that explains *what* it controls.
+- Add a comment explaining *why* this value was chosen — ideally referencing the physical quantity it derives from (e.g. collision radius, tile size, tick rate).
+- If a value is a multiple of another parameter (e.g. `radius * 3.0`), the multiplier itself must be a named constant with rationale.
+- When in doubt: if someone reading the code would ask "where does this number come from?", it needs a name and a comment.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

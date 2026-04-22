@@ -19,7 +19,7 @@ use std::fs;
 use std::io::Write;
 
 use crate::game::cell::{idx, Cell, SubgoalGraph};
-use crate::game::npc::{Npc, ActivityPhase, astar, smooth_path, filter_waypoints};
+use crate::game::npc::{Npc, ActivityPhase, astar, build_path};
 use crate::game::room::Room;
 
 // ---------------------------------------------------------------------------
@@ -362,24 +362,33 @@ fn bfs_room_path(from_room: usize, to_room: usize, rooms: &[Room]) -> Option<Vec
 }
 
 /// Find the door position that connects `from_room` to `to_room`.
-/// If multiple doors connect them, pick the one nearest to `ref_pos`.
+/// Pick door connecting `from_room` → `to_room`.
+/// Score = dist(npc, door) + dist(door, ref_pos) — total path cost
+/// through the door. Naturally prefers nearby doors without needing
+/// direction heuristics.
 fn door_between_rooms(
     from_room: usize,
     to_room: usize,
     ref_pos: (f32, f32),
+    npc_pos: (f32, f32),
     rooms: &[Room],
 ) -> Option<(i32, i32)> {
     if from_room >= rooms.len() {
         return None;
     }
     let ref_tile = (ref_pos.0.floor() as i32, ref_pos.1.floor() as i32);
+    let npc_tile = (npc_pos.0.floor() as i32, npc_pos.1.floor() as i32);
     let mut best: Option<((i32, i32), i32)> = None;
 
     for &(adj, door_pos) in &rooms[from_room].adjacent_rooms {
         if adj == to_room {
-            let d = (door_pos.0 - ref_tile.0).abs() + (door_pos.1 - ref_tile.1).abs();
-            if best.is_none() || d < best.unwrap().1 {
-                best = Some((door_pos, d));
+            let d_ref = (door_pos.0 - ref_tile.0).abs()
+                      + (door_pos.1 - ref_tile.1).abs();
+            let d_npc = (door_pos.0 - npc_tile.0).abs()
+                      + (door_pos.1 - npc_tile.1).abs();
+            let score = d_npc + d_ref;
+            if best.is_none() || score < best.unwrap().1 {
+                best = Some((door_pos, score));
             }
         }
     }
@@ -532,7 +541,7 @@ pub fn update_chase(
                 }
 
                 if npc_room == target_room {
-                    enter_search(npc, i, target_room, rooms);
+                    enter_search(npc, i, target_room, rooms, map, map_w, map_h, sg);
                 } else {
                     enter_navigate(npc, i, npc_room, target_room, rooms, sg,
                                    tile_to_room, map, map_w, map_h);
@@ -553,7 +562,7 @@ pub fn update_chase(
                 if npc_room == final_room {
                     // Reached the ultimate destination room.
                     clog!("CHASE_ARRIVED_ROOM npc={} room={}", i, final_room);
-                    enter_search(npc, i, final_room, rooms);
+                    enter_search(npc, i, final_room, rooms, map, map_w, map_h, sg);
                 } else if npc_room == hop_target && hop_target != final_room {
                     // Reached intermediate room — advance hop.
                     let next_hop = current_hop + 1;
@@ -573,7 +582,8 @@ pub fn update_chase(
                     };
                     let ls = npc.chase.last_seen_pos;
                     if let Some(door) = door_between_rooms(
-                        npc_room, next_room, (ls.0, ls.1), rooms,
+                        npc_room, next_room, (ls.0, ls.1),
+                        (npc.pos.0, npc.pos.1), rooms,
                     ) {
                         clog!("CHASE_NAV_DOOR npc={} from={} to={} door=({},{})",
                             i, npc_room, next_room, door.0, door.1);
@@ -612,7 +622,8 @@ pub fn update_chase(
                         // No target tile — find door to next hop.
                         let ls2 = npc.chase.last_seen_pos;
                         if let Some(door) = door_between_rooms(
-                            npc_room, hop_target, (ls2.0, ls2.1), rooms,
+                            npc_room, hop_target, (ls2.0, ls2.1),
+                            (npc.pos.0, npc.pos.1), rooms,
                         ) {
                             clog!("CHASE_NAV_DOOR npc={} from={} to={} door=({},{})",
                                 i, npc_room, hop_target, door.0, door.1);
@@ -673,7 +684,7 @@ pub fn update_chase(
                             clog!("CHASE_NEXT_ROOM npc={} from={} next={}", i, room_id, next);
                             npc.chase.set_expression(CONFUSED_KAOMOJI, 3.0);
                             if npc_room == next {
-                                enter_search(npc, i, next, rooms);
+                                enter_search(npc, i, next, rooms, map, map_w, map_h, sg);
                             } else {
                                 enter_navigate(npc, i, npc_room, next, rooms, sg,
                                                tile_to_room, map, map_w, map_h);
@@ -688,7 +699,10 @@ pub fn update_chase(
                         let path_done = npc.path_idx >= npc.path.len();
                         let stalled = spd < STALL_SPEED;
                         if (path_done || stalled) && npc.chase.repath_cooldown == 0 {
-                            if let Some(target) = find_blind_spot_target(room, &seen, npc.chase.last_seen_pos) {
+                            if let Some(target) = find_blind_spot_target(
+                                room, &seen, npc.chase.last_seen_pos,
+                                npc_tile, npc.chase.chase_dir,
+                            ) {
                                 clog!("CHASE_BLIND_SPOT npc={} target=({},{}) unseen={}",
                                     i, target.0, target.1, unseen_count);
                                 repath_chase(npc, target, map, map_w, map_h, sg);
@@ -740,7 +754,16 @@ pub fn update_chase(
 // Phase transition helpers
 // ---------------------------------------------------------------------------
 
-fn enter_search(npc: &mut Npc, npc_idx: usize, room_id: usize, rooms: &[Room]) {
+fn enter_search(
+    npc: &mut Npc,
+    npc_idx: usize,
+    room_id: usize,
+    rooms: &[Room],
+    map: &[Cell],
+    map_w: i32,
+    map_h: i32,
+    sg: &SubgoalGraph,
+) {
     if room_id >= rooms.len() {
         return;
     }
@@ -749,8 +772,25 @@ fn enter_search(npc: &mut Npc, npc_idx: usize, room_id: usize, rooms: &[Room]) {
     if !npc.chase.searched_rooms.contains(&room_id) {
         npc.chase.searched_rooms.push(room_id);
     }
+
+    // Truncate any leftover waypoints and immediately path to first blind spot,
+    // so the NPC never coasts without a destination.
+    npc.path.truncate(npc.path_idx);
+    let npc_tile = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
+    if let Some(target) = find_blind_spot_target(
+        room, &seen, npc.chase.last_seen_pos,
+        npc_tile, npc.chase.chase_dir,
+    ) {
+        clog!("CHASE_SEARCH_INITIAL_TARGET npc={} target=({},{})", npc_idx, target.0, target.1);
+        repath_chase(npc, target, map, map_w, map_h, sg);
+        npc.chase.repath_cooldown = REPATH_COOLDOWN_SEARCH;
+    } else {
+        npc.path.clear();
+        npc.path_idx = 0;
+        npc.chase.target_tile = None;
+    }
+
     npc.chase.phase = ChasePhase::Search { room_id, seen };
-    npc.chase.repath_cooldown = 0;
     npc.chase.set_expression(CONFUSED_KAOMOJI, 3.0);
     clog!("CHASE_SEARCH_START npc={} room={} ({:?}) tiles={} searched={:?}",
         npc_idx, room_id, room.kind, room.tiles.len(), npc.chase.searched_rooms);
@@ -790,11 +830,11 @@ fn enter_navigate(
     let first_hop_room = if room_path.len() > 1 { room_path[1] } else { target_room };
     let current_hop = if room_path.len() > 1 { 1 } else { 0 };
 
-    // Find door to first hop — use last_seen_pos so we pick the door
-    // nearest to where the player was, not nearest to the NPC.
+    // Find door to first hop — total path cost: dist(npc, door) + dist(door, last_seen).
     let last_seen = (npc.chase.last_seen_pos.0, npc.chase.last_seen_pos.1);
     let waypoint = if let Some(door) = door_between_rooms(
-        effective_npc_room, first_hop_room, last_seen, rooms,
+        effective_npc_room, first_hop_room, last_seen,
+        (npc.pos.0, npc.pos.1), rooms,
     ) {
         door
     } else if target_room < rooms.len() {
@@ -827,7 +867,7 @@ fn enter_navigate(
 fn find_nearest_room_from_door(
     npc: &Npc,
     tile_to_room: &[usize],
-    map: &[Cell],
+    _map: &[Cell],
     map_w: i32,
     map_h: i32,
 ) -> usize {
@@ -878,7 +918,7 @@ fn find_tile_in_room(
             if nx < 0 || nx >= map_w || ny < 0 || ny >= map_h {
                 continue;
             }
-            if !map[idx(nx, ny, map_w)].terrain.is_walkable() {
+            if !map[idx(nx, ny, map_w)].is_walkable() {
                 break;
             }
             let r = tile_to_room[idx(nx, ny, map_w)];
@@ -933,26 +973,50 @@ fn pick_next_room(
 // Room search helpers
 // ---------------------------------------------------------------------------
 
-/// Find the unseen tile nearest to `last_seen_pos`.
+/// Find the best unseen tile to search next.
+///
+/// Two-pass approach: first consider only tiles *ahead* of the NPC (dot > 0
+/// with `npc_dir`). Among those, pick the one nearest `last_seen_pos`.  If no
+/// forward tiles remain unseen, fall back to ALL unseen tiles (nearest to
+/// `last_seen_pos`).  This ensures the NPC sweeps forward first before
+/// turning around, eliminating unnecessary zigzag in corridors.
 fn find_blind_spot_target(
     room: &Room,
     seen: &[bool],
     last_seen: (f32, f32),
+    npc_tile: (i32, i32),
+    npc_dir: (f32, f32),
 ) -> Option<(i32, i32)> {
     let ref_tile = (last_seen.0.floor() as i32, last_seen.1.floor() as i32);
-    let mut best: Option<((i32, i32), i32)> = None;
 
-    for (ti, &tile) in room.tiles.iter().enumerate() {
-        if seen[ti] {
-            continue;
+    for pass in 0..2 {
+        let mut best: Option<((i32, i32), i32)> = None;
+        for (ti, &tile) in room.tiles.iter().enumerate() {
+            if seen[ti] {
+                continue;
+            }
+            // Pass 0: only forward tiles (dot > 0).
+            if pass == 0 {
+                let dx = (tile.0 - npc_tile.0) as f32;
+                let dy = (tile.1 - npc_tile.1) as f32;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > 0.01 {
+                    let dot = (dx / len) * npc_dir.0 + (dy / len) * npc_dir.1;
+                    if dot <= 0.0 {
+                        continue;
+                    }
+                }
+            }
+            let d = (tile.0 - ref_tile.0).abs() + (tile.1 - ref_tile.1).abs();
+            if best.is_none() || d < best.unwrap().1 {
+                best = Some((tile, d));
+            }
         }
-        let d = (tile.0 - ref_tile.0).abs() + (tile.1 - ref_tile.1).abs();
-        if best.is_none() || d < best.unwrap().1 {
-            best = Some((tile, d));
+        if best.is_some() {
+            return best.map(|(pos, _)| pos);
         }
     }
-
-    best.map(|(pos, _)| pos)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -969,7 +1033,7 @@ fn repath_chase(
 ) {
     let from = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
 
-    let mut p = if let Some(sg_path) = sg.find_path(from, target, map, map_w, map_h) {
+    let raw = if let Some(sg_path) = sg.find_path(from, target, map, map_w, map_h) {
         clog!("CHASE_REPATH_SG from=({},{}) to=({},{}) wps={:?}",
             from.0, from.1, target.0, target.1, sg_path);
         expand_subgoal_path(&sg_path, map, map_w, map_h)
@@ -982,37 +1046,7 @@ fn repath_chase(
         }
     };
 
-    smooth_path(&mut p, map, map_w, map_h);
-    filter_waypoints(&mut p, map, map_w);
-    if p.len() > 1 {
-        p.remove(0);
-    }
-
-    // Direction-aware trimming: skip initial waypoints that go backward
-    // from chase_dir. Kept for Pursuit→Navigate transition where the NPC
-    // was chasing in one direction. Only trim if we have > 1 waypoint left.
-    let cd = npc.chase.chase_dir;
-    let cd_len_sq = cd.0 * cd.0 + cd.1 * cd.1;
-    if cd_len_sq > 1e-4 && p.len() > 1 {
-        let inv_len = 1.0 / cd_len_sq.sqrt();
-        let cdx = cd.0 * inv_len;
-        let cdy = cd.1 * inv_len;
-        // Only trim at most 2 waypoints to prevent over-trimming.
-        let mut trimmed = 0;
-        while p.len() > 1 && trimmed < 2 {
-            let wp = (p[0].0 as f32 + 0.5, p[0].1 as f32 + 0.5);
-            let dx = wp.0 - npc.pos.0;
-            let dy = wp.1 - npc.pos.1;
-            if dx * cdx + dy * cdy <= 0.0 {
-                p.remove(0);
-                trimmed += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    npc.path = p;
+    npc.path = build_path(raw, npc.radius, npc.chase.chase_dir, map, map_w, map_h);
     npc.path_idx = 0;
     npc.pid_integral = 0.0;
     npc.pid_prev_error = 0.0;
@@ -1058,11 +1092,8 @@ fn end_chase(npc: &mut Npc, map: &[Cell], map_w: i32, map_h: i32) {
     npc.routine.phase = ActivityPhase::Traveling;
     let dest = npc.destination();
     let from = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
-    if let Some(mut p) = astar(map, map_w, map_h, from, dest) {
-        smooth_path(&mut p, map, map_w, map_h);
-        filter_waypoints(&mut p, map, map_w);
-        if p.len() > 1 { p.remove(0); }
-        npc.path = p;
+    if let Some(raw) = astar(map, map_w, map_h, from, dest) {
+        npc.path = build_path(raw, npc.radius, npc.chase.chase_dir, map, map_w, map_h);
         npc.path_idx = 0;
         npc.pid_integral = 0.0;
         npc.pid_prev_error = 0.0;

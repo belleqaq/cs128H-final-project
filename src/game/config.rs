@@ -1,7 +1,6 @@
 //! config.toml loading + defaults.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
@@ -40,6 +39,12 @@ pub struct GameplaySettings {
     pub qte_time_per_key: f32,
     /// Rounds of QTE needed per poop session.
     pub poop_rounds: u32,
+    /// Speed multiplier while running.
+    pub run_speed_mult: f32,
+    /// Acceleration multiplier while running.
+    pub run_accel_mult: f32,
+    /// Urgency rate multiplier while running.
+    pub run_urgency_mult: f32,
 }
 
 impl Default for GameplaySettings {
@@ -52,6 +57,9 @@ impl Default for GameplaySettings {
             qte_length: 4,
             qte_time_per_key: 1.0,
             poop_rounds: 3,
+            run_speed_mult: 1.8,
+            run_accel_mult: 1.8,
+            run_urgency_mult: 2.0,
         }
     }
 }

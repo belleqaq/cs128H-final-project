@@ -127,7 +127,7 @@ fn is_blocked(map: &[Cell], map_w: i32, map_h: i32, x: i32, y: i32) -> bool {
     if x < 0 || x >= map_w || y < 0 || y >= map_h {
         return true;
     }
-    !map[idx(x, y, map_w)].terrain.is_walkable()
+    !map[idx(x, y, map_w)].is_walkable()
 }
 
 /// Distance from `pos` to the nearest surface point on a tile AABB.
@@ -371,5 +371,93 @@ fn resolve_collision(
         if !resolved_any {
             break;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entity–entity collision (circle–circle)
+// ---------------------------------------------------------------------------
+
+/// Resolve circle–circle overlap between two entities.
+///
+/// Uses the same push-apart + velocity correction approach as wall collision.
+/// Each entity receives half the penetration correction, and the
+/// toward-other velocity component is zeroed on both sides.
+pub fn resolve_entity_pair(
+    pos_a: &mut (f32, f32),
+    vel_a: &mut (f32, f32),
+    radius_a: f32,
+    pos_b: &mut (f32, f32),
+    vel_b: &mut (f32, f32),
+    radius_b: f32,
+) {
+    let dx = pos_a.0 - pos_b.0;
+    let dy = pos_a.1 - pos_b.1;
+    let dist_sq = dx * dx + dy * dy;
+    let min_dist = radius_a + radius_b;
+
+    if dist_sq >= min_dist * min_dist || dist_sq < 1e-12 {
+        return;
+    }
+
+    let dist = dist_sq.sqrt();
+    let pen = min_dist - dist;
+    // Normal from B toward A.
+    let nx = dx / dist;
+    let ny = dy / dist;
+
+    // Push apart: half penetration each.
+    let half_pen = pen * 0.5;
+    pos_a.0 += nx * half_pen;
+    pos_a.1 += ny * half_pen;
+    pos_b.0 -= nx * half_pen;
+    pos_b.1 -= ny * half_pen;
+
+    // Cancel toward-other velocity component.
+    let dot_a = vel_a.0 * nx + vel_a.1 * ny;
+    if dot_a < 0.0 {
+        vel_a.0 -= dot_a * nx;
+        vel_a.1 -= dot_a * ny;
+    }
+    let dot_b = vel_b.0 * (-nx) + vel_b.1 * (-ny);
+    if dot_b < 0.0 {
+        vel_b.0 -= dot_b * (-nx);
+        vel_b.1 -= dot_b * (-ny);
+    }
+}
+
+/// One-sided push: move entity A away from a static obstacle at `pos_b`
+/// with radius `radius_b`.  Only A's position and velocity are modified.
+/// Used for player–NPC collision where we don't want the NPC to be
+/// nudged off its patrol path.
+pub fn resolve_entity_vs_static(
+    pos_a: &mut (f32, f32),
+    vel_a: &mut (f32, f32),
+    radius_a: f32,
+    pos_b: (f32, f32),
+    radius_b: f32,
+) {
+    let dx = pos_a.0 - pos_b.0;
+    let dy = pos_a.1 - pos_b.1;
+    let dist_sq = dx * dx + dy * dy;
+    let min_dist = radius_a + radius_b;
+
+    if dist_sq >= min_dist * min_dist || dist_sq < 1e-12 {
+        return;
+    }
+
+    let dist = dist_sq.sqrt();
+    let pen = min_dist - dist;
+    let nx = dx / dist;
+    let ny = dy / dist;
+
+    // Full push on A only.
+    pos_a.0 += nx * pen;
+    pos_a.1 += ny * pen;
+
+    let dot_a = vel_a.0 * nx + vel_a.1 * ny;
+    if dot_a < 0.0 {
+        vel_a.0 -= dot_a * nx;
+        vel_a.1 -= dot_a * ny;
     }
 }

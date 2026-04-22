@@ -225,12 +225,35 @@ pub struct State {
     pub dbg_wall_ny: f32,
 }
 
+/// Find a walkable floor tile near the map center for player spawn.
+fn find_walkable_start(map: &[Cell], w: i32, h: i32) -> (f32, f32) {
+    let cx = w / 2;
+    let cy = h / 2;
+    // Spiral outward from center looking for a Floor tile.
+    for radius in 0..w.max(h) {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs() != radius && dy.abs() != radius { continue; }
+                let x = cx + dx;
+                let y = cy + dy;
+                if x < 0 || x >= w || y < 0 || y >= h { continue; }
+                if map[idx(x, y, w)].terrain == Terrain::Floor {
+                    return (x as f32 + 0.5, y as f32 + 0.5);
+                }
+            }
+        }
+    }
+    // Fallback (should not happen on a valid map).
+    (cx as f32 + 0.5, cy as f32 + 0.5)
+}
+
 impl State {
-    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32) -> Self {
-        let start = (15.5, 10.5); // corridor centre
+    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32, cell_kinds: &[Option<room::RoomKind>]) -> Self {
+        // Find a walkable starting position near map center.
+        let start = find_walkable_start(&map, w, h);
         let pw = compute_passage_width(&map, w, h);
         let sg = build_subgoal_graph(&map, w, h);
-        let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg);
+        let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg, cell_kinds);
         let mut s = Self {
             map,
             map_w: w,
@@ -289,6 +312,7 @@ impl State {
     }
 
     pub fn apply_config(&mut self, config: &GameConfig) {
+        // Player physics.
         self.raw_accel = config.player.acceleration;
         self.raw_friction = config.player.friction;
         self.raw_stop_friction = config.player.stop_friction;
@@ -298,11 +322,23 @@ impl State {
         self.repulsion_range = config.player.repulsion_range;
         self.repulsion_push = config.player.repulsion_push;
         self.tick_ms = config.tick_ms;
+        // Gameplay.
+        self.urgency_rate = config.gameplay.urgency_rate;
+        self.toilet_relief = config.gameplay.toilet_relief;
+        self.star_relief = config.gameplay.star_relief;
+        self.goal_count = config.gameplay.goal_count;
+        self.qte_length = config.gameplay.qte_length;
+        self.qte_time_per_key = config.gameplay.qte_time_per_key;
+        self.poop_rounds = config.gameplay.poop_rounds;
+        self.run_speed_mult = config.gameplay.run_speed_mult;
+        self.run_accel_mult = config.gameplay.run_accel_mult;
+        self.run_urgency_mult = config.gameplay.run_urgency_mult;
     }
 
     /// Snapshot current tunable values back into a GameConfig for saving.
     pub fn to_config(&self) -> GameConfig {
         let mut cfg = GameConfig::default();
+        // Player physics.
         cfg.player.max_speed = self.max_speed;
         cfg.player.acceleration = self.raw_accel;
         cfg.player.friction = self.raw_friction;
@@ -312,6 +348,17 @@ impl State {
         cfg.player.repulsion_range = self.repulsion_range;
         cfg.player.repulsion_push = self.repulsion_push;
         cfg.tick_ms = self.tick_ms;
+        // Gameplay.
+        cfg.gameplay.urgency_rate = self.urgency_rate;
+        cfg.gameplay.toilet_relief = self.toilet_relief;
+        cfg.gameplay.star_relief = self.star_relief;
+        cfg.gameplay.goal_count = self.goal_count;
+        cfg.gameplay.qte_length = self.qte_length;
+        cfg.gameplay.qte_time_per_key = self.qte_time_per_key;
+        cfg.gameplay.poop_rounds = self.poop_rounds;
+        cfg.gameplay.run_speed_mult = self.run_speed_mult;
+        cfg.gameplay.run_accel_mult = self.run_accel_mult;
+        cfg.gameplay.run_urgency_mult = self.run_urgency_mult;
         cfg
     }
 
@@ -547,7 +594,7 @@ impl State {
         if tx >= 0 && tx < self.map_w && ty >= 0 && ty < self.map_h {
             self.map[idx(tx, ty, self.map_w)].terrain
         } else {
-            Terrain::Wall
+            Terrain::Void
         }
     }
 
@@ -778,11 +825,32 @@ impl State {
         self.dbg_clearance = dbg.clearance;
         self.dbg_wall_nx = dbg.wall_nx;
         self.dbg_wall_ny = dbg.wall_ny;
+
+        // --- Entity–entity collision ---
+        // NPC–NPC: symmetric push-apart.
+        for i in 0..self.npcs.len() {
+            for j in (i + 1)..self.npcs.len() {
+                let (left, right) = self.npcs.split_at_mut(j);
+                let a = &mut left[i];
+                let b = &mut right[0];
+                physics::resolve_entity_pair(
+                    &mut a.pos, &mut a.velocity, a.radius,
+                    &mut b.pos, &mut b.velocity, b.radius,
+                );
+            }
+        }
+        // Player–NPC: push player away, NPC stays on patrol path.
+        for npc in &self.npcs {
+            physics::resolve_entity_vs_static(
+                &mut self.pos, &mut self.velocity, self.radius,
+                npc.pos, npc.radius,
+            );
+        }
     }
 
     /// Reset player to a safe starting position.
     pub fn reset_position(&mut self) {
-        self.pos = (2.5, 2.5);
+        self.pos = find_walkable_start(&self.map, self.map_w, self.map_h);
         self.velocity = (0.0, 0.0);
         self.prev_pos = self.pos;
         self.move_state = MoveState::Walking;

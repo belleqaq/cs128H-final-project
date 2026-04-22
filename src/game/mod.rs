@@ -6,9 +6,10 @@ pub mod config;
 pub mod npc;
 pub mod physics;
 pub mod room;
+pub mod rooms;
 pub mod state;
 
-pub use config::{load_config, save_config, GameConfig, GameplaySettings};
+pub use config::{load_config, save_config};
 pub use state::State;
 
 /// Baseline tick duration that config friction/acceleration values are
