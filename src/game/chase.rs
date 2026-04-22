@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 
-use crate::game::cell::{idx, Cell, SubgoalGraph};
+use crate::game::cell::{idx, Cell, SubgoalGraph, Terrain};
 use crate::game::npc::{Npc, ActivityPhase, astar, build_path};
 use crate::game::room::Room;
 
@@ -116,6 +116,8 @@ pub struct ChaseConfig {
     pub linger_s: f32,
     /// Cosine of half the vision cone angle.
     pub fov_dot: f32,
+    /// Whether open doors block NPC line-of-sight.
+    pub door_blocks_vision: bool,
 }
 
 impl Default for ChaseConfig {
@@ -124,6 +126,7 @@ impl Default for ChaseConfig {
             enabled: false,
             linger_s: 8.0,
             fov_dot: 0.0,
+            door_blocks_vision: true,
         }
     }
 }
@@ -247,6 +250,7 @@ pub fn can_see_player(
     map: &[Cell],
     map_w: i32,
     map_h: i32,
+    door_blocks_vision: bool,
 ) -> bool {
     let dx = player_pos.0 - npc.pos.0;
     let dy = player_pos.1 - npc.pos.1;
@@ -263,7 +267,7 @@ pub fn can_see_player(
     }
     let a = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
     let b = (player_pos.0.floor() as i32, player_pos.1.floor() as i32);
-    line_of_sight_vision(map, map_w, map_h, a, b)
+    line_of_sight_vision(map, map_w, map_h, a, b, door_blocks_vision)
 }
 
 fn can_see_tile(
@@ -273,6 +277,7 @@ fn can_see_tile(
     map: &[Cell],
     map_w: i32,
     map_h: i32,
+    door_blocks_vision: bool,
 ) -> bool {
     let tx = tile.0 as f32 + 0.5;
     let ty = tile.1 as f32 + 0.5;
@@ -288,7 +293,7 @@ fn can_see_tile(
         return false;
     }
     let a = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
-    line_of_sight_vision(map, map_w, map_h, a, tile)
+    line_of_sight_vision(map, map_w, map_h, a, tile, door_blocks_vision)
 }
 
 fn line_of_sight_vision(
@@ -297,6 +302,7 @@ fn line_of_sight_vision(
     map_h: i32,
     a: (i32, i32),
     b: (i32, i32),
+    door_blocks_vision: bool,
 ) -> bool {
     let mut x = a.0;
     let mut y = a.1;
@@ -309,8 +315,12 @@ fn line_of_sight_vision(
         if x < 0 || x >= map_w || y < 0 || y >= map_h {
             return false;
         }
-        if map[idx(x, y, map_w)].terrain.blocks_vision() {
-            return false;
+        let terrain = map[idx(x, y, map_w)].terrain;
+        if terrain.blocks_vision() {
+            // When door_blocks_vision is false, open doors don't block LOS.
+            if !(terrain == Terrain::DoorOpen && !door_blocks_vision) {
+                return false;
+            }
         }
         if x == b.0 && y == b.1 {
             return true;
@@ -440,7 +450,7 @@ pub fn update_chase(
     };
 
     for (i, npc) in npcs.iter_mut().enumerate() {
-        let sees_player = can_see_player(npc, player_pos, config.fov_dot, map, map_w, map_h);
+        let sees_player = can_see_player(npc, player_pos, config.fov_dot, map, map_w, map_h, config.door_blocks_vision);
 
         // --- Catch check ---
         let dx_p = player_pos.0 - npc.pos.0;
@@ -665,7 +675,7 @@ pub fn update_chase(
                 if room_id < rooms.len() {
                     let room = &rooms[room_id];
                     for (ti, &tile) in room.tiles.iter().enumerate() {
-                        if !seen[ti] && can_see_tile(npc, tile, config.fov_dot, map, map_w, map_h) {
+                        if !seen[ti] && can_see_tile(npc, tile, config.fov_dot, map, map_w, map_h, config.door_blocks_vision) {
                             seen[ti] = true;
                         }
                     }

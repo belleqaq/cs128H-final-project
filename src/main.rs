@@ -1506,6 +1506,22 @@ async fn main() {
                     &mut state.chase_config.fov_dot, -1.0, 1.0,
                 );
                 py += row_h;
+                {
+                    let door_label = if state.chase_config.door_blocks_vision {
+                        "Door blocks vision: ON"
+                    } else {
+                        "Door blocks vision: OFF"
+                    };
+                    let door_col = if state.chase_config.door_blocks_vision {
+                        color_u8!(60, 60, 30, 230)
+                    } else {
+                        color_u8!(30, 60, 60, 230)
+                    };
+                    if debug.button(panel_x, py, pw, 20.0, door_label, door_col) {
+                        state.chase_config.door_blocks_vision = !state.chase_config.door_blocks_vision;
+                    }
+                    py += 22.0;
+                }
                 // Show chase status of first NPC.
                 if let Some(npc) = state.npcs.first() {
                     let status = if npc.chase.active {
