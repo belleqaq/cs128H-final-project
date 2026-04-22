@@ -34,6 +34,38 @@ pub struct Room {
 }
 
 // ---------------------------------------------------------------------------
+// Room kind count enforcement
+// ---------------------------------------------------------------------------
+
+/// Cap the number of rooms with `kind` to at most `max_count`.
+/// When more rooms than allowed have this kind, keep the largest (by tile
+/// count) and downgrade the rest to `RoomKind::Normal`.
+fn cap_room_kind(rooms: &mut [Room], kind: RoomKind, max_count: usize) {
+    let mut indices: Vec<usize> = rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == kind)
+        .map(|(i, _)| i)
+        .collect();
+
+    if indices.len() <= max_count {
+        return;
+    }
+
+    // Sort by tile count descending — keep the largest rooms.
+    indices.sort_by(|&a, &b| rooms[b].tiles.len().cmp(&rooms[a].tiles.len()));
+
+    // Downgrade excess rooms (those after the first `max_count`) to Normal.
+    for &ri in &indices[max_count..] {
+        eprintln!(
+            "[rooms] cap {:?}: downgrading room {} ({} tiles) to Normal",
+            kind, rooms[ri].id, rooms[ri].tiles.len()
+        );
+        rooms[ri].kind = RoomKind::Normal;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Build rooms via flood-fill
 // ---------------------------------------------------------------------------
 
@@ -41,15 +73,17 @@ pub struct Room {
 /// Returns the room list and a flat tile→room_id map (usize::MAX = no room).
 ///
 /// `cell_kinds`: per-cell RoomKind from map_gen (unified classification).
-/// Non-Corridor rooms derive their kind from majority vote of cell_kinds
-/// within their tiles.  If `cell_kinds` is empty, all non-Corridor rooms
-/// default to Normal.
+/// `requested_rooms`: the room kinds requested by config — used to cap
+/// special room counts (e.g. if only 1 Toilet was requested, at most 1
+/// room is classified as Toilet even if multiple flood-fill regions inherit
+/// Toilet from cell_kinds).
 pub fn build_rooms(
     map: &[Cell],
     w: i32,
     h: i32,
     sg: &SubgoalGraph,
     cell_kinds: &[Option<RoomKind>],
+    requested_rooms: &[RoomKind],
 ) -> (Vec<Room>, Vec<usize>) {
     let n = (w * h) as usize;
     let mut tile_to_room = vec![usize::MAX; n];
@@ -219,6 +253,17 @@ pub fn build_rooms(
             }
             // else: stays Normal (the flood-fill default).
         }
+    }
+
+    // Enforce requested room kind counts: if BSP over-split produced more
+    // flood-fill rooms of a special kind than were requested, keep only the
+    // N largest (by tile count) and downgrade the rest to Normal.
+    if !requested_rooms.is_empty() {
+        let requested_toilet = requested_rooms.iter().filter(|k| **k == RoomKind::Toilet).count();
+        let requested_trash = requested_rooms.iter().filter(|k| **k == RoomKind::Trash).count();
+
+        cap_room_kind(&mut rooms, RoomKind::Toilet, requested_toilet);
+        cap_room_kind(&mut rooms, RoomKind::Trash, requested_trash);
     }
 
     // Log summary.

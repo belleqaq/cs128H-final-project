@@ -2,19 +2,15 @@
 
 地图生成完成后处理。
 
-## 1. 仇恨时间与搜索时间取 max
+## 1. ~~仇恨时间与搜索时间取 max~~ ✅
 
-当前问题：搜索一个房间的遍历逻辑可能很快结束，导致仇恨计时器也跟着清零，NPC 过早放弃追逐。
+`enter_search` 进入搜索时，`timer = max(timer, room_search_time)`。
+`room_search_time = max(MIN_ROOM_SEARCH_S=3.0, tiles * SEARCH_TIME_PER_TILE=0.12)`。
 
-改法：`aggro_duration = max(aggro_duration, room_search_time)`，保证 NPC 至少搜完当前房间再考虑脱战。
+## 2. ~~搜索中途发现门 → 提前跳房间~~ ✅
 
-## 2. 搜索中途发现门 → 提前跳房间
-
-当前逻辑：NPC 搜索一个房间时必须把每个格子都纳入视野后才结束，遍历方向优先从玩家消失方向开始。
-
-改法：在遍历过程中增加一个提前退出判定——
-
-- 如果沿玩家消失方向发现了至少一个门，则中断当前房间遍历，朝该门前进并开始探索下一个房间。
-- 如果该方向只有一个门，直接去那个门。
-- 如果有多个门，选离玩家消失方向最近的。
-- 整个逻辑的前提仍然是仇恨未消失（aggro 计时器 > 0）。
+`find_escape_direction_door` 每 tick 检查：
+- 门在 chase_dir 方向（dot > DOOR_ESCAPE_DIR_DOT=0.3）
+- NPC 已看到门附近瓦片（discovered）
+- 目标房间未搜过 且 searched_rooms < 2
+满足则中断搜索，enter_navigate 到该房间。多个门时取 dot 最大的。

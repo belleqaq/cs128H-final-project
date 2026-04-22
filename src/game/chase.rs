@@ -103,6 +103,13 @@ const STALL_SPEED: f32 = 0.015;
 const REPATH_COOLDOWN_NAVIGATE: u32 = 5;
 const REPATH_COOLDOWN_SEARCH: u32 = 3;
 
+/// Estimated seconds for NPC to search one room tile (vision sweep overhead).
+const SEARCH_TIME_PER_TILE: f32 = 0.12;
+/// Absolute minimum search time per room (seconds), even for tiny rooms.
+const MIN_ROOM_SEARCH_S: f32 = 3.0;
+/// Minimum dot(chase_dir, npc→door) to consider a door "in the escape direction".
+const DOOR_ESCAPE_DIR_DOT: f32 = 0.3;
+
 pub struct ChaseConfig {
     pub enabled: bool,
     /// Total hunt budget in seconds (timer counts down once LOS is lost).
@@ -695,7 +702,27 @@ pub fn update_chase(
                             continue;
                         }
                     } else {
-                        // Still searching.
+                        // Early door jump: if the NPC discovers a door in the
+                        // player's escape direction, abandon this room and chase
+                        // through that door immediately.
+                        if npc.chase.searched_rooms.len() < 2 {
+                            if let Some((next_room, esc_door)) = find_escape_direction_door(
+                                room_id, npc, rooms, &seen, map_w, map_h,
+                            ) {
+                                clog!("CHASE_ESCAPE_DOOR npc={} room={} next={} door=({},{}) unseen={}",
+                                    i, room_id, next_room, esc_door.0, esc_door.1, unseen_count);
+                                npc.chase.set_expression(ANGRY_KAOMOJI, 2.0);
+                                if npc_room == next_room {
+                                    enter_search(npc, i, next_room, rooms, map, map_w, map_h, sg);
+                                } else {
+                                    enter_navigate(npc, i, npc_room, next_room, rooms, sg,
+                                                   tile_to_room, map, map_w, map_h);
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Still searching — head toward next blind spot.
                         let path_done = npc.path_idx >= npc.path.len();
                         let stalled = spd < STALL_SPEED;
                         if (path_done || stalled) && npc.chase.repath_cooldown == 0 {
@@ -772,6 +799,12 @@ fn enter_search(
     if !npc.chase.searched_rooms.contains(&room_id) {
         npc.chase.searched_rooms.push(room_id);
     }
+
+    // Guarantee the aggro timer lasts at least as long as the estimated
+    // room search time, so the NPC doesn't give up mid-sweep.
+    let room_search_time = (room.tiles.len() as f32 * SEARCH_TIME_PER_TILE)
+        .max(MIN_ROOM_SEARCH_S);
+    npc.chase.timer = npc.chase.timer.max(room_search_time);
 
     // Truncate any leftover waypoints and immediately path to first blind spot,
     // so the NPC never coasts without a destination.
@@ -1017,6 +1050,56 @@ fn find_blind_spot_target(
         }
     }
     None
+}
+
+/// During Search, check if any door in the player's escape direction has been
+/// "discovered" (NPC has seen tiles adjacent to it).  Returns the best
+/// (adjacent_room, door_pos) to jump to, or None.
+///
+/// Selection: among qualifying doors, pick the one whose direction from the
+/// NPC best aligns with `chase_dir` (highest dot product).
+fn find_escape_direction_door(
+    room_id: usize,
+    npc: &Npc,
+    rooms: &[Room],
+    seen: &[bool],
+    map_w: i32,
+    map_h: i32,
+) -> Option<(usize, (i32, i32))> {
+    if room_id >= rooms.len() { return None; }
+    let room = &rooms[room_id];
+    let chase_dir = npc.chase.chase_dir;
+
+    let mut best: Option<(usize, (i32, i32), f32)> = None;
+
+    for &(adj, door_pos) in &room.adjacent_rooms {
+        if npc.chase.searched_rooms.contains(&adj) { continue; }
+
+        // Direction check: door must be roughly in chase_dir from NPC.
+        let dx = door_pos.0 as f32 + 0.5 - npc.pos.0;
+        let dy = door_pos.1 as f32 + 0.5 - npc.pos.1;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 0.01 { continue; }
+        let dot = (dx / len) * chase_dir.0 + (dy / len) * chase_dir.1;
+        if dot < DOOR_ESCAPE_DIR_DOT { continue; }
+
+        // Visibility check: NPC has seen at least one tile adjacent to the door
+        // (on this room's side), meaning the door area has been swept.
+        let door_discovered = [(0i32, 1i32), (0, -1), (1, 0), (-1, 0)].iter().any(|&(ddx, ddy)| {
+            let nx = door_pos.0 + ddx;
+            let ny = door_pos.1 + ddy;
+            if nx < 0 || nx >= map_w || ny < 0 || ny >= map_h { return false; }
+            room.tiles.iter().position(|&t| t == (nx, ny))
+                .map_or(false, |ti| seen[ti])
+        });
+        if !door_discovered { continue; }
+
+        if best.is_none() || dot > best.unwrap().2 {
+            best = Some((adj, door_pos, dot));
+        }
+    }
+
+    best.map(|(room_id, door, _)| (room_id, door))
 }
 
 // ---------------------------------------------------------------------------

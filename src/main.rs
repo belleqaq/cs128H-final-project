@@ -108,6 +108,7 @@ struct MapGenResult {
     width: i32,
     height: i32,
     cell_kinds: Vec<Option<RoomKind>>,
+    requested_rooms: Vec<RoomKind>,
 }
 
 fn run_map_gen(config: &MapGenConfig) -> Option<MapGenResult> {
@@ -134,6 +135,7 @@ fn run_map_gen(config: &MapGenConfig) -> Option<MapGenResult> {
         width: result.width,
         height: result.height,
         cell_kinds: result.cell_kinds,
+        requested_rooms: result.requested_rooms,
     })
 }
 
@@ -146,10 +148,11 @@ fn procedural_map(room_count: usize) -> Option<MapGenResult> {
         if i % 3 == 0 { kinds.push(RoomKind::Toilet); }
         else { kinds.push(RoomKind::Normal); }
     }
-    run_map_gen(&MapGenConfig { rooms: kinds, map_w: None, map_h: None, area_per_room: None })
+    run_map_gen(&MapGenConfig { rooms: kinds, ..Default::default() })
 }
 
 /// Generate a map with explicit room kinds + optional size/area overrides.
+#[allow(dead_code)]
 fn procedural_map_with_kinds(
     kinds: &[RoomKind],
     size_override: Option<(usize, usize)>,
@@ -160,6 +163,7 @@ fn procedural_map_with_kinds(
         map_w: size_override.map(|(w, _)| w),
         map_h: size_override.map(|(_, h)| h),
         area_per_room: area_override,
+        ..Default::default()
     })
 }
 
@@ -200,6 +204,16 @@ struct DebugPanel {
     mapgen_npc_count: f32,
     /// Flag: trigger map regeneration next frame.
     mapgen_regen: bool,
+    // --- Pipeline step debug toggles (default all true) ---
+    mg_doors: bool,
+    mg_wfc_walls: bool,
+    mg_door_approaches: bool,
+    mg_merge_walls: bool,
+    mg_beds: bool,
+    mg_void_cleanup: bool,
+    mg_bed_reval: bool,
+    /// Whether the pipeline toggles sub-section is expanded.
+    mg_toggles_open: bool,
 }
 
 impl DebugPanel {
@@ -223,6 +237,14 @@ impl DebugPanel {
             mapgen_height: 0.0,
             mapgen_area: 0.0,
             mapgen_regen: false,
+            mg_doors: true,
+            mg_wfc_walls: true,
+            mg_door_approaches: true,
+            mg_merge_walls: true,
+            mg_beds: true,
+            mg_void_cleanup: true,
+            mg_bed_reval: true,
+            mg_toggles_open: false,
         }
     }
 
@@ -626,9 +648,9 @@ async fn main() {
     let gen = procedural_map(5).unwrap_or_else(|| {
         eprintln!("[mapgen] Procedural generation failed, using test map");
         let (m, w, h) = test_map();
-        MapGenResult { cells: m, width: w, height: h, cell_kinds: Vec::new() }
+        MapGenResult { cells: m, width: w, height: h, cell_kinds: Vec::new(), requested_rooms: Vec::new() }
     });
-    let mut state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds);
+    let mut state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds, &gen.requested_rooms);
 
     // Spawn NPCs in Normal rooms with beds.
     spawn_npcs(&mut state, 2);
@@ -726,8 +748,21 @@ async fn main() {
                 let a = debug.mapgen_area.round();
                 if a > 0.0 { Some(a) } else { None }
             };
-            if let Some(gen) = procedural_map_with_kinds(&kinds, size_ov, area_ov) {
-                state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds);
+            let mg_cfg = MapGenConfig {
+                rooms: kinds,
+                map_w: size_ov.map(|(w, _)| w),
+                map_h: size_ov.map(|(_, h)| h),
+                area_per_room: area_ov,
+                debug_doors: debug.mg_doors,
+                debug_wfc_walls: debug.mg_wfc_walls,
+                debug_door_approaches: debug.mg_door_approaches,
+                debug_merge_walls: debug.mg_merge_walls,
+                debug_beds: debug.mg_beds,
+                debug_void_cleanup: debug.mg_void_cleanup,
+                debug_bed_reval: debug.mg_bed_reval,
+            };
+            if let Some(gen) = run_map_gen(&mg_cfg) {
+                state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds, &gen.requested_rooms);
                 let n_npc = debug.mapgen_npc_count.round().max(0.0) as usize;
                 spawn_npcs(&mut state, n_npc);
             }
@@ -1551,6 +1586,78 @@ async fn main() {
                     debug.mapgen_area = v.round();
                 }
                 py += row_h;
+
+                // --- Pipeline step toggles (collapsible) ---
+                {
+                    let tg_header = if debug.mg_toggles_open {
+                        "  ▼ Pipeline Toggles"
+                    } else {
+                        "  ▶ Pipeline Toggles"
+                    };
+                    if debug.button(
+                        panel_x, py, pw, 18.0,
+                        tg_header,
+                        color_u8!(25, 40, 50, 230),
+                    ) {
+                        debug.mg_toggles_open = !debug.mg_toggles_open;
+                    }
+                    py += 20.0;
+                }
+                if debug.mg_toggles_open {
+                    let half = pw * 0.5 - 2.0;
+                    let cb_h = 18.0;
+                    // Row 1: Doors+Conn | WFC Walls
+                    {
+                        let l = if debug.mg_doors { "[x] Doors" } else { "[ ] Doors" };
+                        let c = if debug.mg_doors { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                            debug.mg_doors = !debug.mg_doors;
+                        }
+                        let l2 = if debug.mg_wfc_walls { "[x] WFC Walls" } else { "[ ] WFC Walls" };
+                        let c2 = if debug.mg_wfc_walls { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
+                            debug.mg_wfc_walls = !debug.mg_wfc_walls;
+                        }
+                        py += cb_h + 2.0;
+                    }
+                    // Row 2: DoorAppr | MergeWall
+                    {
+                        let l = if debug.mg_door_approaches { "[x] DoorAppr" } else { "[ ] DoorAppr" };
+                        let c = if debug.mg_door_approaches { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                            debug.mg_door_approaches = !debug.mg_door_approaches;
+                        }
+                        let l2 = if debug.mg_merge_walls { "[x] MergeWall" } else { "[ ] MergeWall" };
+                        let c2 = if debug.mg_merge_walls { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
+                            debug.mg_merge_walls = !debug.mg_merge_walls;
+                        }
+                        py += cb_h + 2.0;
+                    }
+                    // Row 3: Beds | VoidSeal
+                    {
+                        let l = if debug.mg_beds { "[x] Beds" } else { "[ ] Beds" };
+                        let c = if debug.mg_beds { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                            debug.mg_beds = !debug.mg_beds;
+                        }
+                        let l2 = if debug.mg_void_cleanup { "[x] VoidSeal" } else { "[ ] VoidSeal" };
+                        let c2 = if debug.mg_void_cleanup { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
+                            debug.mg_void_cleanup = !debug.mg_void_cleanup;
+                        }
+                        py += cb_h + 2.0;
+                    }
+                    // Row 4: BedReval (solo)
+                    {
+                        let l = if debug.mg_bed_reval { "[x] BedReval" } else { "[ ] BedReval" };
+                        let c = if debug.mg_bed_reval { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                            debug.mg_bed_reval = !debug.mg_bed_reval;
+                        }
+                        py += cb_h + 2.0;
+                    }
+                }
 
                 if debug.button(
                     panel_x, py, pw * 0.5, btn_h,

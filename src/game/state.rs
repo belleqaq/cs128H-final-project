@@ -248,12 +248,12 @@ fn find_walkable_start(map: &[Cell], w: i32, h: i32) -> (f32, f32) {
 }
 
 impl State {
-    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32, cell_kinds: &[Option<room::RoomKind>]) -> Self {
+    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32, cell_kinds: &[Option<room::RoomKind>], requested_rooms: &[room::RoomKind]) -> Self {
         // Find a walkable starting position near map center.
         let start = find_walkable_start(&map, w, h);
         let pw = compute_passage_width(&map, w, h);
         let sg = build_subgoal_graph(&map, w, h);
-        let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg, cell_kinds);
+        let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg, cell_kinds, requested_rooms);
         let mut s = Self {
             map,
             map_w: w,

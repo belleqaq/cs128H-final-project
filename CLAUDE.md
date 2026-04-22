@@ -70,6 +70,18 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - If a value is a multiple of another parameter (e.g. `radius * 3.0`), the multiplier itself must be a named constant with rationale.
 - When in doubt: if someone reading the code would ask "where does this number come from?", it needs a name and a comment.
 
+## 6. Debug Toggle Log Protocol
+
+**First-time debug on any toggle → write its log output logic FIRST.**
+
+When starting the first debug task for a pipeline toggle:
+1. Add comprehensive `eprintln` logging covering every key parameter and decision point in that toggle's code path. Ensure the log output is structured enough to diagnose issues without guessing. **Keep log output concise** — one line per decision point, no redundant information. Target: ≤ 30 lines per toggle per generation for the default 6-room config.
+2. Record the log prefix (e.g. `[doors]`) in `output/WFC_DESIGN.md` under a "Debug Logs" section.
+3. In every subsequent debug iteration, **read the log output first** before asking the user for more information. Only ask questions to resolve ambiguities that the log cannot answer.
+4. Never guess at root causes — use log evidence + user description. If the two contradict, ask the user to re-confirm.
+
+**Default map config** (when user does not specify): 3 Normal + 2 Toilet + 1 Trash = 6 rooms.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

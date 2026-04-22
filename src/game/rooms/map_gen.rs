@@ -5,12 +5,13 @@
 //!  2. Union-Find merge excess leaves into target room count.
 //!  3. Carve floor + paint BSP walls.
 //!  4. Assign RoomKind per group (Trash < Toilet < Normal by area).
-//!  5. Cut one door per group-pair per wall line.
-//!  6. WFC internal walls per leaf; validate ≥2 gaps per chamber.
-//!  7. Clear door approaches.
-//!  8. Remove merge-boundary walls.
-//!  9. Place beds in Medium/Large Normal rooms.
-//! 10. Void cleanup + global connectivity check.
+//!  5. Size classification.
+//!  6. Remove merge-boundary walls.
+//!  7. Cut doors (Hamiltonian-cycle minimum-door algorithm).
+//!  8. WFC internal walls per leaf.
+//!  9. Clear door approaches.
+//! 10. Place beds in Medium/Large Normal rooms.
+//! 11. Void cleanup + global connectivity check.
 
 use crate::game::cell::{Cell, Furniture, Terrain};
 use crate::game::room::RoomKind;
@@ -241,6 +242,21 @@ pub struct MapGenConfig {
     pub map_w: Option<usize>,
     pub map_h: Option<usize>,
     pub area_per_room: Option<f32>,
+    // --- Debug toggles (all default true = normal pipeline) ---
+    /// Step 6: remove BSP walls between merged leaves.
+    pub debug_merge_walls: bool,
+    /// Steps 7 + 11b: cut inter-room doors + connectivity flood-fill/force_door.
+    pub debug_doors: bool,
+    /// Step 8: WFC internal wall generation.
+    pub debug_wfc_walls: bool,
+    /// Step 9: clear WFC walls near door approaches.
+    pub debug_door_approaches: bool,
+    /// Step 10: place beds in Medium/Large Normal rooms.
+    pub debug_beds: bool,
+    /// Step 11a: void_cleanup — seal Floor/Door adjacent to Void.
+    pub debug_void_cleanup: bool,
+    /// Step 12: post-void bed re-validation.
+    pub debug_bed_reval: bool,
 }
 
 impl Default for MapGenConfig {
@@ -251,6 +267,13 @@ impl Default for MapGenConfig {
                 RoomKind::Toilet, RoomKind::Toilet,
             ],
             map_w: None, map_h: None, area_per_room: None,
+            debug_doors: true,
+            debug_wfc_walls: true,
+            debug_door_approaches: true,
+            debug_merge_walls: true,
+            debug_beds: true,
+            debug_void_cleanup: true,
+            debug_bed_reval: true,
         }
     }
 }
@@ -262,6 +285,9 @@ pub struct GeneratedMap {
     /// Per-cell RoomKind assigned by map_gen (None = Void/Wall/Door/unassigned).
     /// Used by downstream `build_rooms` for unified classification.
     pub cell_kinds: Vec<Option<RoomKind>>,
+    /// Requested room kinds from config — used by `build_rooms` to cap special
+    /// room counts (e.g. at most N Toilet rooms if N were requested).
+    pub requested_rooms: Vec<RoomKind>,
 }
 
 /// Generate a complete map.
@@ -343,117 +369,170 @@ pub fn generate_map(
     // Map group properties to leaves for WFC tileset selection and logging.
     let leaf_kinds: Vec<RoomKind> = (0..leaves.len()).map(|i| group_kinds[leaf_group[i]]).collect();
 
-    // --- Step 6: Cut doors ---
-    let door_count = cut_doors(&mut map, map_w, &leaves, &walls, &leaf_group);
-    if let Some(ref mut w) = log {
-        let _ = writeln!(w, "[mapgen] {} doors cut", door_count);
-    }
-
-    // --- Step 7: WFC per leaf ---
-    for (i, leaf) in leaves.iter().enumerate() {
-        fill_room_wfc(&mut map, map_w, leaf, leaf_kinds[i], rng);
-        if let Some(ref mut w) = log {
-            let _ = writeln!(w, "[mapgen] leaf {} ({:?}) at ({},{}) {}x{} group={}",
-                i, leaf_kinds[i], leaf.x, leaf.y, leaf.w, leaf.h, leaf_group[i]);
-        }
-    }
-
     let map_h = map.len() / map_w;
 
-    // --- Step 8: Clear door approaches ---
-    clear_door_approaches(&mut map, map_w, map_h, &walls);
+    // --- Step 6: Merge wall removal ---
+    // Remove BSP walls between same-group leaves BEFORE cutting doors,
+    // so the group adjacency graph only reflects inter-group boundaries.
+    if config.debug_merge_walls {
+        execute_merge_wall_removal(&mut map, map_w, map_h, &walls, &leaves, &mut uf, &edges);
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 6 (merge wall removal)");
+    }
 
-    // --- Step 9: Merge wall removal ---
-    execute_merge_wall_removal(&mut map, map_w, map_h, &walls, &leaves, &mut uf, &edges);
+    // --- Step 7: Cut doors ---
+    let door_count = if config.debug_doors {
+        let dc = cut_doors(&mut map, map_w, &leaves, &walls, &leaf_group, num_groups);
+        if let Some(ref mut w) = log {
+            let _ = writeln!(w, "[mapgen] {} doors cut", dc);
+        }
+        dc
+    } else {
+        if let Some(ref mut w) = log {
+            let _ = writeln!(w, "[mapgen] SKIP step 7 (cut doors)");
+        }
+        0
+    };
+    let _ = door_count;
+
+    // --- Step 8: WFC per leaf ---
+    if config.debug_wfc_walls {
+        for (i, leaf) in leaves.iter().enumerate() {
+            fill_room_wfc(&mut map, map_w, leaf, leaf_kinds[i], rng);
+            if let Some(ref mut w) = log {
+                let _ = writeln!(w, "[mapgen] leaf {} ({:?}) at ({},{}) {}x{} group={}",
+                    i, leaf_kinds[i], leaf.x, leaf.y, leaf.w, leaf.h, leaf_group[i]);
+            }
+        }
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 8 (WFC walls)");
+    }
+
+    // --- Step 9: Clear door approaches ---
+    if config.debug_door_approaches {
+        clear_door_approaches(&mut map, map_w, map_h, &walls);
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 9 (door approaches)");
+    }
 
     // --- Step 10: Bed placement ---
-    for gid in 0..num_groups {
-        if group_classes[gid] == SizeClass::Small { continue; }
-        if group_kinds[gid] != RoomKind::Normal { continue; }
-        let largest_leaf = (0..leaves.len())
-            .filter(|&i| leaf_group[i] == gid)
-            .max_by_key(|&i| leaves[i].w * leaves[i].h);
-        if let Some(li) = largest_leaf {
-            place_bed(&mut map, map_w, &leaves[li]);
+    if config.debug_beds {
+        for gid in 0..num_groups {
+            if group_classes[gid] == SizeClass::Small { continue; }
+            if group_kinds[gid] != RoomKind::Normal { continue; }
+            let largest_leaf = (0..leaves.len())
+                .filter(|&i| leaf_group[i] == gid)
+                .max_by_key(|&i| leaves[i].w * leaves[i].h);
+            if let Some(li) = largest_leaf {
+                place_bed(&mut map, map_w, &leaves[li]);
+            }
+            if let Some(ref mut w) = log {
+                let _ = writeln!(w, "[mapgen] bed for group {} ({:?})", gid, group_classes[gid]);
+            }
         }
-        if let Some(ref mut w) = log {
-            let _ = writeln!(w, "[mapgen] bed for group {} ({:?})", gid, group_classes[gid]);
-        }
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 10 (beds)");
     }
 
-    // --- Step 11: Void cleanup + connectivity ---
+    // --- Step 11a: Void cleanup ---
     let map_h = map.len() / map_w;
-    void_cleanup(&mut map, map_w, map_h);
-
-    let walkable = map.iter().filter(|c| c.terrain.is_walkable()).count();
-    if walkable == 0 {
-        if let Some(ref mut w) = log {
-            let _ = writeln!(w, "[mapgen] no walkable tiles!");
-        }
-        return None;
-    }
-    let start = map.iter().position(|c| c.terrain.is_walkable()).unwrap();
-    let reached = flood_fill_count(&map, map_w, start);
-    if reached < walkable {
-        if let Some(ref mut w) = log {
-            let _ = writeln!(w, "[mapgen] WARN: disconnected {}/{}, forcing doors", reached, walkable);
-        }
-        for wall in &walls {
-            force_door(&mut map, map_w, wall, rng);
-        }
-        clear_door_approaches(&mut map, map_w, map_h, &walls);
-        // Re-seal: force_door may have placed doors adjacent to Void.
+    if config.debug_void_cleanup {
         void_cleanup(&mut map, map_w, map_h);
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 11a (void cleanup)");
     }
 
-    // --- Step 12: Post-void bed re-validation ---
-    // void_cleanup may have added walls (Floor adjacent to Void → Wall) that
-    // combine with beds to form enclosed pockets.  Re-validate each leaf that
-    // had a bed placed.  If validation fails, remove internal walls (bed is
-    // essential, internal walls are not).
-    for gid in 0..num_groups {
-        if group_classes[gid] == SizeClass::Small { continue; }
-        if group_kinds[gid] != RoomKind::Normal { continue; }
-        let largest_leaf = (0..leaves.len())
-            .filter(|&i| leaf_group[i] == gid)
-            .max_by_key(|&i| leaves[i].w * leaves[i].h);
-        if let Some(li) = largest_leaf {
-            let rect = &leaves[li];
-            let has_bed = rect_indices(rect, map_w)
-                .any(|i| map[i].furniture == Some(Furniture::Bed));
-            if has_bed && !validate_room_interior(&map, map_w, rect) {
-                // Try removing walls near bed first.
-                let bed_cells: Vec<usize> = rect_indices(rect, map_w)
-                    .filter(|&i| map[i].furniture == Some(Furniture::Bed))
-                    .collect();
-                let mut fixed = false;
-                if bed_cells.len() >= 2 {
-                    fixed = try_wall_holes(&mut map, map_w, rect, bed_cells[0], bed_cells[1]);
-                }
-                if !fixed {
-                    // Degrade: clear WFC-generated internal walls in this leaf.
-                    // Preserve boundary walls (adjacent to Void) that were sealed
-                    // by void_cleanup — removing those would open the outer wall ring.
-                    for i in rect_indices(rect, map_w) {
-                        if map[i].terrain != Terrain::Wall { continue; }
-                        let x = i % map_w;
-                        let y = i / map_w;
-                        let adjacent_void = [
-                            (x > 0          && map[i - 1].terrain == Terrain::Void),
-                            (x + 1 < map_w  && map[i + 1].terrain == Terrain::Void),
-                            (y > 0          && map[i - map_w].terrain == Terrain::Void),
-                            (y + 1 < map_h  && map[i + map_w].terrain == Terrain::Void),
-                        ].iter().any(|&v| v);
-                        if !adjacent_void {
-                            map[i].terrain = Terrain::Floor;
-                        }
-                    }
-                }
-                if let Some(ref mut w) = log {
-                    let _ = writeln!(w, "[mapgen] post-void bed fix for group {} (fixed={})", gid, fixed);
+    // --- Step 11b: Connectivity fix ---
+    if config.debug_doors {
+        let walkable = map.iter().filter(|c| c.terrain.is_walkable()).count();
+        if walkable == 0 {
+            if let Some(ref mut w) = log {
+                let _ = writeln!(w, "[mapgen] no walkable tiles!");
+            }
+            return None;
+        }
+        let start = map.iter().position(|c| c.terrain.is_walkable()).unwrap();
+        let reached = flood_fill_count(&map, map_w, start);
+        eprintln!("[doors] Step11b: flood_fill {}/{} walkable", reached, walkable);
+        if reached < walkable {
+            eprintln!("[doors] Step11b: DISCONNECTED — forcing doors on all {} walls", walls.len());
+            if let Some(ref mut w) = log {
+                let _ = writeln!(w, "[mapgen] WARN: disconnected {}/{}, forcing doors", reached, walkable);
+            }
+            for wall in &walls {
+                force_door(&mut map, map_w, wall, rng);
+            }
+            clear_door_approaches(&mut map, map_w, map_h, &walls);
+            // Re-seal: force_door may have placed doors adjacent to Void.
+            if config.debug_void_cleanup {
+                void_cleanup(&mut map, map_w, map_h);
+            }
+        }
+        // Log all DoorOpen positions after Step 11b for diagnosis.
+        eprintln!("[doors] Step11b: post-state DoorOpen cells:");
+        for yi in 0..map_h {
+            for xi in 0..map_w {
+                if map[yi * map_w + xi].terrain == Terrain::DoorOpen {
+                    eprintln!("[doors]   door@({},{})", xi, yi);
                 }
             }
         }
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 11b (doors off → connectivity fix skipped)");
+    }
+
+    // --- Step 12: Post-void bed re-validation ---
+    if config.debug_bed_reval {
+        // void_cleanup may have added walls (Floor adjacent to Void → Wall) that
+        // combine with beds to form enclosed pockets.  Re-validate each leaf that
+        // had a bed placed.  If validation fails, remove internal walls (bed is
+        // essential, internal walls are not).
+        for gid in 0..num_groups {
+            if group_classes[gid] == SizeClass::Small { continue; }
+            if group_kinds[gid] != RoomKind::Normal { continue; }
+            let largest_leaf = (0..leaves.len())
+                .filter(|&i| leaf_group[i] == gid)
+                .max_by_key(|&i| leaves[i].w * leaves[i].h);
+            if let Some(li) = largest_leaf {
+                let rect = &leaves[li];
+                let has_bed = rect_indices(rect, map_w)
+                    .any(|i| map[i].furniture == Some(Furniture::Bed));
+                if has_bed && !validate_room_interior(&map, map_w, rect) {
+                    // Try removing walls near bed first.
+                    let bed_cells: Vec<usize> = rect_indices(rect, map_w)
+                        .filter(|&i| map[i].furniture == Some(Furniture::Bed))
+                        .collect();
+                    let mut fixed = false;
+                    if bed_cells.len() >= 2 {
+                        fixed = try_wall_holes(&mut map, map_w, rect, bed_cells[0], bed_cells[1]);
+                    }
+                    if !fixed {
+                        // Degrade: clear WFC-generated internal walls in this leaf.
+                        // Preserve boundary walls (adjacent to Void) that were sealed
+                        // by void_cleanup — removing those would open the outer wall ring.
+                        for i in rect_indices(rect, map_w) {
+                            if map[i].terrain != Terrain::Wall { continue; }
+                            let x = i % map_w;
+                            let y = i / map_w;
+                            let adjacent_void = [
+                                (x > 0          && map[i - 1].terrain == Terrain::Void),
+                                (x + 1 < map_w  && map[i + 1].terrain == Terrain::Void),
+                                (y > 0          && map[i - map_w].terrain == Terrain::Void),
+                                (y + 1 < map_h  && map[i + map_w].terrain == Terrain::Void),
+                            ].iter().any(|&v| v);
+                            if !adjacent_void {
+                                map[i].terrain = Terrain::Floor;
+                            }
+                        }
+                    }
+                    if let Some(ref mut w) = log {
+                        let _ = writeln!(w, "[mapgen] post-void bed fix for group {} (fixed={})", gid, fixed);
+                    }
+                }
+            }
+        }
+    } else if let Some(ref mut w) = log {
+        let _ = writeln!(w, "[mapgen] SKIP step 12 (bed re-validation)");
     }
 
     // --- Build cell_kinds: per-cell RoomKind from map_gen groups ---
@@ -474,7 +553,13 @@ pub fn generate_map(
         let _ = writeln!(w, "[mapgen] done {}x{}, {} walkable", map_w, map_h, final_w);
     }
 
-    Some(GeneratedMap { cells: map, width: map_w as i32, height: map_h as i32, cell_kinds })
+    Some(GeneratedMap {
+        cells: map,
+        width: map_w as i32,
+        height: map_h as i32,
+        cell_kinds,
+        requested_rooms: config.rooms.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -563,96 +648,611 @@ fn assign_room_kinds(group_areas: &[usize], requested: &[RoomKind]) -> Vec<RoomK
 // Door cutting (one per group-pair per wall)
 // ---------------------------------------------------------------------------
 
+/// Minimum gap between two doors (cells), checked in 2D (both axes).
+/// Set to BLOCK_TILE_SIZE so doors never fall within the same WFC block.
+/// Applies to same-axis AND cross-axis door pairs (horizontal↔vertical).
+const MIN_DOOR_GAP: usize = BLOCK_TILE_SIZE;
+
+/// Minimum distance from a wall intersection (room corner) to a door (cells).
+/// Overlap range endpoints are BSP leaf boundaries where perpendicular walls
+/// meet — doors placed at corners would be blocked by T-junctions.
+/// Equals one WFC block width, keeping doors away from structural corners.
+const DOOR_CORNER_MARGIN: usize = BLOCK_TILE_SIZE;
+
+/// Check if a terrain cell is a door type (DoorOpen or DoorClosed).
+fn is_door_terrain(t: Terrain) -> bool {
+    matches!(t, Terrain::DoorOpen | Terrain::DoorClosed)
+}
+
+/// Check that no existing door terrain exists within MIN_DOOR_GAP cells
+/// in 2D around the proposed door cells.  This catches both same-axis
+/// doors (horizontal↔horizontal) and cross-axis doors (horizontal↔vertical).
+fn no_nearby_doors_2d(
+    map: &[Cell], map_w: usize, map_h: usize,
+    door_cells: &[(usize, usize)], // (x, y) of each proposed door cell
+) -> bool {
+    let gap = MIN_DOOR_GAP as isize;
+    for &(dx, dy) in door_cells {
+        let cx = dx as isize;
+        let cy = dy as isize;
+        for ry in (cy - gap)..=(cy + gap) {
+            if ry < 0 || ry >= map_h as isize { continue; }
+            for rx in (cx - gap)..=(cx + gap) {
+                if rx < 0 || rx >= map_w as isize { continue; }
+                if is_door_terrain(map[ry as usize * map_w + rx as usize].terrain) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// For a horizontal wall at row `y`, find a door-start column in [safe_s, safe_e)
+/// where all DOOR_WIDTH cells have Floor both above (y-1) and below (y+1),
+/// and no existing door within MIN_DOOR_GAP cells in 2D.
+/// Searches outward from `candidate`.
+/// Returns None if no valid position exists.
+fn find_clear_door_h(
+    map: &[Cell], map_w: usize, map_h: usize,
+    y: usize, safe_s: usize, safe_e: usize, candidate: usize,
+) -> Option<usize> {
+    let ok = |start: usize| -> bool {
+        // Check all DOOR_WIDTH cells have Floor above and below (T-junction avoidance).
+        let cells_ok = (0..DOOR_WIDTH).all(|d| {
+            let x = start + d;
+            if x >= safe_e { return false; }
+            let above = y > 0 && map[(y - 1) * map_w + x].terrain == Terrain::Floor;
+            let below = y + 1 < map_h && map[(y + 1) * map_w + x].terrain == Terrain::Floor;
+            above && below
+        });
+        if !cells_ok { return false; }
+        // 2D door-gap check (same-axis + cross-axis).
+        let cells: Vec<(usize, usize)> = (0..DOOR_WIDTH).map(|d| (start + d, y)).collect();
+        no_nearby_doors_2d(map, map_w, map_h, &cells)
+    };
+    if ok(candidate) { return Some(candidate); }
+    let max_offset = safe_e.saturating_sub(safe_s);
+    for off in 1..max_offset {
+        if candidate + off + DOOR_WIDTH <= safe_e && ok(candidate + off) {
+            return Some(candidate + off);
+        }
+        if candidate >= safe_s + off && ok(candidate - off) {
+            return Some(candidate - off);
+        }
+    }
+    None
+}
+
+/// For a vertical wall at column `x`, find a door-start row in [safe_s, safe_e)
+/// where all DOOR_WIDTH cells have Floor both left (x-1) and right (x+1),
+/// and no existing door within MIN_DOOR_GAP cells in 2D.
+fn find_clear_door_v(
+    map: &[Cell], map_w: usize, _map_h: usize,
+    x: usize, safe_s: usize, safe_e: usize, candidate: usize,
+) -> Option<usize> {
+    let map_h = map.len() / map_w;
+    let ok = |start: usize| -> bool {
+        let cells_ok = (0..DOOR_WIDTH).all(|d| {
+            let cy = start + d;
+            if cy >= safe_e { return false; }
+            let left = x > 0 && map[cy * map_w + x - 1].terrain == Terrain::Floor;
+            let right = x + 1 < map_w && map[cy * map_w + x + 1].terrain == Terrain::Floor;
+            left && right
+        });
+        if !cells_ok { return false; }
+        let cells: Vec<(usize, usize)> = (0..DOOR_WIDTH).map(|d| (x, start + d)).collect();
+        no_nearby_doors_2d(map, map_w, map_h, &cells)
+    };
+    if ok(candidate) { return Some(candidate); }
+    let max_offset = safe_e.saturating_sub(safe_s);
+    for off in 1..max_offset {
+        if candidate + off + DOOR_WIDTH <= safe_e && ok(candidate + off) {
+            return Some(candidate + off);
+        }
+        if candidate >= safe_s + off && ok(candidate - off) {
+            return Some(candidate - off);
+        }
+    }
+    None
+}
+
+/// A potential door placement between two groups on a specific wall.
+struct DoorSlot {
+    group_lo: usize,
+    group_hi: usize,
+    wall_idx: usize,
+    /// Union overlap range along the wall axis (x-range for horizontal, y-range for vertical).
+    range_start: usize,
+    range_end: usize,
+}
+
+/// Minimum distance from map edge for door placement.
+/// Doors at BORDER+0 would neighbor Void and be sealed by void_cleanup.
+const DOOR_EDGE_MARGIN: usize = 2;
+
+/// Collect all possible door placements (one per group-pair per wall).
+fn collect_door_slots(
+    leaves: &[BspRect],
+    walls: &[WallLine],
+    leaf_group: &[usize],
+) -> Vec<DoorSlot> {
+    let mut slots: Vec<DoorSlot> = Vec::new();
+    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+
+    for (wi, wall) in walls.iter().enumerate() {
+        pairs.clear();
+        match wall {
+            WallLine::Horizontal { y, x0, x1 } => {
+                for (ai, a) in leaves.iter().enumerate().filter(|(_, r)| r.y + r.h == *y) {
+                    for (bi, b) in leaves.iter().enumerate().filter(|(_, r)| r.y == y + 1) {
+                        let (ga, gb) = (leaf_group[ai], leaf_group[bi]);
+                        if ga == gb { continue; }
+                        // Clip leaf overlap to the wall's actual x-range.
+                        let s = a.x.max(b.x).max(*x0);
+                        let e = (a.x + a.w).min(b.x + b.w).min(*x1);
+                        if e > s {
+                            let (lo, hi) = if ga < gb { (ga, gb) } else { (gb, ga) };
+                            pairs.push((lo, hi, s, e));
+                        }
+                    }
+                }
+            }
+            WallLine::Vertical { x, y0, y1 } => {
+                for (ai, a) in leaves.iter().enumerate().filter(|(_, r)| r.x + r.w == *x) {
+                    for (bi, b) in leaves.iter().enumerate().filter(|(_, r)| r.x == x + 1) {
+                        let (ga, gb) = (leaf_group[ai], leaf_group[bi]);
+                        if ga == gb { continue; }
+                        // Clip leaf overlap to the wall's actual y-range.
+                        let s = a.y.max(b.y).max(*y0);
+                        let e = (a.y + a.h).min(b.y + b.h).min(*y1);
+                        if e > s {
+                            let (lo, hi) = if ga < gb { (ga, gb) } else { (gb, ga) };
+                            pairs.push((lo, hi, s, e));
+                        }
+                    }
+                }
+            }
+        }
+        // Union overlaps per group pair.
+        pairs.sort_by_key(|&(a, b, s, _)| (a, b, s));
+        let mut i = 0;
+        while i < pairs.len() {
+            let (ga, gb, rs, mut re) = pairs[i];
+            while i + 1 < pairs.len() && pairs[i+1].0 == ga && pairs[i+1].1 == gb && pairs[i+1].2 <= re {
+                re = re.max(pairs[i+1].3);
+                i += 1;
+            }
+            i += 1;
+            slots.push(DoorSlot { group_lo: ga, group_hi: gb, wall_idx: wi, range_start: rs, range_end: re });
+        }
+    }
+    slots
+}
+
+/// Cut a single door from a DoorSlot.  Returns true if a door was placed.
+/// The safe range is inset by DOOR_CORNER_MARGIN from the overlap edges
+/// (where perpendicular walls create T-junctions) and DOOR_EDGE_MARGIN
+/// from map edges.
+/// Adaptive corner margin: as large as possible (up to DOOR_CORNER_MARGIN)
+/// while still leaving room for at least one DOOR_WIDTH placement.
+///   margin = min(DOOR_CORNER_MARGIN, (range_width - DOOR_WIDTH - 1) / 2)
+/// Falls back to 0 for narrow ranges; T-junction check in find_clear_door_h/v
+/// still prevents doors at actual wall intersections.
+fn adaptive_margin(range_width: usize) -> usize {
+    DOOR_CORNER_MARGIN
+        .min(range_width.saturating_sub(DOOR_WIDTH + 1) / 2)
+}
+
+fn cut_door_from_slot(
+    map: &mut [Cell],
+    map_w: usize,
+    walls: &[WallLine],
+    slot: &DoorSlot,
+) -> bool {
+    let map_h = map.len() / map_w;
+    let range_width = slot.range_end.saturating_sub(slot.range_start);
+    let margin = adaptive_margin(range_width);
+    match &walls[slot.wall_idx] {
+        WallLine::Horizontal { y, x0, x1 } => {
+            let safe_s = (slot.range_start + margin).max(DOOR_EDGE_MARGIN).max(*x0);
+            let safe_e = slot.range_end.saturating_sub(margin)
+                .min(map_w.saturating_sub(DOOR_EDGE_MARGIN)).min(*x1);
+            if safe_e <= safe_s + DOOR_WIDTH { return false; }
+            let mid = (safe_s + safe_e) / 2;
+            let candidate = mid.saturating_sub(DOOR_WIDTH / 2).max(safe_s);
+            if let Some(dx) = find_clear_door_h(map, map_w, map_h, *y, safe_s, safe_e, candidate) {
+                // Safety: verify entire door fits within wall bounds.
+                if dx + DOOR_WIDTH > *x1 { return false; }
+                for d in 0..DOOR_WIDTH {
+                    map[y * map_w + (dx + d)].terrain = Terrain::DoorOpen;
+                }
+                eprintln!("[doors]     placed H door at y={}, x=[{},{})", *y, dx, dx + DOOR_WIDTH);
+                return true;
+            }
+        }
+        WallLine::Vertical { x, y0, y1 } => {
+            let safe_s = (slot.range_start + margin).max(DOOR_EDGE_MARGIN).max(*y0);
+            let safe_e = slot.range_end.saturating_sub(margin)
+                .min(map_h.saturating_sub(DOOR_EDGE_MARGIN)).min(*y1);
+            if safe_e <= safe_s + DOOR_WIDTH { return false; }
+            let mid = (safe_s + safe_e) / 2;
+            let candidate = mid.saturating_sub(DOOR_WIDTH / 2).max(safe_s);
+            if let Some(dy) = find_clear_door_v(map, map_w, map_h, *x, safe_s, safe_e, candidate) {
+                // Safety: verify entire door fits within wall bounds.
+                if dy + DOOR_WIDTH > *y1 { return false; }
+                for d in 0..DOOR_WIDTH {
+                    map[(dy + d) * map_w + x].terrain = Terrain::DoorOpen;
+                }
+                eprintln!("[doors]     placed V door at x={}, y=[{},{})", *x, dy, dy + DOOR_WIDTH);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Try to place a door for a group-pair by attempting all slots for that pair.
+/// Returns true if a door was successfully placed on the map.
+fn try_place_pair_door(
+    map: &mut [Cell],
+    map_w: usize,
+    walls: &[WallLine],
+    slots: &[DoorSlot],
+    pair_slots: &[usize],
+    used_slots: &mut [bool],
+) -> bool {
+    // Try unused slots first (sorted by range length, longest first).
+    for &si in pair_slots {
+        if used_slots[si] { continue; }
+        if cut_door_from_slot(map, map_w, walls, &slots[si]) {
+            used_slots[si] = true;
+            return true;
+        }
+        // Mark as used even on failure so we don't retry.
+        used_slots[si] = true;
+    }
+    false
+}
+
+/// Try to place a door between groups `a` and `b`, updating tracking state.
+/// Returns true if a door was successfully placed on the map.
+fn try_place_edge(
+    a: usize,
+    b: usize,
+    map: &mut [Cell],
+    map_w: usize,
+    pair_to_slots: &std::collections::HashMap<(usize, usize), Vec<usize>>,
+    slots: &[DoorSlot],
+    walls: &[WallLine],
+    used_slots: &mut [bool],
+    distinct_neighbors: &mut [Vec<usize>],
+    count: &mut usize,
+) -> bool {
+    let edge = if a < b { (a, b) } else { (b, a) };
+    if let Some(pair_slots) = pair_to_slots.get(&edge) {
+        if try_place_pair_door(map, map_w, walls, slots, pair_slots, used_slots) {
+            if !distinct_neighbors[a].contains(&b) { distinct_neighbors[a].push(b); }
+            if !distinct_neighbors[b].contains(&a) { distinct_neighbors[b].push(a); }
+            *count += 1;
+            return true;
+        }
+    }
+    false
+}
+
+/// Search for a Hamiltonian cycle in the adjacency graph via DFS backtracking.
+/// Returns the cycle as a list of nodes if found, None otherwise.
+/// Safe for N ≤ ~15 (BSP room counts are typically 4–8).
+fn find_hamiltonian_cycle(adj: &[Vec<usize>], num_nodes: usize) -> Option<Vec<usize>> {
+    if num_nodes < 3 { return None; }
+
+    let mut path = vec![0usize]; // Start from node 0.
+    let mut in_path = vec![false; num_nodes];
+    in_path[0] = true;
+
+    fn dfs(
+        adj: &[Vec<usize>],
+        path: &mut Vec<usize>,
+        in_path: &mut Vec<bool>,
+        num_nodes: usize,
+    ) -> bool {
+        if path.len() == num_nodes {
+            // Check if last node connects back to node 0 to form a cycle.
+            let last = *path.last().unwrap();
+            return adj[last].contains(&0);
+        }
+        let cur = *path.last().unwrap();
+        for &nbr in &adj[cur] {
+            if !in_path[nbr] {
+                in_path[nbr] = true;
+                path.push(nbr);
+                if dfs(adj, path, in_path, num_nodes) {
+                    return true;
+                }
+                path.pop();
+                in_path[nbr] = false;
+            }
+        }
+        false
+    }
+
+    if dfs(adj, &mut path, &mut in_path, num_nodes) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Find the longest simple cycle in the adjacency graph via DFS.
+/// Returns the cycle as a list of nodes (may not cover all nodes).
+fn find_longest_cycle(adj: &[Vec<usize>], num_nodes: usize) -> Vec<usize> {
+    if num_nodes < 3 { return Vec::new(); }
+
+    let mut best: Vec<usize> = Vec::new();
+
+    // Try starting from each node to increase chance of finding long cycles.
+    for start in 0..num_nodes {
+        let mut path = vec![start];
+        let mut in_path = vec![false; num_nodes];
+        in_path[start] = true;
+
+        fn dfs_longest(
+            adj: &[Vec<usize>],
+            path: &mut Vec<usize>,
+            in_path: &mut Vec<bool>,
+            start: usize,
+            best: &mut Vec<usize>,
+        ) {
+            let cur = *path.last().unwrap();
+            // Check if we can close a cycle back to start (need len >= 3).
+            if path.len() >= 3 && adj[cur].contains(&start) {
+                if path.len() > best.len() {
+                    *best = path.clone();
+                }
+            }
+            // Prune: even if we visit all remaining nodes we can't beat best.
+            // (remaining = total - already_in_path; max possible = path.len() + remaining)
+            let total = in_path.len();
+            let remaining = total - path.len();
+            if path.len() + remaining <= best.len() {
+                return;
+            }
+            for &nbr in &adj[cur] {
+                if !in_path[nbr] {
+                    in_path[nbr] = true;
+                    path.push(nbr);
+                    dfs_longest(adj, path, in_path, start, best);
+                    path.pop();
+                    in_path[nbr] = false;
+                }
+            }
+        }
+
+        dfs_longest(adj, &mut path, &mut in_path, start, &mut best);
+        // Early exit if Hamiltonian cycle found.
+        if best.len() == num_nodes { break; }
+    }
+    best
+}
+
+/// Cut doors between groups using a Hamiltonian-cycle-first algorithm.
+///
+/// Constraint: every room has ≥ 2 doors to different rooms (where possible),
+/// total door count minimized. A Hamiltonian cycle achieves exactly N doors
+/// for N rooms, each with degree 2 to distinct neighbors — the theoretical
+/// minimum.
+///
+/// Algorithm:
+/// 1. Collect all possible door slots.
+/// 2. Build adjacency graph, search for Hamiltonian cycle (DFS backtracking,
+///    feasible for typical BSP room counts of 4–8).
+/// 3. Place doors along cycle edges (interleaved: degree increments only on
+///    successful placement).
+/// 4. Connect any off-cycle nodes (if no Hamiltonian cycle exists, use longest
+///    cycle + attach remaining nodes).
+/// 5. Augmentation: any room with distinct-neighbor count < 2 gets additional
+///    doors. If a room has only 1 neighbor in the adjacency graph, a second
+///    door to the same room is allowed (Option A fallback).
 fn cut_doors(
     map: &mut [Cell],
     map_w: usize,
     leaves: &[BspRect],
     walls: &[WallLine],
     leaf_group: &[usize],
+    num_groups: usize,
 ) -> usize {
-    let map_h = map.len() / map_w;
-    let mut count = 0;
-    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new(); // (g_lo, g_hi, start, end)
+    eprintln!("[doors] === cut_doors: {} groups ===", num_groups);
+    if num_groups <= 1 {
+        eprintln!("[doors] num_groups <= 1, skipping");
+        return 0;
+    }
 
-    /// Minimum distance from map edge for door placement.
-    /// Doors at BORDER+0 would neighbor Void and be sealed by void_cleanup.
-    const DOOR_EDGE_MARGIN: usize = 2;
+    // Phase 1: enumerate all possible door placements.
+    let slots = collect_door_slots(leaves, walls, leaf_group);
+    eprintln!("[doors] Phase1: {} slots collected", slots.len());
+    if slots.is_empty() {
+        eprintln!("[doors] no slots, skipping");
+        return 0;
+    }
 
-    for wall in walls {
-        pairs.clear();
-        match wall {
-            WallLine::Horizontal { y, x0: _, x1 } => {
-                for (ai, a) in leaves.iter().enumerate().filter(|(_, r)| r.y + r.h == *y) {
-                    for (bi, b) in leaves.iter().enumerate().filter(|(_, r)| r.y == y + 1) {
-                        let (ga, gb) = (leaf_group[ai], leaf_group[bi]);
-                        if ga == gb { continue; }
-                        let s = a.x.max(b.x);
-                        let e = (a.x + a.w).min(b.x + b.w);
-                        if e > s {
-                            let (lo, hi) = if ga < gb { (ga, gb) } else { (gb, ga) };
-                            pairs.push((lo, hi, s, e));
-                        }
-                    }
-                }
-                pairs.sort_by_key(|&(a, b, s, _)| (a, b, s));
-                let mut i = 0;
-                while i < pairs.len() {
-                    let (ga, gb, rs, mut re) = pairs[i];
-                    while i + 1 < pairs.len() && pairs[i+1].0 == ga && pairs[i+1].1 == gb && pairs[i+1].2 <= re {
-                        re = re.max(pairs[i+1].3);
-                        i += 1;
-                    }
-                    i += 1;
-                    // Clamp range away from map edges.
-                    let safe_s = rs.max(DOOR_EDGE_MARGIN);
-                    let safe_e = re.min(map_w.saturating_sub(DOOR_EDGE_MARGIN));
-                    if safe_e <= safe_s + DOOR_WIDTH { continue; }
-                    let mid = (safe_s + safe_e) / 2;
-                    let dx = mid.saturating_sub(DOOR_WIDTH / 2).max(safe_s);
-                    for d in 0..DOOR_WIDTH {
-                        let x = dx + d;
-                        if x < *x1 { map[y * map_w + x].terrain = Terrain::DoorOpen; }
-                    }
-                    count += 1;
-                }
+    // Group slots by (group_lo, group_hi).
+    // For each pair, sort by range length descending (prefer longest overlap).
+    let mut pair_to_slots: std::collections::HashMap<(usize, usize), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (si, slot) in slots.iter().enumerate() {
+        pair_to_slots.entry((slot.group_lo, slot.group_hi)).or_default().push(si);
+    }
+    for indices in pair_to_slots.values_mut() {
+        indices.sort_by(|&a, &b| {
+            let len_a = slots[a].range_end - slots[a].range_start;
+            let len_b = slots[b].range_end - slots[b].range_start;
+            len_b.cmp(&len_a)
+        });
+    }
+
+    // Log slot details per pair.
+    for ((a, b), indices) in &pair_to_slots {
+        let ranges: Vec<String> = indices.iter().map(|&si| {
+            let s = &slots[si];
+            format!("w{}:[{},{})", s.wall_idx, s.range_start, s.range_end)
+        }).collect();
+        eprintln!("[doors]   pair({},{}) {} slots: {}", a, b, indices.len(), ranges.join(", "));
+    }
+
+    // Build adjacency list.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); num_groups];
+    for &(a, b) in pair_to_slots.keys() {
+        adj[a].push(b);
+        adj[b].push(a);
+    }
+    for list in &mut adj { list.sort(); list.dedup(); }
+
+    // Log adjacency per group.
+    for g in 0..num_groups {
+        eprintln!("[doors]   group {} adj: {:?}", g, adj[g]);
+    }
+
+    // Track actual placed doors.
+    let mut used_slots = vec![false; slots.len()];
+    // distinct_neighbors[node] = set of rooms connected by actually placed doors.
+    let mut distinct_neighbors: Vec<Vec<usize>> = vec![Vec::new(); num_groups];
+    let mut count = 0usize;
+
+    // Phase 2: search for Hamiltonian cycle.
+    let cycle = find_hamiltonian_cycle(&adj, num_groups);
+
+    if let Some(ref cycle_nodes) = cycle {
+        eprintln!("[doors] Phase2: Hamiltonian cycle found: {:?}", cycle_nodes);
+        for i in 0..cycle_nodes.len() {
+            let a = cycle_nodes[i];
+            let b = cycle_nodes[(i + 1) % cycle_nodes.len()];
+            let ok = try_place_edge(a, b, map, map_w, &pair_to_slots, &slots, walls,
+                           &mut used_slots, &mut distinct_neighbors, &mut count);
+            eprintln!("[doors]   cycle edge ({},{}) -> {}", a, b, if ok {"OK"} else {"FAIL"});
+        }
+    } else {
+        eprintln!("[doors] Phase2: no Hamiltonian cycle");
+        // No Hamiltonian cycle. Use longest cycle + attach remaining nodes.
+        let longest = find_longest_cycle(&adj, num_groups);
+        eprintln!("[doors]   longest cycle: {:?}", longest);
+        let mut on_cycle = vec![false; num_groups];
+
+        if longest.len() >= 3 {
+            for i in 0..longest.len() {
+                let a = longest[i];
+                let b = longest[(i + 1) % longest.len()];
+                on_cycle[a] = true;
+                on_cycle[b] = true;
+                let ok = try_place_edge(a, b, map, map_w, &pair_to_slots, &slots, walls,
+                               &mut used_slots, &mut distinct_neighbors, &mut count);
+                eprintln!("[doors]   cycle edge ({},{}) -> {}", a, b, if ok {"OK"} else {"FAIL"});
             }
-            WallLine::Vertical { x, y0: _, y1 } => {
-                for (ai, a) in leaves.iter().enumerate().filter(|(_, r)| r.x + r.w == *x) {
-                    for (bi, b) in leaves.iter().enumerate().filter(|(_, r)| r.x == x + 1) {
-                        let (ga, gb) = (leaf_group[ai], leaf_group[bi]);
-                        if ga == gb { continue; }
-                        let s = a.y.max(b.y);
-                        let e = (a.y + a.h).min(b.y + b.h);
-                        if e > s {
-                            let (lo, hi) = if ga < gb { (ga, gb) } else { (gb, ga) };
-                            pairs.push((lo, hi, s, e));
+        }
+
+        // Attach off-cycle nodes via BFS.
+        let mut attached = on_cycle.clone();
+        let mut bfs_q = std::collections::VecDeque::new();
+        for &node in &longest { bfs_q.push_back(node); }
+        if longest.is_empty() {
+            attached[0] = true;
+            bfs_q.push_back(0);
+        }
+
+        while let Some(u) = bfs_q.pop_front() {
+            for &v in &adj[u] {
+                if !attached[v] {
+                    attached[v] = true;
+                    eprintln!("[doors]   attaching off-cycle node {} (from {})", v, u);
+                    let mut placed_count = 0;
+                    let nbrs: Vec<usize> = adj[v].clone();
+                    for &nbr in &nbrs {
+                        if !attached[nbr] && nbr != u { continue; }
+                        if distinct_neighbors[v].contains(&nbr) { continue; }
+                        let ok = try_place_edge(v, nbr, map, map_w, &pair_to_slots, &slots, walls,
+                                          &mut used_slots, &mut distinct_neighbors, &mut count);
+                        eprintln!("[doors]     edge ({},{}) -> {}", v, nbr, if ok {"OK"} else {"FAIL"});
+                        if ok {
+                            placed_count += 1;
+                            if placed_count >= 2 { break; }
                         }
                     }
-                }
-                pairs.sort_by_key(|&(a, b, s, _)| (a, b, s));
-                let mut i = 0;
-                while i < pairs.len() {
-                    let (ga, gb, rs, mut re) = pairs[i];
-                    while i + 1 < pairs.len() && pairs[i+1].0 == ga && pairs[i+1].1 == gb && pairs[i+1].2 <= re {
-                        re = re.max(pairs[i+1].3);
-                        i += 1;
+                    if placed_count < 1 && !distinct_neighbors[v].contains(&u) {
+                        let ok = try_place_edge(v, u, map, map_w, &pair_to_slots, &slots, walls,
+                                       &mut used_slots, &mut distinct_neighbors, &mut count);
+                        eprintln!("[doors]     fallback edge ({},{}) -> {}", v, u, if ok {"OK"} else {"FAIL"});
                     }
-                    i += 1;
-                    // Clamp range away from map edges.
-                    let safe_s = rs.max(DOOR_EDGE_MARGIN);
-                    let safe_e = re.min(map_h.saturating_sub(DOOR_EDGE_MARGIN));
-                    if safe_e <= safe_s + DOOR_WIDTH { continue; }
-                    let mid = (safe_s + safe_e) / 2;
-                    let dy = mid.saturating_sub(DOOR_WIDTH / 2).max(safe_s);
-                    for d in 0..DOOR_WIDTH {
-                        let y = dy + d;
-                        if y < *y1 { map[y * map_w + x].terrain = Terrain::DoorOpen; }
-                    }
-                    count += 1;
+                    bfs_q.push_back(v);
                 }
             }
         }
     }
+
+    // Phase 3: augmentation — ensure every room has ≥ MIN_DISTINCT_NEIGHBORS
+    // doors to distinct rooms. If a room has only 1 neighbor in the adjacency
+    // graph, allow a second door to the same room (Option A).
+    const MIN_DISTINCT_NEIGHBORS: usize = 2;
+
+    eprintln!("[doors] Phase3: augmentation (pre-state):");
+    for g in 0..num_groups {
+        eprintln!("[doors]   group {} distinct_nbrs: {:?}", g, distinct_neighbors[g]);
+    }
+
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for node in 0..num_groups {
+            while distinct_neighbors[node].len() < MIN_DISTINCT_NEIGHBORS {
+                let mut placed = false;
+                let node_adj: Vec<usize> = adj[node].clone();
+                // First pass: try NEW (unconnected) neighbors.
+                for &nbr in &node_adj {
+                    if distinct_neighbors[node].contains(&nbr) { continue; }
+                    let ok = try_place_edge(node, nbr, map, map_w, &pair_to_slots, &slots, walls,
+                                      &mut used_slots, &mut distinct_neighbors, &mut count);
+                    eprintln!("[doors]   aug new ({},{}) -> {}", node, nbr, if ok {"OK"} else {"FAIL"});
+                    if ok {
+                        placed = true;
+                        progress = true;
+                        break;
+                    }
+                }
+                if placed { continue; }
+                // Second pass (Option A): duplicate door to existing neighbor.
+                for &nbr in &node_adj {
+                    let edge = if node < nbr { (node, nbr) } else { (nbr, node) };
+                    let has_untried = pair_to_slots.get(&edge)
+                        .map(|ss| ss.iter().any(|&si| !used_slots[si]))
+                        .unwrap_or(false);
+                    if !has_untried { continue; }
+                    if let Some(pair_slots) = pair_to_slots.get(&edge) {
+                        if try_place_pair_door(map, map_w, walls, &slots, pair_slots, &mut used_slots) {
+                            count += 1;
+                            placed = true;
+                            progress = true;
+                            eprintln!("[doors]   aug optA ({},{}) -> OK (dup door)", node, nbr);
+                            break;
+                        } else {
+                            eprintln!("[doors]   aug optA ({},{}) -> FAIL", node, nbr);
+                        }
+                    }
+                }
+                if !placed {
+                    eprintln!("[doors]   aug node {} STUCK: no slots left, distinct_nbrs={:?}", node, distinct_neighbors[node]);
+                    break;
+                }
+                // Option A doesn't increase distinct count → break to avoid infinite loop.
+                break;
+            }
+        }
+    }
+
+    // Final summary.
+    eprintln!("[doors] === result: {} doors placed ===", count);
+    for g in 0..num_groups {
+        eprintln!("[doors]   group {} -> {} distinct neighbors: {:?}", g, distinct_neighbors[g].len(), distinct_neighbors[g]);
+    }
+
     count
 }
 
@@ -822,34 +1422,46 @@ fn execute_merge_wall_removal(
     walls: &[WallLine], leaves: &[BspRect],
     uf: &mut UnionFind, edges: &[LeafEdge],
 ) {
+    let mut removed_count = 0usize;
+    let mut edge_count = 0usize;
+    eprintln!("[merge] === merge wall removal: {} edges, {} leaves ===", edges.len(), leaves.len());
     for edge in edges {
         if uf.find(edge.a) != uf.find(edge.b) { continue; }
+        edge_count += 1;
         let (la, lb) = (&leaves[edge.a], &leaves[edge.b]);
+        let group = uf.find(edge.a);
         match &walls[edge.wall_idx] {
             WallLine::Horizontal { y, .. } => {
                 let ox0 = la.x.max(lb.x);
                 let ox1 = (la.x + la.w).min(lb.x + lb.w);
+                let mut seg_removed = 0usize;
                 for x in ox0..ox1 {
-                    if map[y*map_w+x].terrain == Terrain::Wall { map[y*map_w+x].terrain = Terrain::Floor; }
+                    if map[y*map_w+x].terrain == Terrain::Wall { map[y*map_w+x].terrain = Terrain::Floor; seg_removed += 1; }
                     for d in 1..=DOOR_APPROACH_DEPTH {
-                        if *y >= d { let ci=(y-d)*map_w+x; if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; } }
-                        if y+d < map_h { let ci=(y+d)*map_w+x; if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; } }
+                        if *y >= d { let ci=(y-d)*map_w+x; if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; seg_removed += 1; } }
+                        if y+d < map_h { let ci=(y+d)*map_w+x; if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; seg_removed += 1; } }
                     }
                 }
+                eprintln!("[merge]   H leaf({},{}) g{} w{} y={} x=[{},{}) removed={}", edge.a, edge.b, group, edge.wall_idx, y, ox0, ox1, seg_removed);
+                removed_count += seg_removed;
             }
             WallLine::Vertical { x, .. } => {
                 let oy0 = la.y.max(lb.y);
                 let oy1 = (la.y + la.h).min(lb.y + lb.h);
+                let mut seg_removed = 0usize;
                 for y in oy0..oy1 {
-                    if map[y*map_w+x].terrain == Terrain::Wall { map[y*map_w+x].terrain = Terrain::Floor; }
+                    if map[y*map_w+x].terrain == Terrain::Wall { map[y*map_w+x].terrain = Terrain::Floor; seg_removed += 1; }
                     for d in 1..=DOOR_APPROACH_DEPTH {
-                        if *x >= d { let ci=y*map_w+(x-d); if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; } }
-                        if x+d < map_w { let ci=y*map_w+(x+d); if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; } }
+                        if *x >= d { let ci=y*map_w+(x-d); if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; seg_removed += 1; } }
+                        if x+d < map_w { let ci=y*map_w+(x+d); if map[ci].terrain==Terrain::Wall { map[ci].terrain=Terrain::Floor; seg_removed += 1; } }
                     }
                 }
+                eprintln!("[merge]   V leaf({},{}) g{} w{} x={} y=[{},{}) removed={}", edge.a, edge.b, group, edge.wall_idx, x, oy0, oy1, seg_removed);
+                removed_count += seg_removed;
             }
         }
     }
+    eprintln!("[merge] === result: {} same-group edges processed, {} wall cells removed ===", edge_count, removed_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,19 +1639,23 @@ fn force_door(map: &mut [Cell], map_w: usize, wall: &WallLine, rng: &mut impl Fn
     let map_h = map.len() / map_w;
     match wall {
         WallLine::Horizontal { y, x0, x1 } => {
-            // Clamp range away from map edges.
             let safe_lo = (*x0).max(FORCE_DOOR_EDGE_MARGIN);
             let safe_hi = (*x1).min(map_w.saturating_sub(FORCE_DOOR_EDGE_MARGIN));
             if safe_hi <= safe_lo + DOOR_WIDTH { return; }
-            let pos = rand_range(rng, safe_lo, safe_hi - DOOR_WIDTH);
-            for d in 0..DOOR_WIDTH { map[y*map_w+(pos+d)].terrain = Terrain::DoorOpen; }
+            // Use find_clear_door_h for T-junction avoidance + door-gap enforcement.
+            let candidate = rand_range(rng, safe_lo, safe_hi - DOOR_WIDTH);
+            if let Some(pos) = find_clear_door_h(map, map_w, map_h, *y, safe_lo, safe_hi, candidate) {
+                for d in 0..DOOR_WIDTH { map[y*map_w+(pos+d)].terrain = Terrain::DoorOpen; }
+            }
         }
         WallLine::Vertical { x, y0, y1 } => {
             let safe_lo = (*y0).max(FORCE_DOOR_EDGE_MARGIN);
             let safe_hi = (*y1).min(map_h.saturating_sub(FORCE_DOOR_EDGE_MARGIN));
             if safe_hi <= safe_lo + DOOR_WIDTH { return; }
-            let pos = rand_range(rng, safe_lo, safe_hi - DOOR_WIDTH);
-            for d in 0..DOOR_WIDTH { map[(pos+d)*map_w+x].terrain = Terrain::DoorOpen; }
+            let candidate = rand_range(rng, safe_lo, safe_hi - DOOR_WIDTH);
+            if let Some(pos) = find_clear_door_v(map, map_w, map_h, *x, safe_lo, safe_hi, candidate) {
+                for d in 0..DOOR_WIDTH { map[(pos+d)*map_w+x].terrain = Terrain::DoorOpen; }
+            }
         }
     }
 }
