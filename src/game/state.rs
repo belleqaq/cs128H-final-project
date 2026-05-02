@@ -13,7 +13,7 @@ use crate::game::cell::{idx, Cell, Terrain, compute_passage_width, build_subgoal
 use crate::game::config::GameConfig;
 use crate::game::npc::{self as npc_mod, Npc, SteerWeights};
 use crate::game::physics;
-use crate::game::room::{self, Room};
+use crate::game::room::{self, Room, RoomKind};
 use crate::game::BASELINE_TICK_MS;
 
 // ---------------------------------------------------------------------------
@@ -248,12 +248,25 @@ fn find_walkable_start(map: &[Cell], w: i32, h: i32) -> (f32, f32) {
 }
 
 impl State {
-    pub fn new(config: &GameConfig, map: Vec<Cell>, w: i32, h: i32, cell_kinds: &[Option<room::RoomKind>], requested_rooms: &[room::RoomKind]) -> Self {
+    pub fn new(config: &GameConfig, mut map: Vec<Cell>, w: i32, h: i32, cell_kinds: &[Option<room::RoomKind>], requested_rooms: &[room::RoomKind]) -> Self {
         // Find a walkable starting position near map center.
         let start = find_walkable_start(&map, w, h);
         let pw = compute_passage_width(&map, w, h);
         let sg = build_subgoal_graph(&map, w, h);
         let (rooms, tile_to_room) = room::build_rooms(&map, w, h, &sg, cell_kinds, requested_rooms);
+
+        // Paint Toilet terrain on floor cells in Toilet rooms.
+        for room in &rooms {
+            if room.kind == RoomKind::Toilet {
+                for &(tx, ty) in &room.tiles {
+                    let i = idx(tx, ty, w);
+                    if map[i].terrain == Terrain::Floor {
+                        map[i].terrain = Terrain::Toilet;
+                    }
+                }
+            }
+        }
+
         let mut s = Self {
             map,
             map_w: w,
@@ -370,8 +383,15 @@ impl State {
     // -- Input --
 
     pub fn set_input(&mut self, left: bool, right: bool, up: bool, down: bool, run: bool, e_down: bool, e_pressed: bool) {
-        self.input_x = right as i32 - left as i32;
-        self.input_y = down as i32 - up as i32;
+        // Isometric input rotation: screen directions → world grid directions.
+        // W (screen up)    → world (-1, -1)  (northwest)
+        // S (screen down)  → world (+1, +1)  (southeast)
+        // A (screen left)  → world (-1, +1)  (southwest)
+        // D (screen right) → world (+1, -1)  (northeast)
+        let screen_x = right as i32 - left as i32;
+        let screen_y = down as i32 - up as i32;
+        self.input_x = screen_x + screen_y;
+        self.input_y = screen_y - screen_x;
         self.input_run = run;
         self.input_e_down = e_down;
         self.input_e_pressed = e_pressed;
@@ -415,16 +435,21 @@ impl State {
         x
     }
 
-    /// Pick a random 2×2 Floor area for the star objective.
+    /// Pick a random 2×2 Floor area in a Normal room for the star objective.
     fn spawn_star(&mut self) {
-        // Collect top-left corners where all 4 tiles are Floor.
+        // Collect top-left corners where all 4 tiles are Floor in a Normal room.
         let candidates: Vec<(i32, i32)> = (0..self.map_h - 1)
             .flat_map(|y| (0..self.map_w - 1).map(move |x| (x, y)))
             .filter(|&(x, y)| {
-                self.map[idx(x, y, self.map_w)].terrain == Terrain::Floor
+                // All 4 cells must be Floor.
+                let all_floor = self.map[idx(x, y, self.map_w)].terrain == Terrain::Floor
                     && self.map[idx(x + 1, y, self.map_w)].terrain == Terrain::Floor
                     && self.map[idx(x, y + 1, self.map_w)].terrain == Terrain::Floor
-                    && self.map[idx(x + 1, y + 1, self.map_w)].terrain == Terrain::Floor
+                    && self.map[idx(x + 1, y + 1, self.map_w)].terrain == Terrain::Floor;
+                if !all_floor { return false; }
+                // Top-left cell must be in a Normal room.
+                let ri = self.tile_to_room[idx(x, y, self.map_w)];
+                ri != usize::MAX && self.rooms[ri].kind == RoomKind::Normal
             })
             .collect();
 
@@ -674,6 +699,9 @@ impl State {
         self.steer_weights.pid_kd = kd;
         self.steer_weights.pid_ki = ki;
         // Chase update: check vision, manage chase state (before movement).
+        // v9: only Pooping (at star outside toilet) triggers chase; UsingToilet
+        // is legitimate and ignored. Maintenance phase doesn't need this gate.
+        let player_pooping = matches!(self.move_state, MoveState::Pooping(_));
         crate::game::chase::update_chase(
             &mut self.npcs,
             &self.chase_config,
@@ -685,6 +713,7 @@ impl State {
             &self.subgoal_graph,
             &self.rooms,
             &self.tile_to_room,
+            player_pooping,
         );
         Self::tick_npcs(&mut self.npcs, &npc_params, &self.steer_weights, &self.map, self.map_w, self.map_h, self.tick_ms, &mut self.rng_state);
 

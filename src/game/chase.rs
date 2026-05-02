@@ -296,7 +296,116 @@ fn can_see_tile(
     line_of_sight_vision(map, map_w, map_h, a, tile, door_blocks_vision)
 }
 
-fn line_of_sight_vision(
+/// Player FOV — radial 360° lit cells. Includes the wall cells that terminate
+/// each ray (so walls at vision boundary render normally — the building
+/// outlines you can see in Darkwood-style fog of war).
+///
+/// `range` is in world cells. Returned list may contain duplicates if multiple
+/// rays cross the same cell — caller should dedup if needed.
+pub fn compute_lit_cells_radial(
+    pos: (f32, f32),
+    map: &[Cell],
+    map_w: i32,
+    map_h: i32,
+    range: f32,
+    door_blocks_vision: bool,
+) -> Vec<(i32, i32)> {
+    let mut lit: Vec<(i32, i32)> = Vec::new();
+    let cx = pos.0.floor() as i32;
+    let cy = pos.1.floor() as i32;
+    // Clamp r_int to map dimensions so callers can pass "effectively
+    // unlimited" (e.g. 1e6) without producing an infinite outer loop.
+    let r_int = (range.ceil() as i32).max(0).min(map_w + map_h);
+    let r_sq = range * range;
+
+    // Cast a ray to every cell in bounding box; record every cell crossed
+    // (including the terminating wall, which IS visible — it's what you see
+    // bounding your vision).
+    for dy in -r_int..=r_int {
+        for dx in -r_int..=r_int {
+            let tx = cx + dx;
+            let ty = cy + dy;
+            if tx < 0 || ty < 0 || tx >= map_w || ty >= map_h { continue; }
+            let dist_sq = (tx as f32 + 0.5 - pos.0).powi(2)
+                        + (ty as f32 + 0.5 - pos.1).powi(2);
+            if dist_sq > r_sq { continue; }
+
+            // Bresenham — record every crossed cell, stop at blocker.
+            let mut x = cx;
+            let mut y = cy;
+            let dx_abs = (tx - cx).abs();
+            let dy_abs = (ty - cy).abs();
+            let sx = if cx < tx { 1 } else { -1 };
+            let sy = if cy < ty { 1 } else { -1 };
+            let mut err = dx_abs - dy_abs;
+            loop {
+                if x < 0 || x >= map_w || y < 0 || y >= map_h { break; }
+                lit.push((x, y));
+                let terrain = map[idx(x, y, map_w)].terrain;
+                if terrain.blocks_vision() {
+                    let allow = terrain == Terrain::DoorOpen && !door_blocks_vision;
+                    if !allow { break; }  // wall already pushed; stop ray
+                }
+                if x == tx && y == ty { break; }
+                let e2 = 2 * err;
+                if e2 > -dy_abs { err -= dy_abs; x += sx; }
+                if e2 <  dx_abs { err += dx_abs; y += sy; }
+            }
+        }
+    }
+    lit
+}
+
+/// NPC FOV — cone with `fov_half_cos` and `range`. Used by debug overlay.
+/// `fov_half_cos` = cos(half cone angle). 1.0 = forward only, 0.0 = 180°,
+/// -1.0 = full circle.
+pub fn compute_visible_cells(
+    npc: &Npc,
+    map: &[Cell],
+    map_w: i32,
+    map_h: i32,
+    fov_half_cos: f32,
+    range: f32,
+    door_blocks_vision: bool,
+) -> Vec<(i32, i32)> {
+    let mut visible: Vec<(i32, i32)> = Vec::new();
+    let nx = npc.pos.0;
+    let ny = npc.pos.1;
+    let r_int = range.ceil() as i32;
+    let r_sq = range * range;
+    let cx = nx.floor() as i32;
+    let cy = ny.floor() as i32;
+
+    for dy in -r_int..=r_int {
+        for dx in -r_int..=r_int {
+            let tx = cx + dx;
+            let ty = cy + dy;
+            if tx < 0 || ty < 0 || tx >= map_w || ty >= map_h { continue; }
+            let cell_x = tx as f32 + 0.5;
+            let cell_y = ty as f32 + 0.5;
+            let dist_x = cell_x - nx;
+            let dist_y = cell_y - ny;
+            let dist_sq = dist_x * dist_x + dist_y * dist_y;
+            if dist_sq > r_sq { continue; }
+            // NPC's own cell always visible.
+            if dist_sq < 1e-6 {
+                visible.push((tx, ty));
+                continue;
+            }
+            // FOV cone test.
+            let inv = 1.0 / dist_sq.sqrt();
+            let dot = npc.facing.0 * dist_x * inv + npc.facing.1 * dist_y * inv;
+            if dot < fov_half_cos { continue; }
+            // LoS via existing Bresenham helper.
+            if line_of_sight_vision(map, map_w, map_h, (cx, cy), (tx, ty), door_blocks_vision) {
+                visible.push((tx, ty));
+            }
+        }
+    }
+    visible
+}
+
+pub(crate) fn line_of_sight_vision(
     map: &[Cell],
     map_w: i32,
     map_h: i32,
@@ -417,6 +526,10 @@ fn door_between_rooms(
 // Main update
 // ---------------------------------------------------------------------------
 
+/// v9: NPC only triggers chase when player is committing the "crime" (pooping
+/// at a star location, i.e. MoveState::Pooping). Pooping in a toilet
+/// (UsingToilet) is legal and does NOT trigger. Once chase is active, NPC
+/// continues pursuing on LoS regardless of player's MoveState.
 pub fn update_chase(
     npcs: &mut [Npc],
     config: &ChaseConfig,
@@ -428,6 +541,7 @@ pub fn update_chase(
     sg: &SubgoalGraph,
     rooms: &[Room],
     tile_to_room: &[usize],
+    player_pooping: bool,
 ) {
     if !config.enabled {
         for npc in npcs.iter_mut() {
@@ -450,7 +564,12 @@ pub fn update_chase(
     };
 
     for (i, npc) in npcs.iter_mut().enumerate() {
-        let sees_player = can_see_player(npc, player_pos, config.fov_dot, map, map_w, map_h, config.door_blocks_vision);
+        let los_to_player = can_see_player(npc, player_pos, config.fov_dot, map, map_w, map_h, config.door_blocks_vision);
+        // v9 trigger gate: only consider player "seen" for chase purposes when
+        // they're committing the crime (pooping outside toilet). Once chase is
+        // active, regular LoS keeps it alive — player can't escape just by
+        // standing up.
+        let sees_player = los_to_player && (player_pooping || npc.chase.active);
 
         // --- Catch check ---
         let dx_p = player_pos.0 - npc.pos.0;

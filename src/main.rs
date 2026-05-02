@@ -4,7 +4,9 @@
 
 mod game;
 
-use game::cell::{idx, Cell, Furniture, Terrain};
+use game::cell::{idx, Cell, Terrain};
+#[allow(unused_imports)]
+use game::cell::Furniture;
 use game::npc::{ActivityPhase, AlertState, Npc, NpcActivity, NpcRoutine, STEER_SLOTS};
 use game::rooms::{generate_map, MapGenConfig};
 use game::room::RoomKind;
@@ -14,7 +16,829 @@ use macroquad::prelude::*;
 
 use std::io::Write as IoWrite;
 
+/// Tile size in pixels (used for HUD scaling and collision debug display).
 const TILE_SIZE: f32 = 32.0;
+
+// ---------------------------------------------------------------------------
+// Isometric rendering constants
+// ---------------------------------------------------------------------------
+
+/// Half-height of an isometric tile diamond (screen pixels).
+const ISO_HH: f32 = 32.0;
+/// Half-width of an isometric tile diamond (screen pixels).
+/// ISO_HW = ISO_HH * √3 for true isometric (regular hexagon).
+const ISO_HW: f32 = 55.4;
+/// Wall extrusion height for one tile (screen pixels).
+/// Equals 2 × ISO_HH so that the three visible faces form a regular hexagon.
+const WALL_ISO_H: f32 = 64.0;
+/// Door frame height when closed (screen pixels).
+const DOOR_CLOSED_H: f32 = 56.0;
+/// Door frame height when open (screen pixels) — just the low frame.
+const DOOR_OPEN_H: f32 = 10.0;
+/// Inner wall height as fraction of outer wall height.
+const INNER_WALL_H_RATIO: f32 = 0.6;
+
+/// Alpha applied to walls/doors that visually occlude the player (0.0–1.0).
+const OCCLUDE_ALPHA: f32 = 0.38;
+
+// --- Legacy v8 constants (kept per CLAUDE.md rule 4 — referenced by dead
+// draw_iso_box_ex / draw_iso_box / draw_iso_box_outline used in old textured
+// path). v9 uses PALETTE_C_WALL + contrast-driven outline below. ---
+const ISO_OUTLINE: Color = color_u8!(32, 18, 16, 255);
+const ISO_WALL_COLOR: Color = color_u8!(120, 105, 90, 255);
+const ISO_DOOR_CLOSED: Color = color_u8!(130, 95, 55, 255);
+const ISO_DOOR_OPEN: Color = color_u8!(110, 85, 50, 255);
+
+// =====================================================================
+// v9 ART STYLE — Option C (muted pastel) palette.
+// See output/ART_STYLE.md for full spec.
+// Walls: 2 triangles per face = lit + shade tier (色纯光影不纯).
+// Outlines: contrast-driven, computed at draw time from face fill.
+// =====================================================================
+
+/// Wall facet palette: 6 colors per face × 2 tiers.
+struct WallPalette {
+    top_lit: Color,
+    top_shade: Color,
+    sw_lit: Color,
+    sw_shade: Color,
+    se_lit: Color,
+    se_shade: Color,
+}
+
+/// Default wall palette — Option C (peach / warm-brown family).
+const PALETTE_C_WALL: WallPalette = WallPalette {
+    top_lit:   color_u8!(245, 214, 194, 255), // #f5d6c2
+    top_shade: color_u8!(232, 192, 168, 255), // #e8c0a8
+    sw_lit:    color_u8!(200, 154, 138, 255), // #c89a8a
+    sw_shade:  color_u8!(168, 122, 106, 255), // #a87a6a
+    se_lit:    color_u8!(138,  94,  88, 255), // #8a5e58
+    se_shade:  color_u8!(104,  72,  67, 255), // #684843
+};
+
+/// Floor checker tile colors per RoomKind — derived from Option C with hue shift.
+const ISO_FLOOR_NORMAL: (Color, Color) = (
+    color_u8!(245, 214, 194, 255), // #f5d6c2 — peach (lit)
+    color_u8!(232, 192, 168, 255), // #e8c0a8 — peach (shade)
+);
+const ISO_FLOOR_TOILET: (Color, Color) = (
+    color_u8!(206, 224, 232, 255), // #cee0e8 — cool blue (lit)
+    color_u8!(188, 208, 216, 255), // #bcd0d8 — cool blue (shade)
+);
+const ISO_FLOOR_TRASH: (Color, Color) = (
+    color_u8!(218, 216, 168, 255), // #dad8a8 — olive (lit)
+    color_u8!(200, 194, 148, 255), // #c8c294 — olive (shade)
+);
+const ISO_FLOOR_CORRIDOR: (Color, Color) = (
+    color_u8!(224, 212, 202, 255), // #e0d4ca — desat peach (lit)
+    color_u8!(206, 191, 178, 255), // #cebfb2 — desat peach (shade)
+);
+/// Door cell uses a saturated warm peach for slight contrast vs. surrounding floor.
+const ISO_FLOOR_DOOR: Color = color_u8!(235, 180, 145, 255);
+
+// =====================================================================
+// v9 Vision overlay — see output/VISION_DESIGN.md.
+// MVP: idle vs alert tier (drives color + range + cone width from chase.active).
+// =====================================================================
+
+/// Range in world cells when NPC is unaware.
+const VISION_RANGE_IDLE: f32 = 6.0;
+/// Range when NPC is actively chasing (chase.active == true).
+const VISION_RANGE_ALERT: f32 = 12.0;
+/// Cone half-angle cosine — idle = 60° → cos(60°) = 0.5 (wide).
+const VISION_FOV_HALF_COS_IDLE: f32 = 0.5;
+/// Cone half-angle cosine — alert = 30° → cos(30°) ≈ 0.866 (narrow & focused).
+const VISION_FOV_HALF_COS_ALERT: f32 = 0.866;
+/// Floor overlay tint when NPC unaware — warm cream, very faint.
+const VISION_TINT_IDLE: Color = color_u8!(245, 220, 180, 24);
+/// Floor overlay tint when NPC chasing — warm red, more opaque.
+const VISION_TINT_ALERT: Color = color_u8!(220, 100, 80, 85);
+
+// =====================================================================
+// v9 Player FOV + Fog of War (Darkwood style).
+// Player has radial 360° vision; cells outside it get fog-blended.
+// =====================================================================
+
+/// Player vision radius in world cells. Effectively unlimited — true LoS is
+/// the only limit. Function clamps to map dimensions internally.
+const PLAYER_VISION_RANGE: f32 = 1e6;
+/// Cool-dark tint that fog-blended colors lerp toward — gray-blue, not pure black.
+const FOG_TINT: Color = color_u8!(38, 36, 50, 255);
+/// Floor blend factor: 0 = unchanged, 1 = pure FOG_TINT. Floor goes heavy.
+const FOG_BLEND_FLOOR: f32 = 0.72;
+/// Wall blend factor: less aggressive than floor so silhouettes still read.
+const FOG_BLEND_WALL: f32 = 0.50;
+/// Star marker (pooping target) — amber, replaces yellow per art-direction call.
+const STAR_AMBER: Color = color_u8!(232, 144, 80, 255);
+/// Star core highlight (lightest pulse tip).
+const STAR_AMBER_HOT: Color = color_u8!(255, 192, 130, 255);
+
+// =====================================================================
+// v9 NPC Awareness — sound ripples (A) + close-range silhouette (B).
+// =====================================================================
+
+/// Speed below which an NPC is considered "stationary" — emits no ripple.
+const RIPPLE_SPEED_THRESHOLD: f32 = 0.05;
+/// Ripple base size (iso ellipse, fits roughly inside one floor diamond).
+const RIPPLE_BASE_RX: f32 = 22.0;
+const RIPPLE_BASE_RY: f32 = 11.0;
+/// How many times the base size the ripple reaches at maximum expansion.
+const RIPPLE_GROW_FACTOR: f32 = 2.6;
+/// Seconds per ripple cycle when patrolling.
+const RIPPLE_PERIOD_NORMAL: f32 = 1.5;
+/// Faster pulses when actively chasing — danger feedback.
+const RIPPLE_PERIOD_ALERT: f32 = 0.7;
+/// Ripple color when NPC is unaware (warm gray, neutral).
+const RIPPLE_COLOR_NORMAL: Color = color_u8!(192, 184, 168, 255);
+/// Ripple color when NPC has detected target — red, "已索敌".
+const RIPPLE_COLOR_ALERT: Color = color_u8!(200, 64, 80, 255);
+
+/// "Spider sense" range: NPCs within this distance are visible as a faint
+/// silhouette even outside the player's line of sight. Conveys "there's
+/// somebody very close" without revealing exact pose / alert state.
+const NPC_PROXIMITY_RANGE: f32 = 3.5;
+/// Alpha for silhouette mode.
+const NPC_SILHOUETTE_ALPHA: f32 = 0.40;
+/// Blend factor toward FOG_TINT for silhouette colors.
+const NPC_SILHOUETTE_BLEND: f32 = 0.55;
+
+/// Lerp two colors by `t` ∈ [0,1].
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    let inv = 1.0 - t;
+    Color::new(
+        a.r * inv + b.r * t,
+        a.g * inv + b.g * t,
+        a.b * inv + b.b * t,
+        a.a * inv + b.a * t,
+    )
+}
+
+/// Fog-blend a floor color (heavy darken, hue preserved).
+fn fog_blend_floor(c: Color) -> Color {
+    blend_color(c, FOG_TINT, FOG_BLEND_FLOOR)
+}
+
+/// Fog-blend a wall color (medium darken, silhouette readable).
+fn fog_blend_wall(c: Color) -> Color {
+    blend_color(c, FOG_TINT, FOG_BLEND_WALL)
+}
+
+/// Build a fog-darkened wall palette for use with `draw_iso_box_facet`.
+fn fog_wall_palette() -> WallPalette {
+    WallPalette {
+        top_lit:   fog_blend_wall(PALETTE_C_WALL.top_lit),
+        top_shade: fog_blend_wall(PALETTE_C_WALL.top_shade),
+        sw_lit:    fog_blend_wall(PALETTE_C_WALL.sw_lit),
+        sw_shade:  fog_blend_wall(PALETTE_C_WALL.sw_shade),
+        se_lit:    fog_blend_wall(PALETTE_C_WALL.se_lit),
+        se_shade:  fog_blend_wall(PALETTE_C_WALL.se_shade),
+    }
+}
+
+// Dead (kept per CLAUDE.md rule 4 — old textured atlas + black outline path):
+//   ISO_OUTLINE, ISO_WALL_COLOR, ISO_DOOR_CLOSED, ISO_DOOR_OPEN — replaced
+//   by PALETTE_C_WALL + contrast-driven outline. Old constants live as
+//   compile-warned dead code in the file's history. Run `cargo fix` if you
+//   want them gone.
+
+// ---------------------------------------------------------------------------
+// Isometric projection helpers
+// ---------------------------------------------------------------------------
+
+/// Convert world grid position to screen position relative to camera.
+/// Camera is at (cam_gx, cam_gy); result is centered on screen.
+fn iso_w2s(gx: f32, gy: f32, cam_gx: f32, cam_gy: f32) -> (f32, f32) {
+    let dx = gx - cam_gx;
+    let dy = gy - cam_gy;
+    (
+        (dx - dy) * ISO_HW + screen_width() * 0.5,
+        (dx + dy) * ISO_HH + screen_height() * 0.5,
+    )
+}
+
+/// Depth value for back-to-front sorting. Higher = closer to camera.
+fn iso_depth(gx: f32, gy: f32) -> f32 {
+    gx + gy + gx * 0.001
+}
+
+/// Darken a color by a factor (0.0 = black, 1.0 = unchanged).
+fn darken(c: Color, factor: f32) -> Color {
+    Color::new(c.r * factor, c.g * factor, c.b * factor, c.a)
+}
+
+/// Apply an alpha multiplier to a color.
+fn with_alpha(c: Color, a: f32) -> Color {
+    Color::new(c.r, c.g, c.b, c.a * a)
+}
+
+/// Check if an iso box at (item_sx, item_sy) with height `item_h`
+/// visually overlaps the player's screen-space bounding box.
+/// All coordinates are screen pixels.
+fn item_occludes_player(
+    item_sx: f32, item_sy: f32, item_h: f32,
+    player_sx: f32, player_sy: f32, actor_total_h: f32,
+) -> bool {
+    // Item's screen-space bounding box (iso box silhouette).
+    let item_left = item_sx - ISO_HW;
+    let item_right = item_sx + ISO_HW;
+    let item_top = item_sy - ISO_HH - item_h;
+    let item_bottom = item_sy + ISO_HH;
+
+    // Player's screen-space bounding box (body + head).
+    /// Actor screen half-width: same as body footprint used in draw_iso_actor_box.
+    const PLAYER_SCREEN_HW: f32 = ISO_HW * 0.4;
+    let player_left = player_sx - PLAYER_SCREEN_HW;
+    let player_right = player_sx + PLAYER_SCREEN_HW;
+    let player_top = player_sy - actor_total_h;
+    let player_bottom = player_sy;
+
+    // AABB overlap test.
+    item_right > player_left && item_left < player_right
+        && item_bottom > player_top && item_top < player_bottom
+}
+
+/// Draw a flat isometric diamond with custom dimensions.
+fn draw_iso_diamond_sized(cx: f32, cy: f32, hw: f32, hh: f32, color: Color) {
+    let n = vec2(cx, cy - hh);
+    let e = vec2(cx + hw, cy);
+    let s = vec2(cx, cy + hh);
+    let w = vec2(cx - hw, cy);
+    draw_triangle(n, e, s, color);
+    draw_triangle(n, s, w, color);
+}
+
+/// Draw a flat isometric diamond (floor tile) centered at (cx, cy).
+fn draw_iso_diamond(cx: f32, cy: f32, color: Color) {
+    draw_iso_diamond_sized(cx, cy, ISO_HW, ISO_HH, color);
+}
+
+/// Draw an isometric box with explicit face colors and dimensions.
+/// (cx, cy) = floor center, hw/hh = diamond half-width/height, h = extrusion height.
+fn draw_iso_box_ex(
+    cx: f32, cy: f32, hw: f32, hh: f32, h: f32,
+    top: Color, front: Color, right: Color,
+) {
+    // Bottom diamond vertices.
+    let s = vec2(cx, cy + hh);
+    let w = vec2(cx - hw, cy);
+    let e = vec2(cx + hw, cy);
+
+    // Top diamond vertices (shifted up by height).
+    let nt = vec2(cx, cy - hh - h);
+    let et = vec2(cx + hw, cy - h);
+    let st = vec2(cx, cy + hh - h);
+    let wt = vec2(cx - hw, cy - h);
+
+    // South-west face (front, facing viewer-left).
+    draw_triangle(wt, st, s, front);
+    draw_triangle(wt, s, w, front);
+
+    // South-east face (right, facing viewer-right).
+    draw_triangle(st, et, e, right);
+    draw_triangle(st, e, s, right);
+
+    // Top face.
+    draw_triangle(nt, et, st, top);
+    draw_triangle(nt, st, wt, top);
+
+    // Outline — visible edges only.
+    let lw = 1.0;
+    draw_line(nt.x, nt.y, et.x, et.y, lw, ISO_OUTLINE);
+    draw_line(et.x, et.y, st.x, st.y, lw, ISO_OUTLINE);
+    draw_line(st.x, st.y, wt.x, wt.y, lw, ISO_OUTLINE);
+    draw_line(wt.x, wt.y, nt.x, nt.y, lw, ISO_OUTLINE);
+    draw_line(w.x, w.y, wt.x, wt.y, lw, ISO_OUTLINE);
+    draw_line(s.x, s.y, st.x, st.y, lw, ISO_OUTLINE);
+    draw_line(e.x, e.y, et.x, et.y, lw, ISO_OUTLINE);
+    draw_line(w.x, w.y, s.x, s.y, lw, ISO_OUTLINE);
+    draw_line(s.x, s.y, e.x, e.y, lw, ISO_OUTLINE);
+}
+
+/// Draw an isometric box using standard tile dimensions and auto-darkened faces.
+fn draw_iso_box(cx: f32, cy: f32, h: f32, base_color: Color) {
+    draw_iso_box_ex(
+        cx, cy, ISO_HW, ISO_HH, h,
+        base_color, darken(base_color, 0.78), darken(base_color, 0.62),
+    );
+}
+
+/// Draw an isometric actor as stacked boxes (body + head).
+/// (sx, sy) = floor-level iso position. Shadow is drawn in a separate pass.
+fn draw_iso_actor_box(
+    sx: f32, sy: f32,
+    body_color: Color, head_color: Color,
+    body_h: f32, head_h: f32,
+) {
+    /// Actor body footprint: ~40% of tile width.
+    const ACTOR_HW: f32 = ISO_HW * 0.4;
+    const ACTOR_HH: f32 = ISO_HH * 0.4;
+    /// Head footprint: ~30% of tile width.
+    const HEAD_HW: f32 = ISO_HW * 0.3;
+    const HEAD_HH: f32 = ISO_HH * 0.3;
+
+    // Body box at floor level.
+    draw_iso_box_ex(
+        sx, sy, ACTOR_HW, ACTOR_HH, body_h,
+        body_color, darken(body_color, 0.78), darken(body_color, 0.62),
+    );
+    // Head box on top of body.
+    draw_iso_box_ex(
+        sx, sy - body_h, HEAD_HW, HEAD_HH, head_h,
+        head_color, darken(head_color, 0.78), darken(head_color, 0.62),
+    );
+    // Eyes on head's front face.
+    let eye_y = sy - body_h - head_h * 0.6;
+    draw_circle(sx - 2.5, eye_y, 1.5, ISO_OUTLINE);
+    draw_circle(sx + 2.5, eye_y, 1.5, ISO_OUTLINE);
+}
+
+// =====================================================================
+// v9 character: pooping pose + shadow + ASCII kaomoji rotation.
+// =====================================================================
+
+/// ASCII kaomoji palette — rotates through these on the newspaper while pooping.
+/// Stays ASCII-only for reliable macroquad font rendering.
+const KAOMOJIS: &[&str] = &[
+    "(>_<)", "(T_T)", "(0_0)", "(X_X)", "(@_@)",
+    "(?_?)", "(u_u)", "(Z_Z)", "(*_*)", "(>.<)",
+];
+
+/// Soft multi-layer actor shadow. Replaces the harsh full-tile diamond.
+/// Uses three concentric ellipses with stepped alpha for a falloff feel.
+fn draw_actor_shadow(sx: f32, sy: f32) {
+    const SHADOW_RX: f32 = ISO_HW * 0.35;
+    const SHADOW_RY: f32 = ISO_HH * 0.55;
+    // Outer halo, diffuse.
+    draw_ellipse(sx, sy, SHADOW_RX * 1.5, SHADOW_RY * 1.5, 0.0, color_u8!(10, 10, 20, 25));
+    // Mid layer.
+    draw_ellipse(sx, sy, SHADOW_RX * 1.1, SHADOW_RY * 1.1, 0.0, color_u8!(10, 10, 20, 55));
+    // Core.
+    draw_ellipse(sx, sy, SHADOW_RX, SHADOW_RY, 0.0, color_u8!(10, 10, 20, 95));
+}
+
+/// v9 character: sitting pose for player while pooping (MoveState::Pooping
+/// or UsingToilet). Compressed body + lowered head + vertical newspaper
+/// covering legs. The newspaper carries the QTE progress bar + a rotating
+/// kaomoji for tone — replaces the floating overhead status indicator.
+fn draw_iso_actor_sitting(
+    sx: f32, sy: f32,
+    body_color: Color, head_color: Color,
+    body_h: f32, head_h: f32,
+    qte_progress: f32, qte_failed: bool,
+    elapsed: f32,
+) {
+    const ACTOR_HW: f32 = ISO_HW * 0.4;
+    const ACTOR_HH: f32 = ISO_HH * 0.4;
+    const HEAD_HW: f32 = ISO_HW * 0.3;
+    const HEAD_HH: f32 = ISO_HH * 0.3;
+
+    // Body — half the standing height to read as "sitting".
+    let sit_body_h = body_h * 0.5;
+    draw_iso_box_ex(
+        sx, sy, ACTOR_HW, ACTOR_HH, sit_body_h,
+        body_color, darken(body_color, 0.78), darken(body_color, 0.62),
+    );
+
+    // Head on top of compressed body, slight forward tilt visualised by
+    // shifting head box -2 px right (toward the camera face).
+    let head_top_y = sy - sit_body_h;
+    draw_iso_box_ex(
+        sx, head_top_y, HEAD_HW, HEAD_HH, head_h,
+        head_color, darken(head_color, 0.78), darken(head_color, 0.62),
+    );
+
+    // Eyes (slightly squinted — closer y).
+    let eye_y = head_top_y - head_h * 0.55;
+    draw_circle(sx - 2.5, eye_y, 1.4, ISO_OUTLINE);
+    draw_circle(sx + 2.5, eye_y, 1.4, ISO_OUTLINE);
+    // Red cheek tint dots.
+    draw_circle(sx - 5.0, eye_y + 3.5, 1.8, color_u8!(220, 110, 110, 130));
+    draw_circle(sx + 5.0, eye_y + 3.5, 1.8, color_u8!(220, 110, 110, 130));
+
+    // Vertical newspaper — covers from below head down to floor diamond.
+    // Drawn AFTER body so it occludes the lower body for that "exaggerated
+    // newspaper" silhouette.
+    let np_w = ACTOR_HW * 2.6;
+    let np_top_y = head_top_y - 2.0;
+    let np_bottom_y = sy + ACTOR_HH * 0.8;
+    let np_left = sx - np_w * 0.5;
+    let np_h = np_bottom_y - np_top_y;
+    if np_h > 4.0 {
+        // Paper background — cream.
+        draw_rectangle(np_left, np_top_y, np_w, np_h,
+                       color_u8!(240, 232, 218, 255));
+        draw_rectangle_lines(np_left, np_top_y, np_w, np_h, 1.2,
+                             color_u8!(60, 45, 30, 255));
+
+        // Title bar.
+        let title = "DAILY DUMP";
+        let title_size = 11.0;
+        let title_w = measure_text(title, None, title_size as u16, 1.0).width;
+        let title_y = np_top_y + 13.0;
+        draw_text(title, sx - title_w * 0.5, title_y, title_size,
+                  color_u8!(40, 28, 18, 255));
+        draw_line(np_left + 4.0, title_y + 3.0, np_left + np_w - 4.0,
+                  title_y + 3.0, 0.6, color_u8!(60, 45, 30, 255));
+
+        // Status progress bar.
+        let bar_y = title_y + 8.0;
+        let bar_x = np_left + 5.0;
+        let bar_w = np_w - 10.0;
+        let bar_h = 4.5;
+        draw_rectangle(bar_x, bar_y, bar_w, bar_h,
+                       color_u8!(200, 192, 178, 255));
+        let fill_color = if qte_failed { color_u8!(220, 100, 80, 255) }
+                         else          { color_u8!(120, 180, 100, 255) };
+        let fill_w = (bar_w * qte_progress.clamp(0.0, 1.0)).max(0.0);
+        draw_rectangle(bar_x, bar_y, fill_w, bar_h, fill_color);
+        draw_rectangle_lines(bar_x, bar_y, bar_w, bar_h, 0.5,
+                             color_u8!(60, 45, 30, 255));
+
+        // Random kaomoji — rotates roughly every 0.8s for visual life.
+        let km_rate = 0.8;
+        let km_idx = ((elapsed / km_rate).floor() as usize) % KAOMOJIS.len();
+        let km = KAOMOJIS[km_idx];
+        let km_size = 12.0;
+        let km_w = measure_text(km, None, km_size as u16, 1.0).width;
+        let km_y = bar_y + bar_h + 12.0;
+        if km_y < np_bottom_y - 2.0 {
+            draw_text(km, sx - km_w * 0.5, km_y, km_size,
+                      color_u8!(60, 40, 30, 255));
+        }
+
+        // Hands gripping the newspaper — small skin-color circles at top corners.
+        draw_circle(np_left + 2.0, np_top_y + 8.0, 3.0, head_color);
+        draw_circle(np_left + np_w - 2.0, np_top_y + 8.0, 3.0, head_color);
+        // Hand outlines for low-poly read.
+        draw_circle_lines(np_left + 2.0, np_top_y + 8.0, 3.0, 0.6,
+                          color_u8!(60, 45, 30, 255));
+        draw_circle_lines(np_left + np_w - 2.0, np_top_y + 8.0, 3.0, 0.6,
+                          color_u8!(60, 45, 30, 255));
+    }
+}
+
+/// Get floor color for a tile based on room kind, using checker pattern.
+/// v9: per-room oak variation removed (Option C is single hue per kind).
+fn iso_floor_color(kind: RoomKind, _room_id: usize, gx: i32, gy: i32) -> Color {
+    let checker = (gx + gy) % 2 == 0;
+    let (a, b) = match kind {
+        RoomKind::Normal   => ISO_FLOOR_NORMAL,
+        RoomKind::Toilet   => ISO_FLOOR_TOILET,
+        RoomKind::Trash    => ISO_FLOOR_TRASH,
+        RoomKind::Corridor => ISO_FLOOR_CORRIDOR,
+    };
+    if checker { a } else { b }
+}
+
+// ---------------------------------------------------------------------------
+// Texture Atlas — procedurally generated face textures for iso boxes
+// ---------------------------------------------------------------------------
+
+/// Size of each face texture in the atlas (pixels).
+const FACE_TEX_SIZE: u32 = 64;
+
+/// UV region within the atlas (normalized 0–1).
+#[derive(Clone, Copy)]
+struct AtlasRegion {
+    u: f32,
+    v: f32,
+    w: f32,
+    h: f32,
+}
+
+impl AtlasRegion {
+    fn from_px(px_x: u32, px_y: u32, px_w: u32, px_h: u32, aw: f32, ah: f32) -> Self {
+        Self { u: px_x as f32 / aw, v: px_y as f32 / ah, w: px_w as f32 / aw, h: px_h as f32 / ah }
+    }
+}
+
+/// Three visible iso box faces from the atlas.
+#[derive(Clone, Copy)]
+struct IsoFaceSet {
+    top: AtlasRegion,
+    front: AtlasRegion,
+    right: AtlasRegion,
+}
+
+/// Pre-built texture atlas with face sets per wall type.
+struct WallAtlas {
+    texture: Texture2D,
+    outer: IsoFaceSet,
+    inner: IsoFaceSet,
+}
+
+// --- Image pixel-level drawing helpers ---
+
+/// Fill a rectangle in the image (clamped to image bounds).
+fn img_fill(img: &mut Image, x: u32, y: u32, w: u32, h: u32, c: Color) {
+    let iw = img.width() as u32;
+    let ih = img.height() as u32;
+    for dy in 0..h {
+        for dx in 0..w {
+            let px = x + dx;
+            let py = y + dy;
+            if px < iw && py < ih {
+                img.set_pixel(px, py, c);
+            }
+        }
+    }
+}
+
+/// Deterministic per-brick color variation.
+fn brick_tint(base: Color, row: u32, col: u32) -> Color {
+    let hash = (row.wrapping_mul(7).wrapping_add(col.wrapping_mul(13))) % 5;
+    let f = match hash { 0 => 0.88, 1 => 1.06, 2 => 0.94, 3 => 1.0, _ => 0.97 };
+    Color::new((base.r * f).min(1.0), (base.g * f).min(1.0), (base.b * f).min(1.0), base.a)
+}
+
+/// Draw a brick wall face into the atlas, optionally with a window.
+fn gen_brick_face(img: &mut Image, ox: u32, oy: u32, s: u32,
+                  base: Color, mortar: Color, has_window: bool) {
+    img_fill(img, ox, oy, s, s, base);
+
+    /// Brick height in texels.
+    const BH: u32 = 8;
+    /// Brick width in texels.
+    const BW: u32 = 16;
+
+    for row in 0..(s / BH) {
+        let y = oy + row * BH;
+        // Horizontal mortar line.
+        img_fill(img, ox, y, s, 1, mortar);
+        // Vertical mortar (offset alternating rows).
+        let off = if row % 2 == 0 { 0 } else { BW / 2 };
+        for col in 0..((s + BW) / BW + 1) {
+            let x = ox.wrapping_add(off).wrapping_add(col * BW);
+            if x >= ox && x < ox + s {
+                img_fill(img, x, y, 1, BH, mortar);
+            }
+            // Brick body with tint variation.
+            let bx = x + 1;
+            let by = y + 1;
+            if bx >= ox && bx + BW - 2 <= ox + s {
+                let bc = brick_tint(base, row, col);
+                img_fill(img, bx, by, BW - 2, BH - 1, bc);
+            }
+        }
+    }
+
+    if has_window {
+        /// Window width in texels.
+        const WW: u32 = 18;
+        /// Window height in texels.
+        const WH: u32 = 22;
+        let wx = ox + (s - WW) / 2;
+        /// Window y-offset from face center (shifts window slightly above center).
+        const WIN_Y_SHIFT: u32 = 4;
+        let wy = oy + (s - WH) / 2 - WIN_Y_SHIFT;
+        let glass = Color::from_rgba(100, 145, 185, 255);
+        let frame = Color::from_rgba(65, 50, 40, 255);
+        // Glass fill.
+        img_fill(img, wx, wy, WW, WH, glass);
+        // Frame borders.
+        img_fill(img, wx, wy, WW, 2, frame);
+        img_fill(img, wx, wy + WH - 2, WW, 2, frame);
+        img_fill(img, wx, wy, 2, WH, frame);
+        img_fill(img, wx + WW - 2, wy, 2, WH, frame);
+        // Cross bars.
+        img_fill(img, wx + WW / 2 - 1, wy, 2, WH, frame);
+        img_fill(img, wx, wy + WH / 2 - 1, WW, 2, frame);
+    }
+}
+
+/// Generate the wall atlas: outer walls (brick + window) and inner walls (plain).
+fn generate_wall_atlas() -> WallAtlas {
+    let s = FACE_TEX_SIZE;
+    let aw = 256u16;
+    let ah = 256u16;
+    let mut img = Image::gen_image_color(aw, ah, Color::new(0.0, 0.0, 0.0, 0.0));
+
+    // --- Row 0: Outer wall ---
+    // Front face (warm terracotta bricks + window).
+    let ob = Color::from_rgba(150, 95, 75, 255);
+    let om = Color::from_rgba(130, 118, 108, 255);
+    gen_brick_face(&mut img, 0, 0, s, ob, om, true);
+    // Right face (darker bricks + window).
+    let obr = Color::from_rgba(120, 76, 60, 255);
+    let omr = Color::from_rgba(108, 98, 88, 255);
+    gen_brick_face(&mut img, s, 0, s, obr, omr, true);
+    // Top face (flat dark roof).
+    img_fill(&mut img, 2 * s, 0, s, s, Color::from_rgba(100, 72, 56, 255));
+
+    // --- Row 1: Inner wall ---
+    // Front face (plaster, no window, subtle bricks).
+    let ib = Color::from_rgba(135, 118, 105, 255);
+    let im_mortar = Color::from_rgba(125, 112, 100, 255);
+    gen_brick_face(&mut img, 0, s, s, ib, im_mortar, false);
+    // Right face (darker plaster).
+    let ibr = Color::from_rgba(110, 96, 85, 255);
+    gen_brick_face(&mut img, s, s, s, ibr, Color::from_rgba(102, 90, 80, 255), false);
+    // Top face.
+    img_fill(&mut img, 2 * s, s, s, s, Color::from_rgba(98, 88, 78, 255));
+
+    // Save atlas PNG for inspection (best-effort).
+    let _ = std::fs::create_dir_all("output");
+    img.export_png("output/wall_atlas.png");
+
+    let texture = Texture2D::from_image(&img);
+    texture.set_filter(FilterMode::Nearest);
+
+    let af = aw as f32;
+    let ahf = ah as f32;
+    WallAtlas {
+        texture,
+        outer: IsoFaceSet {
+            front: AtlasRegion::from_px(0, 0, s, s, af, ahf),
+            right: AtlasRegion::from_px(s, 0, s, s, af, ahf),
+            top: AtlasRegion::from_px(2 * s, 0, s, s, af, ahf),
+        },
+        inner: IsoFaceSet {
+            front: AtlasRegion::from_px(0, s, s, s, af, ahf),
+            right: AtlasRegion::from_px(s, s, s, s, af, ahf),
+            top: AtlasRegion::from_px(2 * s, s, s, s, af, ahf),
+        },
+    }
+}
+
+// --- Textured iso box rendering ---
+
+/// Draw a textured quad (2 triangles) using atlas UV mapping.
+fn draw_textured_quad(tex: &Texture2D, pos: [Vec2; 4], region: AtlasRegion, alpha: f32) {
+    let c = Color::new(1.0, 1.0, 1.0, alpha);
+    let u0 = region.u;
+    let v0 = region.v;
+    let u1 = region.u + region.w;
+    let v1 = region.v + region.h;
+
+    let mesh = Mesh {
+        vertices: vec![
+            Vertex::new(pos[0].x, pos[0].y, 0.0, u0, v0, c),
+            Vertex::new(pos[1].x, pos[1].y, 0.0, u1, v0, c),
+            Vertex::new(pos[2].x, pos[2].y, 0.0, u1, v1, c),
+            Vertex::new(pos[3].x, pos[3].y, 0.0, u0, v1, c),
+        ],
+        indices: vec![0u16, 1, 2, 0, 2, 3],
+        texture: Some(tex.clone()),
+    };
+    draw_mesh(&mesh);
+}
+
+/// Draw an iso box with atlas-textured faces.
+fn draw_iso_box_textured(
+    cx: f32, cy: f32, hw: f32, hh: f32, h: f32,
+    faces: &IsoFaceSet, tex: &Texture2D, alpha: f32,
+) {
+    let s = vec2(cx, cy + hh);
+    let w = vec2(cx - hw, cy);
+    let e = vec2(cx + hw, cy);
+    let nt = vec2(cx, cy - hh - h);
+    let et = vec2(cx + hw, cy - h);
+    let st = vec2(cx, cy + hh - h);
+    let wt = vec2(cx - hw, cy - h);
+
+    // Front face (SW): wt → st → s → w.
+    draw_textured_quad(tex, [wt, st, s, w], faces.front, alpha);
+    // Right face (SE): st → et → e → s.
+    draw_textured_quad(tex, [st, et, e, s], faces.right, alpha);
+    // Top face: nt → et → st → wt.
+    draw_textured_quad(tex, [nt, et, st, wt], faces.top, alpha);
+}
+
+/// Draw only the outline edges of an iso box (no face fill).
+fn draw_iso_box_outline(cx: f32, cy: f32, hw: f32, hh: f32, h: f32, alpha: f32) {
+    let s = vec2(cx, cy + hh);
+    let w = vec2(cx - hw, cy);
+    let e = vec2(cx + hw, cy);
+    let nt = vec2(cx, cy - hh - h);
+    let et = vec2(cx + hw, cy - h);
+    let st = vec2(cx, cy + hh - h);
+    let wt = vec2(cx - hw, cy - h);
+    let lw = 1.0;
+    let c = with_alpha(ISO_OUTLINE, alpha);
+    draw_line(nt.x, nt.y, et.x, et.y, lw, c);
+    draw_line(et.x, et.y, st.x, st.y, lw, c);
+    draw_line(st.x, st.y, wt.x, wt.y, lw, c);
+    draw_line(wt.x, wt.y, nt.x, nt.y, lw, c);
+    draw_line(w.x, w.y, wt.x, wt.y, lw, c);
+    draw_line(s.x, s.y, st.x, st.y, lw, c);
+    draw_line(e.x, e.y, et.x, et.y, lw, c);
+    draw_line(w.x, w.y, s.x, s.y, lw, c);
+    draw_line(s.x, s.y, e.x, e.y, lw, c);
+}
+
+// =====================================================================
+// v9 facet renderer + contrast-driven outline.
+// =====================================================================
+
+/// WCAG-style relative luminance of a Color (channels in [0,1]).
+/// Uses gamma 2.2 approximation (close enough to sRGB curve for art purposes).
+fn relative_luminance(c: Color) -> f32 {
+    let r = c.r.powf(2.2);
+    let g = c.g.powf(2.2);
+    let b = c.b.powf(2.2);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// Compute outline color for a face fill, using contrast-based luminance shift.
+/// Auto direction: lit faces (L > 0.5) → LIGHTER outline (extends highlight),
+/// shadow faces (L ≤ 0.5) → DARKER outline (extends shadow). Reinforces the
+/// face's lighting tier rather than contrasting against it.
+/// `target_c` ∈ [1.5, 7.0]: WCAG-style contrast ratio between outline and fill.
+fn outline_color_for(face: Color, target_c: f32) -> Color {
+    let l = relative_luminance(face);
+    let target_l = if l > 0.5 {
+        ((l + 0.05) * target_c - 0.05).clamp(0.0, 1.0)
+    } else {
+        ((l + 0.05) / target_c - 0.05).clamp(0.0, 1.0)
+    };
+    // Scale RGB to match target luminance, preserving hue.
+    let scale = if l > 1e-4 { target_l / l } else { 0.0 };
+    Color::new(
+        (face.r * scale).clamp(0.0, 1.0),
+        (face.g * scale).clamp(0.0, 1.0),
+        (face.b * scale).clamp(0.0, 1.0),
+        face.a,
+    )
+}
+
+/// v9: facet-shaded iso box. Each face = 2 triangles (lit + shade tier),
+/// outlines computed per-face from contrast slider.
+fn draw_iso_box_facet(
+    cx: f32, cy: f32, hw: f32, hh: f32, h: f32,
+    palette: &WallPalette,
+    outline_w: f32, outline_alpha: f32, outline_contrast: f32,
+    fill_alpha: f32,
+) {
+    let s  = vec2(cx, cy + hh);
+    let w  = vec2(cx - hw, cy);
+    let e  = vec2(cx + hw, cy);
+    let nt = vec2(cx, cy - hh - h);
+    let et = vec2(cx + hw, cy - h);
+    let st = vec2(cx, cy + hh - h);
+    let wt = vec2(cx - hw, cy - h);
+
+    let top_lit   = with_alpha(palette.top_lit,   fill_alpha);
+    let top_shade = with_alpha(palette.top_shade, fill_alpha);
+    let sw_lit    = with_alpha(palette.sw_lit,    fill_alpha);
+    let sw_shade  = with_alpha(palette.sw_shade,  fill_alpha);
+    let se_lit    = with_alpha(palette.se_lit,    fill_alpha);
+    let se_shade  = with_alpha(palette.se_shade,  fill_alpha);
+
+    // Top face: split along nt-st diagonal. East tri = lit, west tri = shade.
+    draw_triangle(nt, et, st, top_lit);
+    draw_triangle(nt, st, wt, top_shade);
+
+    // SW face (front-left): split along wt-s diagonal. Upper tri = lit, lower = shade.
+    draw_triangle(wt, st, s, sw_lit);
+    draw_triangle(wt, s, w, sw_shade);
+
+    // SE face (front-right): split along st-e diagonal.
+    draw_triangle(st, et, e, se_lit);
+    draw_triangle(st, e, s, se_shade);
+
+    // Outlines — per-face contrast-driven color.
+    if outline_w > 0.0 && outline_alpha > 0.0 {
+        let oc_top = with_alpha(
+            outline_color_for(palette.top_lit, outline_contrast),
+            outline_alpha * fill_alpha,
+        );
+        let oc_sw = with_alpha(
+            outline_color_for(palette.sw_lit, outline_contrast),
+            outline_alpha * fill_alpha,
+        );
+        let oc_se = with_alpha(
+            outline_color_for(palette.se_lit, outline_contrast),
+            outline_alpha * fill_alpha,
+        );
+        // Top diamond rim.
+        draw_line(nt.x, nt.y, et.x, et.y, outline_w, oc_top);
+        draw_line(et.x, et.y, st.x, st.y, outline_w, oc_top);
+        draw_line(st.x, st.y, wt.x, wt.y, outline_w, oc_top);
+        draw_line(wt.x, wt.y, nt.x, nt.y, outline_w, oc_top);
+        // SW vertical edges + bottom.
+        draw_line(w.x, w.y, wt.x, wt.y, outline_w, oc_sw);
+        draw_line(s.x, s.y, st.x, st.y, outline_w, oc_sw);
+        draw_line(w.x, w.y, s.x, s.y, outline_w, oc_sw);
+        // SE vertical edge + bottom.
+        draw_line(e.x, e.y, et.x, et.y, outline_w, oc_se);
+        draw_line(s.x, s.y, e.x, e.y, outline_w, oc_se);
+    }
+}
+
+/// Check if a wall tile is an outer wall (borders Void or map edge).
+fn is_outer_wall(map: &[Cell], gx: i32, gy: i32, map_w: i32, map_h: i32) -> bool {
+    for &(dx, dy) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+        let nx = gx + dx;
+        let ny = gy + dy;
+        if nx < 0 || ny < 0 || nx >= map_w || ny >= map_h {
+            return true;
+        }
+        if map[idx(nx, ny, map_w)].terrain == Terrain::Void {
+            return true;
+        }
+    }
+    false
+}
 
 fn window_conf() -> Conf {
     let config = load_config();
@@ -29,7 +853,7 @@ fn window_conf() -> Conf {
 }
 
 // ---------------------------------------------------------------------------
-// Room colour helper (uses dynamic tile_to_room from State)
+// Room colour helper (used in debug overlays)
 // ---------------------------------------------------------------------------
 
 /// Distinct colours for up to 8 room IDs, cycling.
@@ -184,6 +1008,8 @@ struct DebugPanel {
     npc_steer_open: bool,
     /// Whether NPC path/waypoint visualization is shown.
     show_npc_paths: bool,
+    /// Whether NPC vision cones are rendered on the floor.
+    show_npc_vision: bool,
     /// Whether the Map Gen section is expanded.
     mapgen_open: bool,
     /// Show room boundaries overlay.
@@ -205,15 +1031,32 @@ struct DebugPanel {
     /// Flag: trigger map regeneration next frame.
     mapgen_regen: bool,
     // --- Pipeline step debug toggles (default all true) ---
+    mg_void_seal: bool,
+    mg_merge: bool,
     mg_doors: bool,
-    mg_wfc_walls: bool,
-    mg_door_approaches: bool,
-    mg_merge_walls: bool,
-    mg_beds: bool,
-    mg_void_cleanup: bool,
-    mg_bed_reval: bool,
+    mg_shield_density: f32,
     /// Whether the pipeline toggles sub-section is expanded.
     mg_toggles_open: bool,
+    // --- ISO Rendering ---
+    /// Whether the ISO rendering section is expanded.
+    iso_open: bool,
+    /// Wall extrusion height (screen pixels).
+    iso_wall_h: f32,
+    /// Closed door frame height (screen pixels).
+    iso_door_closed_h: f32,
+    /// Open door frame height (screen pixels).
+    iso_door_open_h: f32,
+    /// Actor body box height (screen pixels).
+    iso_actor_body_h: f32,
+    /// Actor head box height (screen pixels).
+    iso_actor_head_h: f32,
+    // --- v9 Art Style sliders ---
+    /// Wall outline stroke width in pixels (0 = no outline).
+    art_outline_width: f32,
+    /// Wall outline alpha multiplier [0,1].
+    art_outline_alpha: f32,
+    /// Outline-to-fill contrast ratio [1.5, 7.0]. WCAG-style.
+    art_outline_contrast: f32,
 }
 
 impl DebugPanel {
@@ -226,6 +1069,7 @@ impl DebugPanel {
             physics_open: false,
             npc_steer_open: false,
             show_npc_paths: false,
+            show_npc_vision: false,
             mapgen_open: false,
             show_room_bounds: false,
             show_room_ids: false,
@@ -237,14 +1081,20 @@ impl DebugPanel {
             mapgen_height: 0.0,
             mapgen_area: 0.0,
             mapgen_regen: false,
+            mg_void_seal: true,
+            mg_merge: true,
             mg_doors: true,
-            mg_wfc_walls: true,
-            mg_door_approaches: true,
-            mg_merge_walls: true,
-            mg_beds: true,
-            mg_void_cleanup: true,
-            mg_bed_reval: true,
+            mg_shield_density: 0.5,
             mg_toggles_open: false,
+            iso_open: false,
+            iso_wall_h: WALL_ISO_H,
+            iso_door_closed_h: DOOR_CLOSED_H,
+            iso_door_open_h: DOOR_OPEN_H,
+            iso_actor_body_h: 20.0,
+            iso_actor_head_h: 10.0,
+            art_outline_width: 1.0,
+            art_outline_alpha: 0.8,
+            art_outline_contrast: 3.0,
         }
     }
 
@@ -432,27 +1282,6 @@ const IDLE_MAX_S: f32 = 6.0;
 /// Duration spent at toilet/trash destination (seconds).
 const DEST_DURATION_S: f32 = 5.0;
 
-/// Find the bed cell in a room (first tile with Furniture::Bed), or None.
-fn find_bed_in_room(room: &game::room::Room, map: &[Cell], map_w: i32) -> Option<(i32, i32)> {
-    room.tiles.iter().copied().find(|&(x, y)| {
-        map[idx(x, y, map_w)].furniture == Some(Furniture::Bed)
-    })
-}
-
-/// Find a walkable floor tile adjacent to a bed cell (for NPC spawn).
-fn floor_near_bed(bed: (i32, i32), map: &[Cell], map_w: i32, map_h: i32) -> (i32, i32) {
-    for &(dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
-        let nx = bed.0 + dx;
-        let ny = bed.1 + dy;
-        if nx >= 0 && nx < map_w && ny >= 0 && ny < map_h
-            && map[idx(nx, ny, map_w)].is_walkable()
-        {
-            return (nx, ny);
-        }
-    }
-    bed // fallback (shouldn't happen with valid maps)
-}
-
 /// Geometric centre of a room's walkable tiles (floor tile nearest to centroid).
 fn room_center(room: &game::room::Room) -> (i32, i32) {
     if room.tiles.is_empty() {
@@ -479,46 +1308,49 @@ fn rng32(state: &mut u32) -> u32 {
     x
 }
 
+/// Pick a random walkable floor tile from a room.
+fn random_floor_in_room(room: &game::room::Room, map: &[Cell], map_w: i32, rng: &mut u32) -> (i32, i32) {
+    let walkable: Vec<(i32, i32)> = room.tiles.iter().copied()
+        .filter(|&(x, y)| map[idx(x, y, map_w)].is_walkable())
+        .collect();
+    if walkable.is_empty() { return room_center(room); }
+    let i = rng32(rng) as usize % walkable.len();
+    walkable[i]
+}
+
 /// Spawn NPCs based on the rooms detected in the current map.
 ///
-/// Per WFC_DESIGN.md § NPC Creation:
-/// - `npc_count` NPCs, each assigned to a distinct Normal room with a bed.
-/// - Spawn position: floor tile adjacent to the room's bed.
+/// Per MAP_DESIGN.md § NPC Creation:
+/// - `npc_count` NPCs, each assigned to a distinct Normal room.
+/// - Spawn position: random walkable floor tile in the room.
 /// - Patrol route (fixed random sequence, persists until map changes):
-///   destinations = all Toilets + all Trash rooms + random [0, PATROL_MAX_OTHER_BEDS] other NPC beds.
+///   destinations = all Toilets + all Trash rooms + random [0, PATROL_MAX_OTHER_BEDS]
+///   other Normal rooms.
 ///   Cycle: home → dest₁ → home → dest₂ → ... → destₙ → home → dest₁ → ...
 /// - Toilet/Trash waypoints: room geometric centre.
-/// - Other NPC bed waypoints: bed cell position.
+/// - Other Normal room waypoints: room centre.
 fn spawn_npcs(state: &mut State, npc_count: usize) {
     state.npcs.clear();
 
-    // Collect Normal rooms that have beds (eligible for NPC assignment).
+    // Collect Normal rooms (eligible for NPC assignment).
     let normal_rooms: Vec<usize> = state.rooms.iter()
         .filter(|r| r.kind == RoomKind::Normal)
-        .filter_map(|r| {
-            if find_bed_in_room(r, &state.map, state.map_w).is_some() {
-                Some(r.id)
-            } else {
-                None
-            }
-        })
+        .map(|r| r.id)
         .collect();
 
     let actual_count = npc_count.min(normal_rooms.len());
     if actual_count == 0 {
-        eprintln!("[npc] No Normal rooms with beds — skipping NPC spawn");
+        eprintln!("[npc] No Normal rooms — skipping NPC spawn");
         return;
     }
 
-    // Randomly select `actual_count` rooms from normal_rooms.
     let mut rng_state: u32 = 0xDEAD_BEEF;
-    // Seed with something varying (use room count + map dimensions).
     rng_state ^= (state.map_w as u32).wrapping_mul(31) ^ (state.map_h as u32).wrapping_mul(97);
     rng_state ^= normal_rooms.len() as u32;
     if rng_state == 0 { rng_state = 1; }
 
+    // Randomly select `actual_count` rooms.
     let mut shuffled = normal_rooms.clone();
-    // Fisher-Yates shuffle.
     for i in (1..shuffled.len()).rev() {
         let j = rng32(&mut rng_state) as usize % (i + 1);
         shuffled.swap(i, j);
@@ -535,23 +1367,14 @@ fn spawn_npcs(state: &mut State, npc_count: usize) {
         .map(|r| r.id)
         .collect();
 
-    // Build bed positions for all assigned NPC rooms (for cross-NPC bed visits).
-    let assigned_beds: Vec<(usize, (i32, i32))> = assigned.iter()
-        .filter_map(|&ri| {
-            find_bed_in_room(&state.rooms[ri], &state.map, state.map_w)
-                .map(|bed| (ri, bed))
-        })
-        .collect();
-
     for (npc_idx, &home_room_id) in assigned.iter().enumerate() {
-        let home_bed = find_bed_in_room(&state.rooms[home_room_id], &state.map, state.map_w)
-            .expect("assigned room must have bed");
-        let home_tile = floor_near_bed(home_bed, &state.map, state.map_w, state.map_h);
+        let home_tile = random_floor_in_room(
+            &state.rooms[home_room_id], &state.map, state.map_w, &mut rng_state,
+        );
 
-        // Build destination list: all toilets + all trash + random [0,3] other beds.
+        // Build destination list: all toilets + all trash + random other Normal rooms.
         let mut destinations: Vec<NpcActivity> = Vec::new();
 
-        // Add toilet destinations.
         for &tid in &toilet_rooms {
             let center = room_center(&state.rooms[tid]);
             destinations.push(NpcActivity::GoToToilet {
@@ -560,7 +1383,6 @@ fn spawn_npcs(state: &mut State, npc_count: usize) {
             });
         }
 
-        // Add trash destinations.
         for &tid in &trash_rooms {
             let center = room_center(&state.rooms[tid]);
             destinations.push(NpcActivity::TakeOutTrash {
@@ -569,24 +1391,22 @@ fn spawn_npcs(state: &mut State, npc_count: usize) {
             });
         }
 
-        // Add random [0, PATROL_MAX_OTHER_BEDS] other NPC beds.
-        let other_beds: Vec<(i32, i32)> = assigned_beds.iter()
-            .filter(|&&(ri, _)| ri != home_room_id)
-            .map(|&(_, bed)| bed)
+        // Add random [0, PATROL_MAX_OTHER_BEDS] other Normal rooms.
+        let other_normals: Vec<(i32, i32)> = assigned.iter()
+            .filter(|&&ri| ri != home_room_id)
+            .map(|&ri| room_center(&state.rooms[ri]))
             .collect();
-        if !other_beds.is_empty() {
+        if !other_normals.is_empty() {
             let extra = rng32(&mut rng_state) as usize % (PATROL_MAX_OTHER_BEDS + 1);
-            let extra = extra.min(other_beds.len());
-            // Shuffle and pick.
-            let mut bed_pool = other_beds.clone();
-            for i in (1..bed_pool.len()).rev() {
+            let extra = extra.min(other_normals.len());
+            let mut pool = other_normals.clone();
+            for i in (1..pool.len()).rev() {
                 let j = rng32(&mut rng_state) as usize % (i + 1);
-                bed_pool.swap(i, j);
+                pool.swap(i, j);
             }
-            for &bed_pos in bed_pool.iter().take(extra) {
-                // Waypoint is the bed cell itself (arrival = any adjacent floor).
+            for &pos in pool.iter().take(extra) {
                 destinations.push(NpcActivity::IdleInRoom {
-                    room_pos: bed_pos,
+                    room_pos: pos,
                     idle_min_s: IDLE_MIN_S,
                     idle_max_s: IDLE_MAX_S,
                 });
@@ -602,16 +1422,13 @@ fn spawn_npcs(state: &mut State, npc_count: usize) {
         // Build interleaved activity list: home → dest₁ → home → dest₂ → ...
         let mut activities: Vec<NpcActivity> = Vec::new();
         for dest in &destinations {
-            // Home idle.
             activities.push(NpcActivity::IdleInRoom {
                 room_pos: home_tile,
                 idle_min_s: IDLE_MIN_S,
                 idle_max_s: IDLE_MAX_S,
             });
-            // Destination.
             activities.push(dest.clone());
         }
-        // If no destinations, just idle at home.
         if activities.is_empty() {
             activities.push(NpcActivity::IdleInRoom {
                 room_pos: home_tile,
@@ -630,9 +1447,8 @@ fn spawn_npcs(state: &mut State, npc_count: usize) {
         state.npcs.push(Npc::new(spawn_pos, routine));
 
         eprintln!(
-            "[npc] NPC {} in room {} (bed {:?}, spawn {:?}), {} destinations",
-            npc_idx, home_room_id, home_bed, home_tile,
-            destinations.len(),
+            "[npc] NPC {} in room {} (home {:?}), {} destinations",
+            npc_idx, home_room_id, home_tile, destinations.len(),
         );
     }
 }
@@ -654,6 +1470,11 @@ async fn main() {
 
     // Spawn NPCs in Normal rooms with beds.
     spawn_npcs(&mut state, 2);
+
+    // Generate wall texture atlas (once at startup).
+    // v9: atlas no longer drawn (walls use facet renderer); kept for now —
+    // generates output/wall_atlas.png as a side effect, useful for debugging.
+    let _wall_atlas = generate_wall_atlas();
 
     // Tick accumulator for fixed-step game logic.
     let mut tick_acc: f64 = 0.0;
@@ -753,13 +1574,10 @@ async fn main() {
                 map_w: size_ov.map(|(w, _)| w),
                 map_h: size_ov.map(|(_, h)| h),
                 area_per_room: area_ov,
+                debug_void_seal: debug.mg_void_seal,
+                debug_merge: debug.mg_merge,
                 debug_doors: debug.mg_doors,
-                debug_wfc_walls: debug.mg_wfc_walls,
-                debug_door_approaches: debug.mg_door_approaches,
-                debug_merge_walls: debug.mg_merge_walls,
-                debug_beds: debug.mg_beds,
-                debug_void_cleanup: debug.mg_void_cleanup,
-                debug_bed_reval: debug.mg_bed_reval,
+                shield_density: debug.mg_shield_density,
             };
             if let Some(gen) = run_map_gen(&mg_cfg) {
                 state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds, &gen.requested_rooms);
@@ -768,220 +1586,362 @@ async fn main() {
             }
         }
 
-        // -- Render --
+        // -- Render (Isometric) --
         clear_background(color_u8!(16, 18, 30, 255));
 
         let t = (tick_acc / tick_s).min(1.0) as f32;
         let (vx, vy) = state.player_visual_pos(t);
-        let cam_x = vx * TILE_SIZE - screen_width() / 2.0;
-        let cam_y = vy * TILE_SIZE - screen_height() / 2.0;
+        let cam_gx = vx;
+        let cam_gy = vy;
 
-        // --- Layer 1: Floor tiles ---
+        // v9: Player FOV — true line-of-sight, no distance cap. Open doors
+        // pass through (door_blocks_vision=false); closed doors and walls block.
+        // Includes terminator walls so building outlines remain visible.
+        let lit_cells: std::collections::HashSet<(i32, i32)> = game::chase::compute_lit_cells_radial(
+            (vx, vy), &state.map, state.map_w, state.map_h,
+            PLAYER_VISION_RANGE, false,
+        ).into_iter().collect();
+        let is_lit = |gx: i32, gy: i32| lit_cells.contains(&(gx, gy));
+
+        // --- Layer 1: Floor diamonds (fog-blended outside FOV) ---
         for gy in 0..state.map_h {
             for gx in 0..state.map_w {
                 let cell = state.map[idx(gx, gy, state.map_w)];
-                let sx = gx as f32 * TILE_SIZE - cam_x;
-                let sy = gy as f32 * TILE_SIZE - cam_y;
+                let terrain = cell.terrain;
+                if matches!(terrain, Terrain::Void | Terrain::Wall) {
+                    continue;
+                }
+                // Tile center in world coords → iso screen.
+                let (sx, sy) = iso_w2s(gx as f32 + 0.5, gy as f32 + 0.5, cam_gx, cam_gy);
 
-                let color = match cell.terrain {
-                    Terrain::Void => continue,
-                    Terrain::Wall => continue,
-                    Terrain::DoorOpen => color_u8!(70, 60, 40, 255),
-                    Terrain::DoorClosed => color_u8!(120, 90, 50, 255),
-                    // Floor and Toilet both use RoomKind-based coloring.
+                let color = match terrain {
+                    Terrain::DoorOpen | Terrain::DoorClosed => ISO_FLOOR_DOOR,
                     Terrain::Floor | Terrain::Toilet => {
                         let ri = state.tile_to_room[idx(gx, gy, state.map_w)];
-                        if ri == usize::MAX {
-                            color_u8!(39, 43, 63, 255) // corridor/unassigned
+                        let kind = if ri != usize::MAX {
+                            state.rooms[ri].kind
                         } else {
-                            let kind = state.rooms[ri].kind;
-                            match kind {
-                                RoomKind::Toilet => color_u8!(200, 200, 220, 255),
-                                RoomKind::Trash => color_u8!(40, 70, 40, 255),
-                                RoomKind::Corridor => color_u8!(39, 43, 63, 255),
-                                RoomKind::Normal => {
-                                    let (r, g, b) = ROOM_COLORS[ri % ROOM_COLORS.len()];
-                                    Color::from_rgba(r, g, b, 255)
-                                }
-                            }
-                        }
-                    }
-                };
-                draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE, color);
-
-                // Furniture overlay (drawn on top of floor color).
-                if let Some(furn) = cell.furniture {
-                    let furn_color = match furn {
-                        Furniture::Bed => color_u8!(120, 80, 60, 255),
-                        Furniture::Shelf => color_u8!(90, 70, 50, 255),
-                        Furniture::Table => color_u8!(110, 90, 60, 255),
-                        Furniture::Chair => color_u8!(100, 80, 55, 255),
-                        Furniture::TrashBin => color_u8!(70, 70, 70, 255),
-                    };
-                    draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE, furn_color);
-                }
-
-                // Debug: tile grid lines.
-                if debug.visible {
-                    draw_rectangle_lines(
-                        sx, sy, TILE_SIZE, TILE_SIZE, 1.0,
-                        color_u8!(60, 65, 90, 120),
-                    );
-
-                    let ri = state.tile_to_room[idx(gx, gy, state.map_w)];
-
-                    // Room ID colour overlay.
-                    if debug.show_room_ids && ri != usize::MAX {
-                        let (cr, cg, cb) = ROOM_COLORS[ri % ROOM_COLORS.len()];
-                        draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE,
-                            Color::from_rgba(cr, cg, cb, 80));
-                        // Tiny room ID number.
-                        draw_text(
-                            &format!("{}", ri), sx + 2.0, sy + 12.0, 11.0,
-                            Color::from_rgba(255, 255, 255, 150),
-                        );
-                    }
-
-                    // Room boundary: draw thick edge where tile_to_room changes.
-                    if debug.show_room_bounds && ri != usize::MAX {
-                        let check = |dx: i32, dy: i32| -> bool {
-                            let nx = gx + dx;
-                            let ny = gy + dy;
-                            if nx < 0 || nx >= state.map_w || ny < 0 || ny >= state.map_h {
-                                return true;
-                            }
-                            state.tile_to_room[idx(nx, ny, state.map_w)] != ri
+                            RoomKind::Corridor
                         };
-                        let bc = color_u8!(255, 200, 50, 200);
-                        if check(-1, 0) { draw_line(sx, sy, sx, sy + TILE_SIZE, 2.0, bc); }
-                        if check(1, 0) { draw_line(sx + TILE_SIZE, sy, sx + TILE_SIZE, sy + TILE_SIZE, 2.0, bc); }
-                        if check(0, -1) { draw_line(sx, sy, sx + TILE_SIZE, sy, 2.0, bc); }
-                        if check(0, 1) { draw_line(sx, sy + TILE_SIZE, sx + TILE_SIZE, sy + TILE_SIZE, 2.0, bc); }
+                        iso_floor_color(kind, ri, gx, gy)
                     }
+                    _ => continue,
+                };
+                let final_color = if is_lit(gx, gy) { color } else { fog_blend_floor(color) };
+                draw_iso_diamond(sx, sy, final_color);
+            }
+        }
+
+        // --- Star marker (amber pulse, fog-piercing beacon) ---
+        // v9: replaces yellow with warm amber so it reads on fog-dimmed floor.
+        // Three concentric rings + halo, alpha sin-pulses at 0.5 Hz.
+        if let Some((star_gx, star_gy)) = state.star_pos {
+            let now = get_time() as f32;
+            // Slow pulse 0.5 Hz: 0.65 .. 1.0 alpha multiplier.
+            let pulse = 0.825 + 0.175 * (now * std::f32::consts::TAU * 0.5).sin();
+            // Outer halo on each of the 2×2 star tiles.
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (sx, sy) = iso_w2s(
+                        star_gx as f32 + dx as f32 + 0.5,
+                        star_gy as f32 + dy as f32 + 0.5,
+                        cam_gx, cam_gy,
+                    );
+                    let halo = with_alpha(STAR_AMBER, 0.18 * pulse);
+                    draw_iso_diamond(sx, sy, halo);
+                }
+            }
+            let (scx, scy) = iso_w2s(
+                star_gx as f32 + 1.0, star_gy as f32 + 1.0,
+                cam_gx, cam_gy,
+            );
+            // Outer ring (large, faint).
+            let r_outer = 22.0 + 4.0 * (now * std::f32::consts::TAU * 0.5).sin();
+            draw_circle(scx, scy, r_outer, with_alpha(STAR_AMBER, 0.20 * pulse));
+            // Mid ring.
+            draw_circle(scx, scy, 14.0, with_alpha(STAR_AMBER, 0.55 * pulse));
+            // Hot core.
+            draw_circle(scx, scy, 6.0, with_alpha(STAR_AMBER_HOT, 0.95 * pulse));
+        }
+
+        // --- Layer 1.5: Shadow pass (between floor and 3D objects) ---
+        // v9: soft layered ellipse shadow replaces full-tile diamond.
+        // NPC shadow only drawn if NPC's cell is lit (no shadow betrays its
+        // position when hidden by fog).
+        {
+            let (sx, sy) = iso_w2s(vx, vy, cam_gx, cam_gy);
+            draw_actor_shadow(sx, sy);
+
+            for npc in &state.npcs {
+                let (nx, ny) = npc.visual_pos(t);
+                let npc_cell = (nx.floor() as i32, ny.floor() as i32);
+                if !lit_cells.contains(&npc_cell) { continue; }
+                let (sx, sy) = iso_w2s(nx, ny, cam_gx, cam_gy);
+                draw_actor_shadow(sx, sy);
+            }
+        }
+
+        // --- Layer 1.7: NPC vision overlay (between shadows and 3D objects) ---
+        // v9 MVP per output/VISION_DESIGN.md: floor-projected vision cone, color
+        // by chase state. One transparent diamond per visible cell — walls block
+        // via existing line_of_sight_vision Bresenham.
+        if debug.show_npc_vision {
+            for npc in &state.npcs {
+                let (range, fov_cos, tint) = if npc.chase.active {
+                    (VISION_RANGE_ALERT, VISION_FOV_HALF_COS_ALERT, VISION_TINT_ALERT)
+                } else {
+                    (VISION_RANGE_IDLE, VISION_FOV_HALF_COS_IDLE, VISION_TINT_IDLE)
+                };
+                let visible = game::chase::compute_visible_cells(
+                    npc, &state.map, state.map_w, state.map_h,
+                    fov_cos, range, true, // door_blocks_vision: true (matches default)
+                );
+                for (vx_cell, vy_cell) in visible {
+                    let (sx, sy) = iso_w2s(
+                        vx_cell as f32 + 0.5, vy_cell as f32 + 0.5,
+                        cam_gx, cam_gy,
+                    );
+                    draw_iso_diamond(sx, sy, tint);
                 }
             }
         }
 
-        // --- Star marker (2×2 area) ---
-        if let Some((sx, sy)) = state.star_pos {
-            let star_px = sx as f32 * TILE_SIZE - cam_x;
-            let star_py = sy as f32 * TILE_SIZE - cam_y;
-            let area = TILE_SIZE * 2.0;
-            let pulse = (get_time() as f32 * 3.0).sin() * 0.15 + 1.0;
-            // Highlight area.
-            draw_rectangle(star_px, star_py, area, area, color_u8!(255, 220, 50, 40));
-            draw_rectangle_lines(star_px, star_py, area, area, 2.0, color_u8!(255, 220, 50, 150));
-            // Centre glow.
-            let cx = star_px + TILE_SIZE;
-            let cy = star_py + TILE_SIZE;
-            let sr = TILE_SIZE * 0.4 * pulse;
-            draw_circle(cx, cy, sr, color_u8!(255, 220, 50, 180));
-            draw_circle(cx, cy, sr * 0.5, color_u8!(255, 255, 150, 255));
+        // --- Layer 2: Depth-sorted scene (walls, doors, player, NPCs) ---
+        // Render layers for depth-sort tie-breaking within the same tile.
+        /// Walls, doors, furniture.
+        const LAYER_STRUCTURE: u8 = 3;
+        /// Player and NPCs (drawn on top of same-depth structures).
+        const LAYER_ACTOR: u8 = 4;
+
+        #[derive(Clone)]
+        enum SceneItem {
+            Wall(i32, i32),
+            Door(i32, i32, bool),   // gx, gy, is_open
+            Player,
+            Npc(usize),
         }
+        // (depth, layer, item) — sorted by depth then layer.
+        let mut scene: Vec<(f32, u8, SceneItem)> = Vec::new();
 
-        // --- Layer 2: Entities (player) ---
-        let cx = vx * TILE_SIZE - cam_x;
-        let cy = vy * TILE_SIZE - cam_y;
-        let vr = state.radius * TILE_SIZE;
-        // Shadow.
-        draw_circle(cx, cy + vr * 0.3, vr * 0.7, color_u8!(10, 10, 20, 80));
-        // Body.
-        draw_circle(cx, cy, vr, color_u8!(235, 228, 223, 255));
-
-        // Debug overlays on player.
-        if debug.visible {
-            let cr_px = state.radius * TILE_SIZE;
-
-            // Collision circle (red).
-            draw_circle_lines(cx, cy, cr_px, 1.0, color_u8!(255, 80, 80, 180));
-
-            // Repulsion range circle (yellow).
-            let rep_px = (state.radius + state.repulsion_range) * TILE_SIZE;
-            draw_circle_lines(cx, cy, rep_px, 1.0, color_u8!(255, 200, 60, 100));
-
-            // Nearest-wall normal line (green, from centre toward wall).
-            if state.dbg_clearance < state.repulsion_range + 0.5 {
-                let line_len = TILE_SIZE * 1.5;
-                let nx = -state.dbg_wall_nx; // toward wall
-                let ny = -state.dbg_wall_ny;
-                draw_line(
-                    cx, cy,
-                    cx + nx * line_len,
-                    cy + ny * line_len,
-                    2.0,
-                    color_u8!(80, 220, 100, 180),
-                );
-            }
-        }
-
-        // --- NPCs ---
-        for (npc_idx, npc) in state.npcs.iter().enumerate() {
-            let (nx, ny) = npc.visual_pos(t);
-            let ncx = nx * TILE_SIZE - cam_x;
-            let ncy = ny * TILE_SIZE - cam_y;
-            let nvr = npc.radius * TILE_SIZE;
-            // Shadow.
-            draw_circle(ncx, ncy + nvr * 0.3, nvr * 0.7, color_u8!(10, 10, 20, 80));
-            // Body: red when chasing, normal when patrolling.
-            let npc_body_color = if npc.chase.active {
-                color_u8!(255, 50, 50, 255)
-            } else {
-                color_u8!(200, 100, 100, 255)
-            };
-            draw_circle(ncx, ncy, nvr, npc_body_color);
-
-            // Alert indicator / expression bubble above head.
-            if let Some(ref expr) = npc.chase.expression {
-                let fade_in = (expr.age / 0.3).min(1.0);
-                let fade_out = ((expr.lifetime - expr.age) / 0.5).min(1.0).max(0.0);
-                let alpha = fade_in * fade_out;
-                let tw = measure_text(&expr.text, None, 16, 1.0);
-                draw_text(
-                    &expr.text,
-                    ncx - tw.width * 0.5,
-                    ncy - nvr - 12.0,
-                    16.0,
-                    Color::new(1.0, 0.9, 0.5, alpha),
-                );
-            } else if !npc.chase.active {
-                match npc.alert_state {
-                    AlertState::Suspicious => {
-                        draw_text("?", ncx - 5.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 220, 50, 255));
+        // Collect walls and doors (use tile CENTER for depth — avoids edge cases
+        // when player is adjacent to a wall at near-identical depth).
+        for gy in 0..state.map_h {
+            for gx in 0..state.map_w {
+                let terrain = state.map[idx(gx, gy, state.map_w)].terrain;
+                let cx = gx as f32 + 0.5;
+                let cy = gy as f32 + 0.5;
+                match terrain {
+                    Terrain::Wall => {
+                        scene.push((iso_depth(cx, cy), LAYER_STRUCTURE, SceneItem::Wall(gx, gy)));
                     }
-                    AlertState::Alert => {
-                        draw_text("!", ncx - 4.0, ncy - nvr - 4.0, 24.0, color_u8!(255, 50, 50, 255));
-                    }
+                    // v9: doors render as floor only (already drawn in floor pass).
+                    // No box. Future FOV system will handle closed-door darkening.
+                    Terrain::DoorClosed | Terrain::DoorOpen => {}
                     _ => {}
                 }
             }
+        }
 
-            // Debug: collision circle + facing direction + context steering vis.
-            if debug.visible {
-                let ncr = npc.radius * TILE_SIZE;
-                draw_circle_lines(ncx, ncy, ncr, 1.0, color_u8!(255, 80, 80, 180));
-                // Facing line.
-                let fl = TILE_SIZE * 1.0;
-                draw_line(
-                    ncx, ncy,
-                    ncx + npc.facing.0 * fl,
-                    ncy + npc.facing.1 * fl,
-                    2.0,
-                    color_u8!(255, 255, 100, 200),
-                );
+        // Player.
+        scene.push((iso_depth(vx, vy), LAYER_ACTOR, SceneItem::Player));
 
-                // NPC path / waypoint visualization.
+        // NPCs.
+        for (i, npc) in state.npcs.iter().enumerate() {
+            let (nx, ny) = npc.visual_pos(t);
+            scene.push((iso_depth(nx, ny), LAYER_ACTOR, SceneItem::Npc(i)));
+        }
+
+        // Sort by depth (back to front), then by layer (lower layer behind).
+        scene.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+
+        // Draw scene items with occlusion transparency.
+        let wall_h = debug.iso_wall_h;
+        // v9: door_closed_h / door_open_h no longer consumed (doors render as floor).
+        let actor_body_h = debug.iso_actor_body_h;
+        let actor_head_h = debug.iso_actor_head_h;
+        let actor_total_h = actor_body_h + actor_head_h;
+
+        // Pre-compute player screen position and depth for occlusion checks.
+        let player_depth = iso_depth(vx, vy);
+        let (player_sx, player_sy) = iso_w2s(vx, vy, cam_gx, cam_gy);
+
+        for &(depth, _, ref item) in &scene {
+            match item {
+                SceneItem::Wall(gx, gy) => {
+                    let (sx, sy) = iso_w2s(*gx as f32 + 0.5, *gy as f32 + 0.5, cam_gx, cam_gy);
+                    let outer = is_outer_wall(&state.map, *gx, *gy, state.map_w, state.map_h);
+                    let h = if outer { wall_h } else { wall_h * INNER_WALL_H_RATIO };
+                    // Fade walls that are in front of (higher depth) and occlude the player.
+                    let alpha = if depth > player_depth
+                        && item_occludes_player(sx, sy, h, player_sx, player_sy, actor_total_h)
+                    { OCCLUDE_ALPHA } else { 1.0 };
+                    // v9: walls outside player FOV use fog-darkened palette so
+                    // building outlines stay readable but lose detail.
+                    let lit = lit_cells.contains(&(*gx, *gy));
+                    let fog_pal;
+                    let palette: &WallPalette = if lit {
+                        &PALETTE_C_WALL
+                    } else {
+                        fog_pal = fog_wall_palette();
+                        &fog_pal
+                    };
+                    draw_iso_box_facet(
+                        sx, sy, ISO_HW, ISO_HH, h,
+                        palette,
+                        debug.art_outline_width,
+                        debug.art_outline_alpha,
+                        debug.art_outline_contrast,
+                        alpha,
+                    );
+                }
+                // v9: Door SceneItem variant unreachable (doors no longer pushed).
+                // Kept for safety / future FOV-based handling.
+                SceneItem::Door(_, _, _) => {}
+                SceneItem::Player => {
+                    let (sx, sy) = iso_w2s(vx, vy, cam_gx, cam_gy);
+                    let body_color = color_u8!(200, 72, 88, 255);
+                    let head_color = color_u8!(250, 220, 210, 255);
+                    // v9: switch to sitting pose if pooping / using toilet.
+                    match &state.move_state {
+                        MoveState::Pooping(q) | MoveState::UsingToilet(q) => {
+                            let progress = if q.rounds_needed > 0 {
+                                q.rounds_completed as f32 / q.rounds_needed as f32
+                            } else { 0.0 };
+                            draw_iso_actor_sitting(
+                                sx, sy,
+                                body_color, head_color,
+                                actor_body_h, actor_head_h,
+                                progress, q.round_failed,
+                                get_time() as f32,
+                            );
+                        }
+                        _ => {
+                            draw_iso_actor_box(
+                                sx, sy,
+                                body_color, head_color,
+                                actor_body_h, actor_head_h,
+                            );
+                        }
+                    }
+                }
+                SceneItem::Npc(i) => {
+                    let npc = &state.npcs[*i];
+                    let (nx, ny) = npc.visual_pos(t);
+                    let npc_cell = (nx.floor() as i32, ny.floor() as i32);
+                    let lit = lit_cells.contains(&npc_cell);
+                    // v9 awareness B: faint silhouette within NPC_PROXIMITY_RANGE
+                    // even when outside LoS — gives "somebody close" without
+                    // revealing exact pose / alert state.
+                    let dist_sq = (nx - vx).powi(2) + (ny - vy).powi(2);
+                    let in_proximity = dist_sq <= NPC_PROXIMITY_RANGE * NPC_PROXIMITY_RANGE;
+                    if !lit && !in_proximity { continue; }
+                    let (sx, sy) = iso_w2s(nx, ny, cam_gx, cam_gy);
+                    let body_color = if npc.chase.active {
+                        color_u8!(255, 50, 50, 255)
+                    } else {
+                        color_u8!(200, 100, 100, 255)
+                    };
+                    let head_color = color_u8!(250, 220, 210, 255);
+                    let (body_eff, head_eff) = if lit {
+                        (body_color, head_color)
+                    } else {
+                        // Proximity silhouette: heavy fog blend + reduced alpha.
+                        let bb = blend_color(body_color, FOG_TINT, NPC_SILHOUETTE_BLEND);
+                        let hh = blend_color(head_color, FOG_TINT, NPC_SILHOUETTE_BLEND);
+                        (with_alpha(bb, NPC_SILHOUETTE_ALPHA),
+                         with_alpha(hh, NPC_SILHOUETTE_ALPHA))
+                    };
+                    draw_iso_actor_box(
+                        sx, sy,
+                        body_eff, head_eff,
+                        actor_body_h, actor_head_h,
+                    );
+                    // Skip alert markers in silhouette mode — preserve mystery.
+                    if !lit { continue; }
+
+                    // Alert indicator above head (offset for box-based actor).
+                    let indicator_y = sy - actor_total_h - 8.0;
+                    if let Some(ref expr) = npc.chase.expression {
+                        let fade_in = (expr.age / 0.3).min(1.0);
+                        let fade_out = ((expr.lifetime - expr.age) / 0.5).min(1.0).max(0.0);
+                        let alpha = fade_in * fade_out;
+                        let tw = measure_text(&expr.text, None, 16, 1.0);
+                        draw_text(
+                            &expr.text,
+                            sx - tw.width * 0.5,
+                            indicator_y,
+                            16.0,
+                            Color::new(1.0, 0.9, 0.5, alpha),
+                        );
+                    } else if !npc.chase.active {
+                        match npc.alert_state {
+                            AlertState::Suspicious => {
+                                draw_text("?", sx - 5.0, indicator_y, 24.0, color_u8!(255, 220, 50, 255));
+                            }
+                            AlertState::Alert => {
+                                draw_text("!", sx - 4.0, indicator_y, 24.0, color_u8!(255, 50, 50, 255));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- v9 Awareness A: Sound ripples on floor (drawn last, fog-piercing) ---
+        // Each moving NPC emits 2 staggered ripples. Color = warm gray when
+        // unaware, red when chasing. Static NPCs emit nothing — silhouette (B)
+        // covers them at proximity.
+        for npc in &state.npcs {
+            let (nx, ny) = npc.visual_pos(t);
+            let speed = (npc.velocity.0 * npc.velocity.0
+                       + npc.velocity.1 * npc.velocity.1).sqrt();
+            if speed < RIPPLE_SPEED_THRESHOLD { continue; }
+            let (color, period) = if npc.chase.active {
+                (RIPPLE_COLOR_ALERT, RIPPLE_PERIOD_ALERT)
+            } else {
+                (RIPPLE_COLOR_NORMAL, RIPPLE_PERIOD_NORMAL)
+            };
+            let now = get_time() as f32;
+            let (sx, sy) = iso_w2s(nx, ny, cam_gx, cam_gy);
+            // Two staggered ripples for visual richness.
+            for stagger in 0..2 {
+                let phase = ((now / period) + stagger as f32 * 0.5).fract();
+                let scale = 1.0 + phase * (RIPPLE_GROW_FACTOR - 1.0);
+                let alpha = (1.0 - phase) * 0.45 * speed.min(1.0);
+                if alpha < 0.01 { continue; }
+                let rx = RIPPLE_BASE_RX * scale;
+                let ry = RIPPLE_BASE_RY * scale;
+                draw_ellipse_lines(sx, sy + 2.0, rx, ry, 0.0, 1.6,
+                                   with_alpha(color, alpha));
+                // Inner faint fill so ring reads on busy floor.
+                draw_ellipse(sx, sy + 2.0, rx, ry, 0.0,
+                             with_alpha(color, alpha * 0.18));
+            }
+        }
+
+        // Player screen position for HUD elements (E-hold bar, etc.).
+        let (cx, cy) = iso_w2s(vx, vy, cam_gx, cam_gy);
+        // Offset cy upward to reference player body center (half of total actor height).
+        let cy = cy - (actor_body_h + actor_head_h) * 0.5;
+
+        // --- Debug overlays (NPC paths, steering) ---
+        if debug.visible {
+            for (npc_idx, npc) in state.npcs.iter().enumerate() {
+                let (nx, ny) = npc.visual_pos(t);
+                let (ncx, ncy) = iso_w2s(nx, ny, cam_gx, cam_gy);
+
                 if debug.show_npc_paths && !npc.path.is_empty() {
                     let path = &npc.path;
                     let pi = npc.path_idx;
-
-                    // Draw path line: NPC → W0 → W1 → ... → Wn
                     let mut prev_sx = ncx;
                     let mut prev_sy = ncy;
                     for (wi, &(wx, wy)) in path.iter().enumerate() {
-                        let sx = (wx as f32 + 0.5) * TILE_SIZE - cam_x;
-                        let sy = (wy as f32 + 0.5) * TILE_SIZE - cam_y;
-
-                        // Line color: past=dim, current segment=bright, future=medium
+                        let (wsx, wsy) = iso_w2s(wx as f32 + 0.5, wy as f32 + 0.5, cam_gx, cam_gy);
                         let (line_col, line_w) = if wi < pi {
                             (color_u8!(80, 80, 80, 100), 1.0)
                         } else if wi == pi {
@@ -989,9 +1949,7 @@ async fn main() {
                         } else {
                             (color_u8!(50, 180, 255, 150), 1.5)
                         };
-                        draw_line(prev_sx, prev_sy, sx, sy, line_w, line_col);
-
-                        // Waypoint circle + label
+                        draw_line(prev_sx, prev_sy, wsx, wsy, line_w, line_col);
                         let r = if wi == pi { 5.0 } else { 3.0 };
                         let circle_col = if wi == pi {
                             color_u8!(50, 255, 50, 230)
@@ -1000,23 +1958,12 @@ async fn main() {
                         } else {
                             color_u8!(50, 180, 255, 200)
                         };
-                        draw_circle(sx, sy, r, circle_col);
-                        let label = format!("W{}", wi);
-                        draw_text(&label, sx + 6.0, sy - 4.0, 12.0, color_u8!(255, 255, 255, 200));
-
-                        prev_sx = sx;
-                        prev_sy = sy;
+                        draw_circle(wsx, wsy, r, circle_col);
+                        prev_sx = wsx;
+                        prev_sy = wsy;
                     }
 
-                    // Target tile: dashed indicator
-                    if let Some((tx, ty)) = npc.chase.target_tile {
-                        let tsx = (tx as f32 + 0.5) * TILE_SIZE - cam_x;
-                        let tsy = (ty as f32 + 0.5) * TILE_SIZE - cam_y;
-                        draw_circle_lines(tsx, tsy, 8.0, 2.0, color_u8!(255, 100, 50, 200));
-                        draw_text("TGT", tsx + 10.0, tsy - 2.0, 12.0, color_u8!(255, 100, 50, 220));
-                    }
-
-                    // Info label near NPC: phase, idx/total, timer
+                    // Info label near NPC.
                     let phase_str = match &npc.chase.phase {
                         game::chase::ChasePhase::Pursuit => "Pursuit",
                         game::chase::ChasePhase::Navigate { .. } => "Nav",
@@ -1033,16 +1980,13 @@ async fn main() {
                 // Context steering rays (first NPC only).
                 if npc_idx == 0 && debug.npc_steer_open {
                     let step = std::f32::consts::TAU / STEER_SLOTS as f32;
-                    // Find max score for normalisation.
-                    let max_score = npc.steer_scores.iter().cloned()
-                        .fold(0.01f32, f32::max);
+                    let max_score = npc.steer_scores.iter().cloned().fold(0.01f32, f32::max);
                     for i in 0..STEER_SLOTS {
                         let angle = step * i as f32;
                         let cdx = angle.cos();
                         let cdy = angle.sin();
                         let norm = npc.steer_scores[i] / max_score;
                         let ray_len = TILE_SIZE * 1.2 * norm;
-                        // Color: low=dim blue, high=bright green.
                         let g = (norm * 220.0) as u8;
                         let b = ((1.0 - norm) * 180.0) as u8;
                         let alpha = 80 + (norm * 150.0) as u8;
@@ -1053,7 +1997,6 @@ async fn main() {
                             Color::from_rgba(40, g, b, alpha),
                         );
                     }
-                    // Chosen direction — white, thicker.
                     let chosen_len = TILE_SIZE * 1.4;
                     draw_line(
                         ncx, ncy,
@@ -1061,25 +2004,6 @@ async fn main() {
                         ncy + npc.steer_chosen.1 * chosen_len,
                         2.5,
                         color_u8!(255, 255, 255, 220),
-                    );
-                }
-            }
-        }
-
-        // --- Layer 3: Wall tiles ---
-        for gy in 0..state.map_h {
-            for gx in 0..state.map_w {
-                let cell = state.map[idx(gx, gy, state.map_w)];
-                if cell.terrain != Terrain::Wall {
-                    continue;
-                }
-                let sx = gx as f32 * TILE_SIZE - cam_x;
-                let sy = gy as f32 * TILE_SIZE - cam_y;
-                draw_rectangle(sx, sy, TILE_SIZE, TILE_SIZE, color_u8!(100, 100, 110, 255));
-                if debug.visible {
-                    draw_rectangle_lines(
-                        sx, sy, TILE_SIZE, TILE_SIZE, 1.0,
-                        color_u8!(130, 130, 140, 150),
                     );
                 }
             }
@@ -1381,10 +2305,12 @@ async fn main() {
                 // Action buttons.
                 let btn_w_3 = (pw - 20.0) / 3.0;
                 if debug.button(panel_x, py, btn_w_3, btn_h, "Save", color_u8!(30, 80, 50, 230)) {
+                    eprintln!("[debug] Save button clicked");
                     save_config(&state.to_config());
                     save_flash = 1.5;
                 }
                 if debug.button(panel_x + btn_w_3 + 5.0, py, btn_w_3, btn_h, "Load", color_u8!(50, 40, 80, 230)) {
+                    eprintln!("[debug] Load button clicked");
                     let cfg = load_config();
                     state.apply_config(&cfg);
                 }
@@ -1411,6 +2337,20 @@ async fn main() {
                 };
                 if debug.button(panel_x, py, pw * 0.5, btn_h, label, col) {
                     debug.show_npc_paths = !debug.show_npc_paths;
+                }
+                py += btn_h + 4.0;
+            }
+
+            // --- Toggle: Show NPC vision cones (v9) ---
+            {
+                let label = if debug.show_npc_vision { "[x] NPC vision" } else { "[ ] NPC vision" };
+                let col = if debug.show_npc_vision {
+                    color_u8!(140, 80, 40, 230)
+                } else {
+                    color_u8!(50, 50, 60, 230)
+                };
+                if debug.button(panel_x, py, pw * 0.5, btn_h, label, col) {
+                    debug.show_npc_vision = !debug.show_npc_vision;
                 }
                 py += btn_h + 4.0;
             }
@@ -1622,56 +2562,35 @@ async fn main() {
                 if debug.mg_toggles_open {
                     let half = pw * 0.5 - 2.0;
                     let cb_h = 18.0;
-                    // Row 1: Doors+Conn | WFC Walls
+                    // Row 1: VoidSeal | Merge
+                    {
+                        let l = if debug.mg_void_seal { "[x] VoidSeal" } else { "[ ] VoidSeal" };
+                        let c = if debug.mg_void_seal { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                            debug.mg_void_seal = !debug.mg_void_seal;
+                        }
+                        let l2 = if debug.mg_merge { "[x] Merge" } else { "[ ] Merge" };
+                        let c2 = if debug.mg_merge { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
+                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
+                            debug.mg_merge = !debug.mg_merge;
+                        }
+                        py += cb_h + 2.0;
+                    }
+                    // Row 2: Doors
                     {
                         let l = if debug.mg_doors { "[x] Doors" } else { "[ ] Doors" };
                         let c = if debug.mg_doors { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x, py, half, cb_h, l, c) {
+                        if debug.button(panel_x, py, pw, cb_h, l, c) {
                             debug.mg_doors = !debug.mg_doors;
                         }
-                        let l2 = if debug.mg_wfc_walls { "[x] WFC Walls" } else { "[ ] WFC Walls" };
-                        let c2 = if debug.mg_wfc_walls { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
-                            debug.mg_wfc_walls = !debug.mg_wfc_walls;
-                        }
                         py += cb_h + 2.0;
                     }
-                    // Row 2: DoorAppr | MergeWall
+                    // Row 3: Shield density slider
                     {
-                        let l = if debug.mg_door_approaches { "[x] DoorAppr" } else { "[ ] DoorAppr" };
-                        let c = if debug.mg_door_approaches { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x, py, half, cb_h, l, c) {
-                            debug.mg_door_approaches = !debug.mg_door_approaches;
-                        }
-                        let l2 = if debug.mg_merge_walls { "[x] MergeWall" } else { "[ ] MergeWall" };
-                        let c2 = if debug.mg_merge_walls { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
-                            debug.mg_merge_walls = !debug.mg_merge_walls;
-                        }
-                        py += cb_h + 2.0;
-                    }
-                    // Row 3: Beds | VoidSeal
-                    {
-                        let l = if debug.mg_beds { "[x] Beds" } else { "[ ] Beds" };
-                        let c = if debug.mg_beds { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x, py, half, cb_h, l, c) {
-                            debug.mg_beds = !debug.mg_beds;
-                        }
-                        let l2 = if debug.mg_void_cleanup { "[x] VoidSeal" } else { "[ ] VoidSeal" };
-                        let c2 = if debug.mg_void_cleanup { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x + half + 4.0, py, half, cb_h, l2, c2) {
-                            debug.mg_void_cleanup = !debug.mg_void_cleanup;
-                        }
-                        py += cb_h + 2.0;
-                    }
-                    // Row 4: BedReval (solo)
-                    {
-                        let l = if debug.mg_bed_reval { "[x] BedReval" } else { "[ ] BedReval" };
-                        let c = if debug.mg_bed_reval { color_u8!(40, 60, 40, 230) } else { color_u8!(60, 30, 30, 230) };
-                        if debug.button(panel_x, py, half, cb_h, l, c) {
-                            debug.mg_bed_reval = !debug.mg_bed_reval;
-                        }
-                        py += cb_h + 2.0;
+                        let mut v = debug.mg_shield_density;
+                        debug.slider(57, panel_x, py, pw, "shield_density", &mut v, 0.0, 1.0);
+                        debug.mg_shield_density = v;
+                        py += 20.0;
                     }
                 }
 
@@ -1702,8 +2621,78 @@ async fn main() {
                     panel_x, py, pw,
                     &format!("map: {}x{} | {} rooms", state.map_w, state.map_h, state.rooms.len()),
                 );
-                let _ = py;
+                py += 24.0;
             }
+
+            // --- Collapsible: ISO RENDERING ---
+            py += 6.0;
+            {
+                let iso_header = if debug.iso_open {
+                    "▼ ISO RENDERING"
+                } else {
+                    "▶ ISO RENDERING"
+                };
+                if debug.button(
+                    panel_x, py, pw, 20.0,
+                    iso_header,
+                    color_u8!(55, 40, 30, 230),
+                ) {
+                    debug.iso_open = !debug.iso_open;
+                }
+                py += 22.0;
+            }
+            if debug.iso_open {
+                {
+                    let mut v = debug.iso_wall_h;
+                    debug.slider(90, panel_x, py, pw, "wall_h", &mut v, 4.0, 200.0);
+                    debug.iso_wall_h = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.iso_door_closed_h;
+                    debug.slider(91, panel_x, py, pw, "door_closed_h", &mut v, 4.0, 100.0);
+                    debug.iso_door_closed_h = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.iso_door_open_h;
+                    debug.slider(92, panel_x, py, pw, "door_open_h", &mut v, 1.0, 40.0);
+                    debug.iso_door_open_h = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.iso_actor_body_h;
+                    debug.slider(93, panel_x, py, pw, "actor_body_h", &mut v, 4.0, 60.0);
+                    debug.iso_actor_body_h = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.iso_actor_head_h;
+                    debug.slider(94, panel_x, py, pw, "actor_head_h", &mut v, 2.0, 30.0);
+                    debug.iso_actor_head_h = v;
+                }
+                py += row_h;
+                // v9 art-style sliders
+                {
+                    let mut v = debug.art_outline_width;
+                    debug.slider(95, panel_x, py, pw, "outline_w", &mut v, 0.0, 3.0);
+                    debug.art_outline_width = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.art_outline_alpha;
+                    debug.slider(96, panel_x, py, pw, "outline_alpha", &mut v, 0.0, 1.0);
+                    debug.art_outline_alpha = v;
+                }
+                py += row_h;
+                {
+                    let mut v = debug.art_outline_contrast;
+                    debug.slider(97, panel_x, py, pw, "outline_C", &mut v, 1.5, 7.0);
+                    debug.art_outline_contrast = v;
+                }
+                py += row_h;
+            }
+            let _ = py;
         }
 
         next_frame().await;
