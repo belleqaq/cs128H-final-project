@@ -205,11 +205,17 @@ thread_local! {
 // Alert / Activity / Routine
 // ---------------------------------------------------------------------------
 
+/// v9 stealth DFA — 3-state alert ladder per NPC.
+/// See output/stealth_dfa.svg + output/npc_dfa_simple.svg for transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertState {
-    Unaware,
-    Suspicious,
-    Alert,
+    /// Default. Walks routine. Sees player → no reaction. Ripple = warm gray.
+    Patrol,
+    /// Has witnessed crime or been told. Walks routine BUT chases on any LoS.
+    /// Ripple = amber. `!` head bubble visible when NPC is in player view.
+    Alerted,
+    /// Active pursuit (chase.active == true). A* path-following. Ripple = red.
+    Chasing,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +263,24 @@ pub struct Npc {
     pub radius: f32,
     pub routine: NpcRoutine,
     pub alert_state: AlertState,
+    /// v9.5 **unified memory**: cumulative suspicion replaces the old
+    /// `alert_timer` and `contact_timer` fields. Single continuous value
+    /// drives Alerted promotion (gated by `seen_crime`), `?`/`!` indicators,
+    /// and Director-AI dispatch priority.
+    /// Sources: smell fart (rate), Pooping LoS (bump to ceiling), word-of-mouth (rate).
+    /// Decays at SUSPICION_DECAY_RATE per second.
+    pub suspicion: f32,
+    /// v9.5: position of most recent fart smelled. Director uses this as
+    /// preferred dispatch target so the NPC investigates the trail.
+    pub last_smell_pos: Option<(f32, f32)>,
+    /// v9.5: permanent "this NPC has witnessed the crime" tag. Set on the
+    /// FIRST direct LoS to player Pooping. Once true, suspicion alone
+    /// (without re-witnessing) is enough to re-promote to Alerted.
+    /// Cleared only on map regen / chase_enabled OFF.
+    pub seen_crime: bool,
+    /// v9.5: Director-AI override target. When Some, NPC abandons routine
+    /// and paths here. On arrival, cleared and routine resumes.
+    pub director_target: Option<(i32, i32)>,
     /// Chase state (managed by chase module; removable).
     pub chase: ChaseState,
     pub path: Vec<(i32, i32)>,
@@ -282,7 +306,11 @@ impl Npc {
             facing: (0.0, 1.0),
             radius: NPC_RADIUS_DEFAULT,
             routine,
-            alert_state: AlertState::Unaware,
+            alert_state: AlertState::Patrol,
+            suspicion: 0.0,
+            last_smell_pos: None,
+            seen_crime: false,
+            director_target: None,
             chase: ChaseState::default(),
             path: Vec::new(),
             path_idx: 0,
@@ -316,6 +344,23 @@ impl Npc {
         let tick_s = tick_ms as f32 / 1000.0;
 
         self.prev_pos = self.pos;
+
+        // v9.5: Director-target arrival check. When NPC reaches the dispatched
+        // target, clear it and "look around" briefly (2s Performing). Next
+        // advance_activity restores normal routine.
+        if let Some(target) = self.director_target {
+            let dx = self.pos.0 - (target.0 as f32 + 0.5);
+            let dy = self.pos.1 - (target.1 as f32 + 0.5);
+            if dx * dx + dy * dy < 0.5 * 0.5 {
+                self.director_target = None;
+                self.velocity = (0.0, 0.0);
+                self.routine.phase = ActivityPhase::Performing;
+                self.routine.timer = 2.0;
+                self.path.clear();
+                self.path_idx = 0;
+                return;
+            }
+        }
 
         match self.routine.phase {
             ActivityPhase::Performing => {

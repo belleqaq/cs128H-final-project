@@ -11,7 +11,7 @@
 
 use crate::game::cell::{idx, Cell, Terrain, compute_passage_width, build_subgoal_graph, SubgoalGraph};
 use crate::game::config::GameConfig;
-use crate::game::npc::{self as npc_mod, Npc, SteerWeights};
+use crate::game::npc::{self as npc_mod, ActivityPhase, AlertState, Npc, SteerWeights};
 use crate::game::physics;
 use crate::game::room::{self, Room, RoomKind};
 use crate::game::BASELINE_TICK_MS;
@@ -129,6 +129,67 @@ impl PartialEq for QteState {
 }
 
 // ---------------------------------------------------------------------------
+// v9.5 Fart / Brown Aura / Director AI (see output/NPC_AI_SPEC.md §12-14)
+// ---------------------------------------------------------------------------
+
+/// An emitted fart aura — visible on floor for `lifetime` seconds, expanding
+/// to `max_radius`. Stationary at spawn position (does not follow player).
+#[derive(Clone, Debug)]
+pub struct Fart {
+    pub pos: (f32, f32),
+    pub spawn_t: f32,
+    pub max_radius: f32,
+    pub lifetime: f32,
+}
+
+/// v9.5 rhythm-game fart QTE.
+/// Dial is **always present** when urgency ≥ FART_QTE_URGENCY_THRESHOLD.
+/// Movement (any WASD press) triggers a judgment. Pass → long sleep
+/// (free movement window). Fail → fart + short sleep. Sleep duration
+/// adapts to current urgency (lower urgency = longer sleep).
+/// Standing still = no judgment, no fart, dial just rotates harmlessly.
+#[derive(Clone, Debug)]
+pub struct FartQteState {
+    pub pointer_angle: f32,        // current pointer angle (radians)
+    pub pointer_speed: f32,        // rad/sec, recomputed when waking
+    pub green_arc_start: f32,      // start of the green sweet spot
+    pub green_arc_width: f32,      // arc width, recomputed when waking
+    pub sleep_until: f32,          // sim_time at which dial wakes up
+}
+
+/// Map-derived constants for time-based AI calculations. Cached at map regen.
+#[derive(Clone, Debug)]
+pub struct MapStats {
+    pub avg_room_diagonal: f32,    // sqrt(avg_tiles) × √2
+    pub npc_speed: f32,            // approx cells/sec (~1.0 from physics)
+}
+
+impl Default for MapStats {
+    fn default() -> Self {
+        Self { avg_room_diagonal: 5.0, npc_speed: 1.0 }
+    }
+}
+
+/// v9.5 Adaptive Director (L4D-style) — single-responder dispatcher with
+/// self-tuning aggression. One internal `aggression` value drives all
+/// dispatch parameters (skip chance, cooldown, travel window).
+#[derive(Clone, Debug, Default)]
+pub struct AdaptiveDirector {
+    /// 0.0 = relaxed (just had encounter), 1.0 = intense (long quiet).
+    pub aggression: f32,
+    /// sim_time of last LoS sighting between any NPC and player.
+    pub last_encounter_at: f32,
+    /// # times player completed Pooping/UsingToilet without being caught.
+    pub pooping_successes: u32,
+    /// # times player was caught (chase.caught fired).
+    pub pooping_failures: u32,
+    /// Currently dispatched NPC, if any.
+    pub committed: Option<usize>,
+    pub commit_expire_at: f32,
+    pub last_check_at: f32,
+}
+
+// ---------------------------------------------------------------------------
 // Phase
 // ---------------------------------------------------------------------------
 
@@ -212,6 +273,25 @@ pub struct State {
     pub steer_weights: SteerWeights,
     /// Chase feature config (removable — see chase.rs).
     pub chase_config: crate::game::chase::ChaseConfig,
+    /// v9 debug: force chase trigger on plain LoS (bypass Pooping requirement).
+    /// Useful for testing chase AI without setting up the full pooping scenario.
+    pub chase_force_los: bool,
+    // --- v9.5: fart QTE / brown aura / director AI ---
+    /// Active fart auras on the map (spawn → expand → fade).
+    pub farts: Vec<Fart>,
+    /// Current fart QTE if active. None = no QTE running.
+    pub fart_qte: Option<FartQteState>,
+    /// Map-derived constants (cached at map regen).
+    pub map_stats: MapStats,
+    /// Adaptive Director AI dispatcher state.
+    pub director: AdaptiveDirector,
+    /// Tunable: per-hop door-pause time used in travel estimation.
+    pub director_door_pause: f32,
+    /// Tunable: base lifetime of a fart aura in seconds.
+    pub fart_lifetime_base: f32,
+    /// Monotonic in-game seconds since session start. Used by fart aging,
+    /// director cooldowns, etc. Advances by `tick_s` per physics tick.
+    pub sim_time: f32,
     /// Per-tile passage width (min of vertical/horizontal span). Precomputed.
     pub passage_width: Vec<u8>,
     /// Subgoal graph for fast cross-room pathfinding (corner subgoals).
@@ -312,6 +392,14 @@ impl State {
             npcs: Vec::new(),
             steer_weights: SteerWeights::default(),
             chase_config: crate::game::chase::ChaseConfig::default(),
+            chase_force_los: false,
+            farts: Vec::new(),
+            fart_qte: None,
+            map_stats: MapStats::default(),
+            director: AdaptiveDirector::default(),
+            director_door_pause: 0.6,
+            fart_lifetime_base: 10.0,
+            sim_time: 0.0,
             passage_width: pw,
             subgoal_graph: sg,
             rooms,
@@ -321,6 +409,7 @@ impl State {
             dbg_wall_ny: 0.0,
         };
         s.spawn_star();
+        s.refresh_map_stats();  // v9.5: cache map-derived constants
         s
     }
 
@@ -670,6 +759,10 @@ impl State {
         }
 
         let tick_s = self.tick_ms as f32 / 1000.0;
+        self.sim_time += tick_s;
+
+        // v9.5: fart QTE tick (urgency-driven dial-pointer rhythm minigame).
+        self.tick_fart_qte(tick_s);
 
         // --- Toast timer ---
         if let Some((_, ref mut t)) = self.toast {
@@ -699,8 +792,8 @@ impl State {
         self.steer_weights.pid_kd = kd;
         self.steer_weights.pid_ki = ki;
         // Chase update: check vision, manage chase state (before movement).
-        // v9: only Pooping (at star outside toilet) triggers chase; UsingToilet
-        // is legitimate and ignored. Maintenance phase doesn't need this gate.
+        // v9 DFA: only Pooping triggers Patrol→Alerted. force_chase_los is a
+        // debug bypass (treats plain LoS as crime trigger).
         let player_pooping = matches!(self.move_state, MoveState::Pooping(_));
         crate::game::chase::update_chase(
             &mut self.npcs,
@@ -714,7 +807,21 @@ impl State {
             &self.rooms,
             &self.tile_to_room,
             player_pooping,
+            self.chase_force_los,
+            &self.farts,
+            self.sim_time,
         );
+
+        // v9.5: garbage-collect expired farts.
+        let now = self.sim_time;
+        self.farts.retain(|f| now - f.spawn_t <= f.lifetime);
+
+        // v9.5: track encounter time + adaptive Director tick.
+        let any_los = self.npcs.iter().any(|n| n.alert_state == AlertState::Chasing);
+        if any_los {
+            self.director.last_encounter_at = now;
+        }
+        self.tick_director(tick_s);
         Self::tick_npcs(&mut self.npcs, &npc_params, &self.steer_weights, &self.map, self.map_w, self.map_h, self.tick_ms, &mut self.rng_state);
 
         // ========================================================
@@ -903,4 +1010,352 @@ impl State {
             self.prev_pos.1 + (self.pos.1 - self.prev_pos.1) * t,
         )
     }
+
+    // ===================================================================
+    // v9.5 Fart QTE (rhythm-game model) — see output/NPC_AI_SPEC.md §12.
+    //
+    // Mechanic: dial is ALWAYS present when urgency ≥ FART_QTE_URGENCY_THRESHOLD.
+    // Movement (WASD press) is a judgment trigger — green arc = pass (long
+    // sleep, free movement window); else = fail (short sleep + fart spawn).
+    // Standing still is safe.  Sleep durations adapt to urgency: low urgency
+    // grants long grace periods; high urgency gives almost no rest.
+    // ===================================================================
+
+    /// (green_arc_rad, pointer_speed_rad_per_s) at this urgency level.
+    fn fart_qte_dial_params(urgency: f32) -> (f32, f32) {
+        use std::f32::consts::TAU;
+        if urgency < 0.40       { (80f32.to_radians(), 0.4 * TAU) }
+        else if urgency < 0.55  { (60f32.to_radians(), 0.6 * TAU) }
+        else if urgency < 0.75  { (40f32.to_radians(), 0.9 * TAU) }
+        else if urgency < 0.90  { (25f32.to_radians(), 1.3 * TAU) }
+        else                    { (15f32.to_radians(), 1.8 * TAU) }
+    }
+
+    /// Failed-fart aura radius (cells) for current urgency.
+    fn fart_qte_failed_radius(urgency: f32) -> f32 {
+        if urgency < 0.40 { 2.0 }
+        else if urgency < 0.55 { 3.0 }
+        else if urgency < 0.75 { 4.0 }
+        else if urgency < 0.90 { 5.0 }
+        else { 6.0 }
+    }
+
+    /// Sleep duration after a successful judgment.
+    /// Lower urgency → longer free-movement window.
+    fn fart_qte_success_sleep(urgency: f32) -> f32 {
+        if urgency < 0.40 { 5.0 }
+        else if urgency < 0.55 { 4.0 }
+        else if urgency < 0.75 { 3.0 }
+        else if urgency < 0.90 { 2.0 }
+        else { 1.2 }
+    }
+
+    /// Sleep duration after a failed judgment (always shorter than success).
+    fn fart_qte_fail_sleep(urgency: f32) -> f32 {
+        if urgency < 0.40 { 1.5 }
+        else if urgency < 0.55 { 1.2 }
+        else if urgency < 0.75 { 0.9 }
+        else if urgency < 0.90 { 0.6 }
+        else { 0.4 }
+    }
+
+    fn tick_fart_qte(&mut self, tick_s: f32) {
+        const FART_QTE_URGENCY_THRESHOLD: f32 = 0.25;
+        let busy = matches!(
+            self.move_state,
+            MoveState::Pooping(_) | MoveState::UsingToilet(_)
+                | MoveState::Preparing | MoveState::StandingUp(_)
+        );
+        // QTE only exists while urgency is above threshold and we're not in
+        // a major animation state. Drop it otherwise (dial vanishes).
+        if busy || self.urgency < FART_QTE_URGENCY_THRESHOLD {
+            self.fart_qte = None;
+            return;
+        }
+
+        // Spawn fresh dial if just crossed threshold.
+        if self.fart_qte.is_none() {
+            let r = self.xorshift();
+            let (arc, speed) = Self::fart_qte_dial_params(self.urgency);
+            self.fart_qte = Some(FartQteState {
+                pointer_angle: 0.0,
+                pointer_speed: speed,
+                green_arc_start: (r as f32 / u32::MAX as f32) * std::f32::consts::TAU,
+                green_arc_width: arc,
+                // Initial small "ready up" grace before first judgment.
+                sleep_until: self.sim_time + 0.6,
+            });
+            return;
+        }
+
+        // Detect sleep → awake transition; if just woke, randomize for
+        // the next round and refresh difficulty from current urgency.
+        let now = self.sim_time;
+        let prev_now = now - tick_s;
+        let (was_sleeping, is_sleeping) = {
+            let q = self.fart_qte.as_ref().unwrap();
+            (q.sleep_until > prev_now, q.sleep_until > now)
+        };
+        if was_sleeping && !is_sleeping {
+            let r = self.xorshift();
+            let (arc, speed) = Self::fart_qte_dial_params(self.urgency);
+            let q = self.fart_qte.as_mut().unwrap();
+            q.green_arc_start = (r as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+            q.green_arc_width = arc;
+            q.pointer_speed = speed;
+        }
+
+        // Pointer only advances while awake.
+        if !is_sleeping {
+            let q = self.fart_qte.as_mut().unwrap();
+            q.pointer_angle = (q.pointer_angle + q.pointer_speed * tick_s)
+                % std::f32::consts::TAU;
+        }
+    }
+
+    /// Called when a direction key is pressed. Checks against the dial.
+    /// Returns: true on success (pass), false on fail OR no judgment
+    /// (dial sleeping / no dial active).
+    pub fn fart_qte_input(&mut self) -> bool {
+        let now = self.sim_time;
+        // Read-only scope to extract values, then drop borrow.
+        let (sleeping, in_green) = match self.fart_qte.as_ref() {
+            Some(q) => {
+                let sleeping = q.sleep_until > now;
+                let mut delta = (q.pointer_angle - q.green_arc_start)
+                    % std::f32::consts::TAU;
+                if delta < 0.0 { delta += std::f32::consts::TAU; }
+                let in_green = delta <= q.green_arc_width;
+                (sleeping, in_green)
+            }
+            None => return false,
+        };
+        if sleeping { return false; }
+
+        let urg = self.urgency;
+        if in_green {
+            self.urgency = (self.urgency - 0.05).max(0.0);
+            let sleep = Self::fart_qte_success_sleep(urg);
+            self.fart_qte.as_mut().unwrap().sleep_until = now + sleep;
+            true
+        } else {
+            self.spawn_fart_at_player(urg);
+            let sleep = Self::fart_qte_fail_sleep(urg);
+            self.fart_qte.as_mut().unwrap().sleep_until = now + sleep;
+            false
+        }
+    }
+
+    // ===================================================================
+    // v9.5 MapStats + AdaptiveDirector — see output/NPC_AI_SPEC.md §14.
+    // ===================================================================
+
+    /// Recompute map_stats from current rooms. Call after map regen.
+    pub fn refresh_map_stats(&mut self) {
+        let n = self.rooms.len().max(1) as f32;
+        let avg_tiles: f32 = self.rooms.iter()
+            .map(|r| r.tiles.len() as f32)
+            .sum::<f32>() / n;
+        // Diagonal of a square room of avg_tiles tiles: sqrt(N) * sqrt(2)
+        self.map_stats.avg_room_diagonal =
+            avg_tiles.sqrt() * std::f32::consts::SQRT_2;
+        self.map_stats.npc_speed = 1.0;  // approx cells/sec from physics
+    }
+
+    /// Estimate travel time (seconds) for an NPC to reach `target_pos`.
+    /// Uses room-graph hops × avg room diagonal + per-hop door pause.
+    fn estimate_travel_time(&self, npc: &crate::game::npc::Npc,
+                            target_pos: (f32, f32)) -> f32 {
+        let npc_tile = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
+        let tgt_tile = (target_pos.0.floor() as i32, target_pos.1.floor() as i32);
+        let in_bounds = |t: (i32, i32)| -> bool {
+            t.0 >= 0 && t.0 < self.map_w && t.1 >= 0 && t.1 < self.map_h
+        };
+        if !in_bounds(npc_tile) || !in_bounds(tgt_tile) { return 999.0; }
+        let n_room = self.tile_to_room[crate::game::cell::idx(
+            npc_tile.0, npc_tile.1, self.map_w)];
+        let t_room = self.tile_to_room[crate::game::cell::idx(
+            tgt_tile.0, tgt_tile.1, self.map_w)];
+        let manhattan = ((npc.pos.0 - target_pos.0).abs()
+                       + (npc.pos.1 - target_pos.1).abs());
+        // Same-room or unknown: trust Manhattan.
+        if n_room == t_room || n_room == usize::MAX || t_room == usize::MAX {
+            return manhattan / self.map_stats.npc_speed.max(0.01);
+        }
+        // Cross-room: BFS hops.
+        let hops = bfs_room_hops(n_room, t_room, &self.rooms).unwrap_or(99) as f32;
+        let per_hop = self.map_stats.avg_room_diagonal
+                    / self.map_stats.npc_speed.max(0.01)
+                    + self.director_door_pause;
+        hops * per_hop
+    }
+
+    /// Adaptive Director tick — runs every game tick.
+    pub fn tick_director(&mut self, tick_s: f32) {
+        if !self.chase_config.enabled { return; }
+        let now = self.sim_time;
+
+        // ---- 1. Update aggression toward target ----
+        // Layer 1: short-term tension based on time-since-last-encounter.
+        let since_enc = now - self.director.last_encounter_at;
+        let target_short = if since_enc < 5.0 { 0.0 }
+                           else if since_enc < 30.0 { 0.3 }
+                           else if since_enc < 90.0 { 0.6 }
+                           else { 0.9 };
+        // Layer 2: long-term bias from successes vs failures.
+        let s = self.director.pooping_successes as f32;
+        let f = self.director.pooping_failures as f32;
+        let bias = ((s - 2.0 * f) / 10.0).clamp(-0.3, 0.3);
+        let target = (target_short + bias).clamp(0.0, 1.0);
+        // Smooth lerp toward target.
+        self.director.aggression += (target - self.director.aggression) * 0.1 * tick_s;
+        self.director.aggression = self.director.aggression.clamp(0.0, 1.0);
+
+        // ---- 2. Crime-imminent flag ----
+        let player_at_star = self.is_player_at_star();
+        let crime_imm = matches!(self.move_state,
+            MoveState::Pooping(_) | MoveState::Preparing) && player_at_star;
+
+        // ---- 3. Committed responder housekeeping ----
+        if let Some(idx) = self.director.committed {
+            let done = idx >= self.npcs.len()
+                    || self.npcs[idx].alert_state == AlertState::Chasing
+                    || self.npcs[idx].director_target.is_none()
+                    || now > self.director.commit_expire_at;
+            if done {
+                self.director.committed = None;
+            } else {
+                return;  // wait for current responder
+            }
+        }
+
+        // ---- 4. Cooldown check ----
+        let agg = self.director.aggression;
+        let cooldown = if crime_imm {
+            5.0 * (1.5 - agg).max(0.3)
+        } else {
+            30.0 * (1.5 - agg).max(0.5)
+        };
+        if now - self.director.last_check_at < cooldown { return; }
+        self.director.last_check_at = now;
+
+        // ---- 5. Skip chance ----
+        let skip = (0.5 - 0.4 * agg).max(0.0);
+        let r = self.xorshift() as f32 / u32::MAX as f32;
+        if r < skip { return; }
+
+        // ---- 6. Pick best candidate ----
+        let travel_min = (2.0 - 0.5 * agg).max(0.5);
+        let travel_max = 8.0 + 2.0 * agg;
+        let threshold = if crime_imm { 1.0 } else { 0.5 };
+        let player_pos = self.pos;
+
+        let mut best: Option<(usize, f32)> = None;
+        for (i, npc) in self.npcs.iter().enumerate() {
+            if npc.alert_state == AlertState::Chasing { continue; }
+            if npc.director_target.is_some() { continue; }  // already on task
+            let desire = 0.5 * npc.suspicion + (if crime_imm { 5.0 } else { 0.0 });
+            if desire < threshold { continue; }
+            let t = self.estimate_travel_time(npc, player_pos);
+            if t < travel_min || t > travel_max { continue; }
+            if best.is_none() || desire > best.unwrap().1 {
+                best = Some((i, desire));
+            }
+        }
+        let chosen_idx = match best {
+            Some((i, _)) => i,
+            None => return,
+        };
+
+        // ---- 7. Compute target pos (last_smell_pos preferred over player_pos) ----
+        let bias_pos = self.npcs[chosen_idx].last_smell_pos.unwrap_or(player_pos);
+        let r1 = (self.xorshift() as f32 / u32::MAX as f32 - 0.5) * 4.0;
+        let r2 = (self.xorshift() as f32 / u32::MAX as f32 - 0.5) * 4.0;
+        let raw_x = (bias_pos.0 + r1).floor() as i32;
+        let raw_y = (bias_pos.1 + r2).floor() as i32;
+        // Clamp + walkable check.
+        let mut tgt = (raw_x.clamp(0, self.map_w - 1),
+                       raw_y.clamp(0, self.map_h - 1));
+        let cell = self.map[crate::game::cell::idx(tgt.0, tgt.1, self.map_w)];
+        if !cell.terrain.is_walkable() {
+            // Fallback: player tile itself.
+            let pt = (player_pos.0.floor() as i32, player_pos.1.floor() as i32);
+            tgt = (pt.0.clamp(0, self.map_w - 1), pt.1.clamp(0, self.map_h - 1));
+            if !self.map[crate::game::cell::idx(tgt.0, tgt.1, self.map_w)]
+                   .terrain.is_walkable() {
+                return;  // truly no valid target
+            }
+        }
+
+        self.dispatch_npc_to_target(chosen_idx, tgt);
+        self.director.committed = Some(chosen_idx);
+        self.director.commit_expire_at = now + 30.0;
+    }
+
+    /// Compute path + flip NPC into Traveling phase, with director_target set.
+    fn dispatch_npc_to_target(&mut self, npc_idx: usize, target: (i32, i32)) {
+        let from = {
+            let n = &self.npcs[npc_idx];
+            (n.pos.0.floor() as i32, n.pos.1.floor() as i32)
+        };
+        let raw = match npc_mod::astar(&self.map, self.map_w, self.map_h,
+                                       from, target) {
+            Some(p) => p,
+            None => return,  // unreachable; abort dispatch
+        };
+        let npc = &mut self.npcs[npc_idx];
+        let vel_spd = (npc.velocity.0 * npc.velocity.0
+                     + npc.velocity.1 * npc.velocity.1).sqrt();
+        let dir = if vel_spd > 1e-4 {
+            (npc.velocity.0 / vel_spd, npc.velocity.1 / vel_spd)
+        } else { (0.0, 0.0) };
+        let p = npc_mod::build_path(
+            raw, npc.radius, dir, &self.map, self.map_w, self.map_h);
+        npc.path = p;
+        npc.path_idx = 0;
+        npc.pid_integral = 0.0;
+        npc.pid_prev_error = 0.0;
+        npc.director_target = Some(target);
+        npc.routine.phase = ActivityPhase::Traveling;
+    }
+
+    /// True if player is on or adjacent to a star (crime committed here).
+    fn is_player_at_star(&self) -> bool {
+        let Some((sx, sy)) = self.star_pos else { return false; };
+        let pt = (self.pos.0.floor() as i32, self.pos.1.floor() as i32);
+        // Star is a 2×2 area; consider player "at star" if within bounding box.
+        pt.0 >= sx - 1 && pt.0 <= sx + 2 && pt.1 >= sy - 1 && pt.1 <= sy + 2
+    }
+
+    fn spawn_fart_at_player(&mut self, urgency_at_spawn: f32) {
+        let max_radius = Self::fart_qte_failed_radius(urgency_at_spawn);
+        self.farts.push(Fart {
+            pos: self.pos,
+            spawn_t: self.sim_time,
+            max_radius,
+            lifetime: self.fart_lifetime_base,
+        });
+    }
+}
+
+/// v9.5: BFS hop count between two rooms via Room.adjacent_rooms graph.
+/// Returns None if unreachable.
+fn bfs_room_hops(from: usize, to: usize,
+                 rooms: &[crate::game::room::Room]) -> Option<u32> {
+    if from == to { return Some(0); }
+    if from >= rooms.len() || to >= rooms.len() { return None; }
+    let mut visited = vec![false; rooms.len()];
+    let mut queue: std::collections::VecDeque<(usize, u32)> =
+        std::collections::VecDeque::new();
+    visited[from] = true;
+    queue.push_back((from, 0));
+    while let Some((cur, hops)) = queue.pop_front() {
+        for &(adj, _) in &rooms[cur].adjacent_rooms {
+            if adj >= rooms.len() || visited[adj] { continue; }
+            if adj == to { return Some(hops + 1); }
+            visited[adj] = true;
+            queue.push_back((adj, hops + 1));
+        }
+    }
+    None
 }

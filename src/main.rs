@@ -148,10 +148,17 @@ const RIPPLE_GROW_FACTOR: f32 = 2.6;
 const RIPPLE_PERIOD_NORMAL: f32 = 1.5;
 /// Faster pulses when actively chasing — danger feedback.
 const RIPPLE_PERIOD_ALERT: f32 = 0.7;
-/// Ripple color when NPC is unaware (warm gray, neutral).
+/// Ripple color when NPC is Patrol (warm gray, neutral).
 const RIPPLE_COLOR_NORMAL: Color = color_u8!(192, 184, 168, 255);
-/// Ripple color when NPC has detected target — red, "已索敌".
+/// Ripple color when NPC is Alerted (amber — "knows but not actively chasing").
+const RIPPLE_COLOR_AMBER: Color = color_u8!(232, 144, 80, 255);
+/// Ripple color when NPC is Chasing (red, "已索敌").
 const RIPPLE_COLOR_ALERT: Color = color_u8!(200, 64, 80, 255);
+/// v9: stationary alerted/chasing NPCs emit a slow "breathing" pulse
+/// instead of full ripple, so player can detect their presence even if they
+/// aren't moving. Period = 4.0s, max scale = 1.5x base, low alpha.
+const RIPPLE_BREATH_PERIOD: f32 = 4.0;
+const RIPPLE_BREATH_GROW: f32 = 1.5;
 
 /// "Spider sense" range: NPCs within this distance are visible as a faint
 /// silhouette even outside the player's line of sight. Conveys "there's
@@ -258,6 +265,108 @@ fn item_occludes_player(
 }
 
 /// Draw a flat isometric diamond with custom dimensions.
+// =====================================================================
+// v9 Chase HUD — full-screen red overlay + top-left chasing-NPC indicator.
+// =====================================================================
+
+/// Pure red used for the screen-tint overlay (high saturation per spec).
+const CHASE_TINT_RED: (f32, f32, f32) = (1.0, 0.06, 0.06);
+/// Center alpha at full intensity (very faint per "整体透明度低").
+const CHASE_TINT_CENTER_ALPHA: f32 = 0.04;
+/// Edge alpha at full intensity (slightly higher for soft vignette).
+const CHASE_TINT_EDGE_ALPHA: f32 = 0.10;
+/// Width of edge band on each side (px).
+const CHASE_TINT_BAND: f32 = 220.0;
+
+/// Draw a faint red vignette over the whole screen. `intensity` ∈ [0, 1].
+/// Center base layer + 4 edge bands → soft "微红" with edges slightly redder.
+fn draw_chase_red_overlay(intensity: f32) {
+    if intensity < 0.001 { return; }
+    let sw = screen_width();
+    let sh = screen_height();
+    let (r, g, b) = CHASE_TINT_RED;
+    // Base full-screen tint.
+    let base_a = CHASE_TINT_CENTER_ALPHA * intensity;
+    draw_rectangle(0.0, 0.0, sw, sh, Color::new(r, g, b, base_a));
+    // Extra alpha on 4 edge bands (vignette feel; smooth via 4 stepped insets).
+    let extra = (CHASE_TINT_EDGE_ALPHA - CHASE_TINT_CENTER_ALPHA) * intensity;
+    let steps = 4;
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;        // 0..<1
+        let band_a = extra * (1.0 - t).powi(2); // quadratic falloff inward
+        let inset = CHASE_TINT_BAND * t;
+        let bw = CHASE_TINT_BAND / steps as f32;
+        let col = Color::new(r, g, b, band_a);
+        // Top
+        draw_rectangle(0.0, inset, sw, bw, col);
+        // Bottom
+        draw_rectangle(0.0, sh - inset - bw, sw, bw, col);
+        // Left (skip corners, already covered by top/bottom)
+        draw_rectangle(inset, CHASE_TINT_BAND, bw, sh - 2.0 * CHASE_TINT_BAND, col);
+        // Right
+        draw_rectangle(sw - inset - bw, CHASE_TINT_BAND, bw, sh - 2.0 * CHASE_TINT_BAND, col);
+    }
+}
+
+/// Mini iso NPC head for the chase HUD indicator. Proportions match the
+/// in-game NPC head (HW : HH : H ≈ 1.66 : 0.96 : 1.0, scaled up for HUD size),
+/// eyes placed on the **top diamond face** (per spec: "顶点上面") so the
+/// little head reads as "looking up at the camera".
+fn draw_mini_npc_head(cx: f32, cy: f32, alpha: f32) {
+    const HW: f32 = 22.0;
+    const HH: f32 = 12.0;
+    const H:  f32 = 14.0;
+    let head  = with_alpha(color_u8!(250, 220, 210, 255), alpha);
+    let front = with_alpha(color_u8!(195, 172, 164, 255), alpha);
+    let right = with_alpha(color_u8!(155, 136, 130, 255), alpha);
+    let s = vec2(cx, cy + HH);
+    let w = vec2(cx - HW, cy);
+    let e = vec2(cx + HW, cy);
+    let nt = vec2(cx, cy - HH - H);
+    let et = vec2(cx + HW, cy - H);
+    let st = vec2(cx, cy + HH - H);
+    let wt = vec2(cx - HW, cy - H);
+    draw_triangle(wt, st, s, front);
+    draw_triangle(wt, s, w, front);
+    draw_triangle(st, et, e, right);
+    draw_triangle(st, e, s, right);
+    draw_triangle(nt, et, st, head);
+    draw_triangle(nt, st, wt, head);
+    // Eyes on top diamond — visible from the camera angle (顶点上面).
+    // Top diamond center y = cy - H; placing eyes 2px above it for a "looking
+    // up" feel. Eye spacing = HW * 0.23, eye radius = 2.5.
+    let eye_y = cy - H - 2.0;
+    let eye_col = with_alpha(color_u8!(35, 25, 20, 255), alpha);
+    draw_circle(cx - 5.0, eye_y, 2.5, eye_col);
+    draw_circle(cx + 5.0, eye_y, 2.5, eye_col);
+}
+
+/// Top-left chase indicator: NPC head + " : " + count, all white, no backdrop.
+/// Drop shadow for legibility. Pulses subtly while visible.
+fn draw_chase_indicator(count: usize, alpha: f32) {
+    if alpha < 0.001 || count == 0 { return; }
+    let now = get_time() as f32;
+    let pulse = 0.85 + 0.15 * (now * std::f32::consts::TAU * 1.5).sin();
+    let a = alpha * pulse;
+    let head_x = 50.0;
+    let head_y = 48.0;
+    draw_mini_npc_head(head_x, head_y, a);
+    let text_color = color_u8!(255, 255, 255, 255);
+    let shadow_color = color_u8!(0, 0, 0, 180);
+    let colon = ":";
+    let count_str = format!("{}", count);
+    let colon_x = head_x + 30.0;
+    let count_x = colon_x + 18.0;
+    let baseline_y = head_y + 8.0;
+    let font_size = 36.0;
+    // Drop shadow.
+    draw_text(colon, colon_x + 2.0, baseline_y + 2.0, font_size, with_alpha(shadow_color, a));
+    draw_text(&count_str, count_x + 2.0, baseline_y + 2.0, font_size, with_alpha(shadow_color, a));
+    // Foreground (white).
+    draw_text(colon, colon_x, baseline_y, font_size, with_alpha(text_color, a));
+    draw_text(&count_str, count_x, baseline_y, font_size, with_alpha(text_color, a));
+}
+
 fn draw_iso_diamond_sized(cx: f32, cy: f32, hw: f32, hh: f32, color: Color) {
     let n = vec2(cx, cy - hh);
     let e = vec2(cx + hw, cy);
@@ -1010,6 +1119,9 @@ struct DebugPanel {
     show_npc_paths: bool,
     /// Whether NPC vision cones are rendered on the floor.
     show_npc_vision: bool,
+    /// v9 debug: whether player FOV / fog of war is active. OFF → everything
+    /// renders full color (useful for debugging chase + alert visuals).
+    show_fog: bool,
     /// Whether the Map Gen section is expanded.
     mapgen_open: bool,
     /// Show room boundaries overlay.
@@ -1070,6 +1182,7 @@ impl DebugPanel {
             npc_steer_open: false,
             show_npc_paths: false,
             show_npc_vision: false,
+            show_fog: true,
             mapgen_open: false,
             show_room_bounds: false,
             show_room_ids: false,
@@ -1483,6 +1596,10 @@ async fn main() {
     let mut save_flash: f32 = 0.0;
     let mut prev_e_down = false;
 
+    // v9 chase HUD: full-screen red intensity, lerps toward target each frame.
+    // 0.0 = no overlay; 1.0 = max (still very faint per "微红" spec).
+    let mut screen_red_intensity: f32 = 0.0;
+
     loop {
         // -- Toggle debug panel --
         if is_key_pressed(KeyCode::Tab) {
@@ -1500,6 +1617,19 @@ async fn main() {
         let e_down = is_key_down(KeyCode::E);
         let e_pressed = e_down && !prev_e_down;
         prev_e_down = e_down;
+
+        // v9.5: fart QTE input — any direction key press while a fart QTE is
+        // active triggers the input check. Not exclusive — fires alongside
+        // normal movement. Only one direction press per frame counts.
+        if state.fart_qte.is_some() && !debug.is_editing() {
+            if is_key_pressed(KeyCode::W)
+                || is_key_pressed(KeyCode::A)
+                || is_key_pressed(KeyCode::S)
+                || is_key_pressed(KeyCode::D)
+            {
+                state.fart_qte_input();
+            }
+        }
 
         if frozen {
             // StandingUp: all input suppressed.
@@ -1597,10 +1727,21 @@ async fn main() {
         // v9: Player FOV — true line-of-sight, no distance cap. Open doors
         // pass through (door_blocks_vision=false); closed doors and walls block.
         // Includes terminator walls so building outlines remain visible.
-        let lit_cells: std::collections::HashSet<(i32, i32)> = game::chase::compute_lit_cells_radial(
-            (vx, vy), &state.map, state.map_w, state.map_h,
-            PLAYER_VISION_RANGE, false,
-        ).into_iter().collect();
+        // Debug: show_fog=false → mark every cell lit (no fog blending anywhere).
+        let lit_cells: std::collections::HashSet<(i32, i32)> = if debug.show_fog {
+            game::chase::compute_lit_cells_radial(
+                (vx, vy), &state.map, state.map_w, state.map_h,
+                PLAYER_VISION_RANGE, false,
+            ).into_iter().collect()
+        } else {
+            let mut all = std::collections::HashSet::new();
+            for y in 0..state.map_h {
+                for x in 0..state.map_w {
+                    all.insert((x, y));
+                }
+            }
+            all
+        };
         let is_lit = |gx: i32, gy: i32| lit_cells.contains(&(gx, gy));
 
         // --- Layer 1: Floor diamonds (fog-blended outside FOV) ---
@@ -1840,10 +1981,11 @@ async fn main() {
                     let in_proximity = dist_sq <= NPC_PROXIMITY_RANGE * NPC_PROXIMITY_RANGE;
                     if !lit && !in_proximity { continue; }
                     let (sx, sy) = iso_w2s(nx, ny, cam_gx, cam_gy);
-                    let body_color = if npc.chase.active {
-                        color_u8!(255, 50, 50, 255)
-                    } else {
-                        color_u8!(200, 100, 100, 255)
+                    // v9: body color tracks AlertState 3-tier (pink / orange / red).
+                    let body_color = match npc.alert_state {
+                        AlertState::Patrol  => color_u8!(200, 100, 100, 255),  // pink
+                        AlertState::Alerted => color_u8!(232, 144, 80, 255),   // orange (matches `!` bubble)
+                        AlertState::Chasing => color_u8!(255, 50, 50, 255),    // saturated red
                     };
                     let head_color = color_u8!(250, 220, 210, 255);
                     let (body_eff, head_eff) = if lit {
@@ -1860,69 +2002,195 @@ async fn main() {
                         body_eff, head_eff,
                         actor_body_h, actor_head_h,
                     );
-                    // Skip alert markers in silhouette mode — preserve mystery.
-                    if !lit { continue; }
 
-                    // Alert indicator above head (offset for box-based actor).
-                    let indicator_y = sy - actor_total_h - 8.0;
-                    if let Some(ref expr) = npc.chase.expression {
+                    // v9 head-bubble layering (precedence top-down):
+                    //   1. Chasing + Pursuit (has LoS)        → red `!!` (overrides kaomoji)
+                    //   2. Chasing + Navigate/Search (lost LoS) → kaomoji (CONFUSED)
+                    //   3. Alerted                              → yellow `!`
+                    //   4. Patrol with active expression        → kaomoji (transitions)
+                    let indicator_y = sy - actor_total_h - 12.0;
+                    let pursuing_with_los = npc.alert_state == AlertState::Chasing
+                        && matches!(npc.chase.phase, game::chase::ChasePhase::Pursuit);
+
+                    if pursuing_with_los {
+                        // Red `!!` — overrides any kaomoji during active pursuit.
+                        let pulse = 0.85 + 0.15 * (get_time() as f32 * 3.5).sin();
+                        let glow = with_alpha(color_u8!(255, 48, 48, 255), pulse * 0.50);
+                        let outline = with_alpha(color_u8!(0, 0, 0, 255), pulse);
+                        let fg = with_alpha(color_u8!(255, 32, 32, 255), pulse);
+                        draw_text("!!", sx - 13.0, indicator_y + 1.0, 40.0, glow);
+                        for (ox, oy) in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0),
+                                         (-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)] {
+                            draw_text("!!", sx - 12.0 + ox, indicator_y + oy, 36.0, outline);
+                        }
+                        draw_text("!!", sx - 12.0, indicator_y, 36.0, fg);
+                    } else if let Some(ref expr) = npc.chase.expression {
+                        // Kaomoji (Navigate/Search confusion, or Patrol→Alerted transitions).
                         let fade_in = (expr.age / 0.3).min(1.0);
                         let fade_out = ((expr.lifetime - expr.age) / 0.5).min(1.0).max(0.0);
                         let alpha = fade_in * fade_out;
-                        let tw = measure_text(&expr.text, None, 16, 1.0);
+                        let font_size = 22.0;
+                        let tw = measure_text(&expr.text, None, font_size as u16, 1.0);
+                        draw_text(
+                            &expr.text,
+                            sx - tw.width * 0.5 + 1.0,
+                            indicator_y + 1.0,
+                            font_size,
+                            Color::new(0.0, 0.0, 0.0, alpha * 0.7),
+                        );
                         draw_text(
                             &expr.text,
                             sx - tw.width * 0.5,
                             indicator_y,
-                            16.0,
-                            Color::new(1.0, 0.9, 0.5, alpha),
+                            font_size,
+                            Color::new(1.0, 0.92, 0.55, alpha),
                         );
-                    } else if !npc.chase.active {
-                        match npc.alert_state {
-                            AlertState::Suspicious => {
-                                draw_text("?", sx - 5.0, indicator_y, 24.0, color_u8!(255, 220, 50, 255));
-                            }
-                            AlertState::Alert => {
-                                draw_text("!", sx - 4.0, indicator_y, 24.0, color_u8!(255, 50, 50, 255));
-                            }
-                            _ => {}
+                    } else if npc.alert_state == AlertState::Alerted {
+                        // Yellow `!` — gentle pulse, glow halo, black outline.
+                        let pulse = 0.85 + 0.15 * (get_time() as f32 * 2.5).sin();
+                        let glow = with_alpha(color_u8!(255, 235, 64, 255), pulse * 0.45);
+                        let outline = with_alpha(color_u8!(0, 0, 0, 255), pulse);
+                        let fg = with_alpha(color_u8!(255, 216, 32, 255), pulse);
+                        draw_text("!", sx - 6.0, indicator_y + 1.0, 40.0, glow);
+                        for (ox, oy) in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0),
+                                         (-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)] {
+                            draw_text("!", sx - 5.0 + ox, indicator_y + oy, 36.0, outline);
                         }
+                        draw_text("!", sx - 5.0, indicator_y, 36.0, fg);
+                    } else if npc.alert_state == AlertState::Patrol
+                        && npc.suspicion >= game::chase::SUSPICION_CURIOUS_THRESHOLD
+                    {
+                        // v9.5: "curious" — Patrol with suspicion 1.0–1.9.
+                        // Yellow `?` (smaller / softer than Alerted's `!`).
+                        let pulse = 0.75 + 0.20 * (get_time() as f32 * 1.8).sin();
+                        let glow = with_alpha(color_u8!(255, 220, 60, 255), pulse * 0.40);
+                        let outline = with_alpha(color_u8!(0, 0, 0, 255), pulse);
+                        let fg = with_alpha(color_u8!(255, 220, 80, 255), pulse);
+                        draw_text("?", sx - 7.0, indicator_y + 1.0, 36.0, glow);
+                        for (ox, oy) in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0)] {
+                            draw_text("?", sx - 6.0 + ox, indicator_y + oy, 32.0, outline);
+                        }
+                        draw_text("?", sx - 6.0, indicator_y, 32.0, fg);
                     }
                 }
             }
         }
 
         // --- v9 Awareness A: Sound ripples on floor (drawn last, fog-piercing) ---
-        // Each moving NPC emits 2 staggered ripples. Color = warm gray when
-        // unaware, red when chasing. Static NPCs emit nothing — silhouette (B)
-        // covers them at proximity.
+        // Three behaviours, gated by AlertState + movement:
+        //   1. Patrol moving      → warm gray ripple, normal cadence
+        //   2. Alerted moving     → amber ripple, normal cadence
+        //   3. Chasing moving     → red ripple, fast cadence
+        //   4. Patrol static      → no ripple
+        //   5. Alerted/Chasing static → slow "breathing" ring (low alpha, slow)
         for npc in &state.npcs {
             let (nx, ny) = npc.visual_pos(t);
             let speed = (npc.velocity.0 * npc.velocity.0
                        + npc.velocity.1 * npc.velocity.1).sqrt();
-            if speed < RIPPLE_SPEED_THRESHOLD { continue; }
-            let (color, period) = if npc.chase.active {
-                (RIPPLE_COLOR_ALERT, RIPPLE_PERIOD_ALERT)
-            } else {
-                (RIPPLE_COLOR_NORMAL, RIPPLE_PERIOD_NORMAL)
+            let moving = speed >= RIPPLE_SPEED_THRESHOLD;
+            let alert = npc.alert_state;
+            // Static Patrol = invisible (silhouette B handles proximity case).
+            if !moving && alert == AlertState::Patrol { continue; }
+
+            let color = match alert {
+                AlertState::Patrol  => RIPPLE_COLOR_NORMAL,
+                AlertState::Alerted => RIPPLE_COLOR_AMBER,
+                AlertState::Chasing => RIPPLE_COLOR_ALERT,
             };
             let now = get_time() as f32;
             let (sx, sy) = iso_w2s(nx, ny, cam_gx, cam_gy);
-            // Two staggered ripples for visual richness.
-            for stagger in 0..2 {
-                let phase = ((now / period) + stagger as f32 * 0.5).fract();
-                let scale = 1.0 + phase * (RIPPLE_GROW_FACTOR - 1.0);
-                let alpha = (1.0 - phase) * 0.45 * speed.min(1.0);
+
+            // v9 visibility bump: alpha amplified, speed factor floored at 40%
+            // so slow-walking NPCs still render a clear ring. Alerted/Chasing
+            // tiers get extra alpha boost since their visibility matters most.
+            let tier_boost = match alert {
+                AlertState::Patrol  => 1.0,
+                AlertState::Alerted => 1.3,
+                AlertState::Chasing => 1.5,
+            };
+            if moving {
+                // Active ripple — 2 staggered rings, more visible.
+                let period = if alert == AlertState::Chasing {
+                    RIPPLE_PERIOD_ALERT
+                } else {
+                    RIPPLE_PERIOD_NORMAL
+                };
+                let speed_factor = 0.4 + 0.6 * speed.min(1.0);  // floor 40%
+                for stagger in 0..2 {
+                    let phase = ((now / period) + stagger as f32 * 0.5).fract();
+                    let scale = 1.0 + phase * (RIPPLE_GROW_FACTOR - 1.0);
+                    let alpha = (1.0 - phase) * 0.75 * speed_factor * tier_boost;
+                    if alpha < 0.01 { continue; }
+                    let rx = RIPPLE_BASE_RX * scale;
+                    let ry = RIPPLE_BASE_RY * scale;
+                    draw_ellipse_lines(sx, sy + 2.0, rx, ry, 0.0, 2.4,
+                                       with_alpha(color, alpha));
+                    draw_ellipse(sx, sy + 2.0, rx, ry, 0.0,
+                                 with_alpha(color, alpha * 0.30));
+                }
+            } else {
+                // Breathing ring — slower & smaller but VISIBLE for static
+                // alerted/chasing NPCs (their only pre-LoS signal).
+                let phase = (now / RIPPLE_BREATH_PERIOD).fract();
+                let scale = 1.0 + phase * (RIPPLE_BREATH_GROW - 1.0);
+                let alpha = (1.0 - phase) * 0.55 * tier_boost;
                 if alpha < 0.01 { continue; }
-                let rx = RIPPLE_BASE_RX * scale;
-                let ry = RIPPLE_BASE_RY * scale;
-                draw_ellipse_lines(sx, sy + 2.0, rx, ry, 0.0, 1.6,
+                let rx = RIPPLE_BASE_RX * scale * 0.7;
+                let ry = RIPPLE_BASE_RY * scale * 0.7;
+                draw_ellipse_lines(sx, sy + 2.0, rx, ry, 0.0, 2.0,
                                    with_alpha(color, alpha));
-                // Inner faint fill so ring reads on busy floor.
                 draw_ellipse(sx, sy + 2.0, rx, ry, 0.0,
-                             with_alpha(color, alpha * 0.18));
+                             with_alpha(color, alpha * 0.20));
             }
         }
+
+        // --- v9.5 Brown aura overlay (active farts, fog-piercing) ---
+        // Each fart at its spawn pos. Phases:
+        //   age 0–1s    : expand to max_radius
+        //   1s–lifetime-1.5s : hold at max alpha + max radius
+        //   last 1.5s   : linear fade out
+        for fart in &state.farts {
+            let age = state.sim_time - fart.spawn_t;
+            if age < 0.0 || age > fart.lifetime { continue; }
+            let radius = age.min(1.0) * fart.max_radius;
+            let fade_start = fart.lifetime - 1.5;
+            let alpha = if age < fade_start {
+                1.0
+            } else {
+                let t = ((age - fade_start) / 1.5).clamp(0.0, 1.0);
+                1.0 - t
+            };
+            let (sx, sy) = iso_w2s(fart.pos.0, fart.pos.1, cam_gx, cam_gy);
+            // Radius in world cells → screen px (iso has different x/y scales).
+            let rx = ISO_HW * radius;
+            let ry = ISO_HH * radius;
+            // Outer ring
+            let brown = color_u8!(122, 76, 50, 255);
+            let brown_dark = color_u8!(74, 44, 28, 255);
+            draw_ellipse_lines(sx, sy + 2.0, rx, ry, 0.0, 2.5,
+                               with_alpha(brown_dark, alpha * 0.85));
+            draw_ellipse(sx, sy + 2.0, rx * 0.92, ry * 0.92, 0.0,
+                         with_alpha(brown, alpha * 0.22));
+            // Inner ring (smaller, more saturated)
+            draw_ellipse_lines(sx, sy + 2.0, rx * 0.6, ry * 0.6, 0.0, 1.8,
+                               with_alpha(brown_dark, alpha * 0.55));
+        }
+
+        // --- v9 Chase HUD: red overlay + top-left indicator ---
+        // Lerp screen_red_intensity toward target. Asymmetric fade (in faster
+        // than out) for "alarm rises quickly, tension lingers" feel.
+        let chasing_count = state.npcs.iter()
+            .filter(|n| n.alert_state == AlertState::Chasing)
+            .count();
+        let target_intensity = if chasing_count > 0 { 1.0 } else { 0.0 };
+        let dt = get_frame_time();
+        // 0.8s fade-in, 1.5s fade-out.
+        let fade_time = if target_intensity > screen_red_intensity { 0.8 } else { 1.5 };
+        let rate = (dt / fade_time).clamp(0.0, 1.0);
+        screen_red_intensity += (target_intensity - screen_red_intensity) * rate;
+
+        draw_chase_red_overlay(screen_red_intensity);
+        draw_chase_indicator(chasing_count, screen_red_intensity);
 
         // Player screen position for HUD elements (E-hold bar, etc.).
         let (cx, cy) = iso_w2s(vx, vy, cam_gx, cam_gy);
@@ -2091,6 +2359,68 @@ async fn main() {
         }
 
         // --- QTE Overlay ---
+        // --- v9.5 Fart QTE dial UI (top-center, always present once urgency>=25%) ---
+        if let Some(ref fqte) = state.fart_qte {
+            let now = state.sim_time;
+            let sleeping = fqte.sleep_until > now;
+            let cx = screen_width() * 0.5;
+            let cy = 120.0;
+            let r = 60.0;
+            // Dimmed when sleeping (free movement window).
+            let dim = if sleeping { 0.35 } else { 1.0 };
+            // Backdrop
+            draw_circle(cx, cy, r + 10.0,
+                        with_alpha(color_u8!(20, 18, 26, 255), 0.78));
+            draw_circle(cx, cy, r + 8.0,
+                        with_alpha(color_u8!(40, 36, 50, 255), 0.90));
+            // Green sweet-spot arc — radial line segments.
+            const N: i32 = 30;
+            let arc_step = fqte.green_arc_width / N as f32;
+            let arc_color = if sleeping {
+                color_u8!(60, 130, 80, 220)
+            } else {
+                color_u8!(80, 220, 110, 230)
+            };
+            for i in 0..N {
+                let a = fqte.green_arc_start + arc_step * i as f32;
+                let inner = r - 14.0;
+                let outer = r + 4.0;
+                let x0 = cx + a.cos() * inner;
+                let y0 = cy + a.sin() * inner;
+                let x1 = cx + a.cos() * outer;
+                let y1 = cy + a.sin() * outer;
+                draw_line(x0, y0, x1, y1, 3.0, with_alpha(arc_color, dim));
+            }
+            // Outer ring
+            draw_circle_lines(cx, cy, r, 2.0,
+                              with_alpha(color_u8!(220, 220, 220, 255), dim));
+            // Pointer (only animates when awake; static at last position when sleeping)
+            let px = cx + fqte.pointer_angle.cos() * (r - 4.0);
+            let py = cy + fqte.pointer_angle.sin() * (r - 4.0);
+            let ptr_color = if sleeping {
+                color_u8!(140, 140, 140, 255)
+            } else {
+                color_u8!(255, 240, 80, 255)
+            };
+            draw_line(cx, cy, px, py, 3.5, with_alpha(ptr_color, dim));
+            draw_circle(cx, cy, 6.0, with_alpha(ptr_color, dim));
+            draw_circle(px, py, 4.0, with_alpha(ptr_color, dim));
+            // State hint text
+            let hint = if sleeping {
+                let remaining = fqte.sleep_until - now;
+                format!("...zzz  ({:.1}s safe)", remaining.max(0.0))
+            } else {
+                "MOVE TO RHYTHM  [W A S D]".to_string()
+            };
+            let hint_color = if sleeping {
+                color_u8!(180, 200, 220, 220)
+            } else {
+                color_u8!(255, 240, 200, 240)
+            };
+            let tw = measure_text(&hint, None, 16, 1.0);
+            draw_text(&hint, cx - tw.width * 0.5, cy + r + 28.0, 16.0, hint_color);
+        }
+
         if let MoveState::Pooping(ref qte) | MoveState::UsingToilet(ref qte) = state.move_state {
             let qte_w = 320.0;
             let qte_h = 150.0;
@@ -2355,6 +2685,20 @@ async fn main() {
                 py += btn_h + 4.0;
             }
 
+            // --- Toggle: Player FOV / fog of war (v9 debug) ---
+            {
+                let label = if debug.show_fog { "[x] Fog of war" } else { "[ ] Fog of war" };
+                let col = if debug.show_fog {
+                    color_u8!(60, 50, 90, 230)
+                } else {
+                    color_u8!(80, 50, 50, 230)
+                };
+                if debug.button(panel_x, py, pw * 0.5, btn_h, label, col) {
+                    debug.show_fog = !debug.show_fog;
+                }
+                py += btn_h + 4.0;
+            }
+
             // --- Collapsible: NPC Steering ---
             py += 6.0;
             {
@@ -2462,17 +2806,61 @@ async fn main() {
                     }
                     py += 22.0;
                 }
-                // Show chase status of first NPC.
+                // v9: Force-LoS debug bypass — treat plain LoS as crime trigger.
+                {
+                    let force_label = if state.chase_force_los {
+                        "Force chase on LoS: ON (debug)"
+                    } else {
+                        "Force chase on LoS: OFF"
+                    };
+                    let force_col = if state.chase_force_los {
+                        color_u8!(80, 30, 30, 230)
+                    } else {
+                        color_u8!(40, 40, 50, 230)
+                    };
+                    if debug.button(panel_x, py, pw, 20.0, force_label, force_col) {
+                        state.chase_force_los = !state.chase_force_los;
+                    }
+                    py += 22.0;
+                }
+                // v9.5: fart aura base lifetime (tunable).
+                debug.slider(
+                    50, panel_x, py, pw, "fart_lifetime_s",
+                    &mut state.fart_lifetime_base, 3.0, 30.0,
+                );
+                py += row_h;
+                // v9.5: AdaptiveDirector inspector (read-only).
+                let d = &state.director;
+                let since_enc = state.sim_time - d.last_encounter_at;
+                debug.info_row(
+                    panel_x, py, pw,
+                    &format!("director: aggr={:.2} | sinceEnc={:.0}s | succ={} fail={} | committed={:?}",
+                             d.aggression, since_enc,
+                             d.pooping_successes, d.pooping_failures,
+                             d.committed),
+                );
+                py += 24.0;
+                // Show chase + alert status of first NPC.
                 if let Some(npc) = state.npcs.first() {
+                    let alert = match npc.alert_state {
+                        AlertState::Patrol  => "Patrol",
+                        AlertState::Alerted => "Alerted",
+                        AlertState::Chasing => "Chasing",
+                    };
+                    let tag = if npc.seen_crime { " [SEEN]" } else { "" };
+                    let dir_marker = if npc.director_target.is_some() { " [DIR]" } else { "" };
                     let status = if npc.chase.active {
                         let mode = match &npc.chase.phase {
                             game::chase::ChasePhase::Pursuit => "Pursuit",
                             game::chase::ChasePhase::Navigate { .. } => "Navigate",
                             game::chase::ChasePhase::Search { .. } => "Search",
                         };
-                        format!("CHASING [{}] ({:.1}s)", mode, npc.chase.timer)
+                        format!("{}{}{} [{}] ({:.1}s) susp={:.2}",
+                                alert, tag, dir_marker, mode,
+                                npc.chase.timer, npc.suspicion)
                     } else {
-                        "patrol".to_string()
+                        format!("{}{}{} susp={:.2}",
+                                alert, tag, dir_marker, npc.suspicion)
                     };
                     debug.info_row(panel_x, py, pw, &format!("npc0: {}", status));
                     py += 24.0;

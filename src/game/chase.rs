@@ -19,7 +19,7 @@ use std::fs;
 use std::io::Write;
 
 use crate::game::cell::{idx, Cell, SubgoalGraph, Terrain};
-use crate::game::npc::{Npc, ActivityPhase, astar, build_path};
+use crate::game::npc::{AlertState, Npc, ActivityPhase, astar, build_path};
 use crate::game::room::Room;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +110,30 @@ const MIN_ROOM_SEARCH_S: f32 = 3.0;
 /// Minimum dot(chase_dir, npc→door) to consider a door "in the escape direction".
 const DOOR_ESCAPE_DIR_DOT: f32 = 0.3;
 
+// --- v9.5 unified suspicion system ---
+// (alert_timer + contact_timer have been DELETED — suspicion is the single
+// memory mechanism. Word-of-mouth and alert decay both feed this value.)
+
+/// Suspicion gain per second while NPC is inside a fart aura.
+/// 0.5/s = 2s in aura → 1.0 (curious), 4s in aura → 2.0 (Alerted-eligible).
+pub const SUSPICION_GAIN_RATE_IN_FART: f32 = 0.5;
+/// Suspicion gain per second of word-of-mouth contact (Patrol NPC near
+/// Alerted/Chasing NPC + LoS clear). Same scale as fart aura.
+pub const SUSPICION_GAIN_RATE_WORD_OF_MOUTH: f32 = 1.0;
+/// Word-of-mouth: max distance (cells) between giver and receiver.
+pub const WORD_OF_MOUTH_RANGE: f32 = 2.0;
+/// Suspicion decays at this rate per second when no new trigger.
+pub const SUSPICION_DECAY_RATE: f32 = 0.05;
+/// Curious threshold: NPC shows yellow `?` bubble at suspicion ≥ this.
+pub const SUSPICION_CURIOUS_THRESHOLD: f32 = 1.0;
+/// Promotion threshold: Patrol → Alerted (only if `seen_crime`).
+pub const SUSPICION_ALERTED_THRESHOLD: f32 = 2.0;
+/// Demotion threshold (hysteresis): Alerted → Patrol when below this.
+/// Lower than promotion threshold to prevent rapid bouncing.
+pub const SUSPICION_DEMOTE_THRESHOLD: f32 = 1.5;
+/// Suspicion is hard-capped at this value.
+pub const SUSPICION_CEILING: f32 = 4.0;
+
 pub struct ChaseConfig {
     pub enabled: bool,
     /// Total hunt budget in seconds (timer counts down once LOS is lost).
@@ -135,11 +159,21 @@ impl Default for ChaseConfig {
 // Expression (kaomoji bubble)
 // ---------------------------------------------------------------------------
 
+// ASCII-only — macroquad's default font doesn't support Japanese chars
+// (they render as ▢▢ boxes). Chosen to convey emotion using basic glyphs.
 const ANGRY_KAOMOJI: &[&str] = &[
-    "(╬ಠ益ಠ)", "ヽ(`Д´)ノ", "(`皿´＃)", "(#`Д´)", "(ﾉಥ益ﾉ)",
+    "(>:O)", "(>_<#)", "(@_@#)", "(O_O!)", "[!@#]",
 ];
 const CONFUSED_KAOMOJI: &[&str] = &[
-    "(・・?)", "(；￣Д￣)", "(¬_¬)", "( ˘_˘?)", "(ㆆ_ㆆ)",
+    "(?_?)", "(o_O)?", "( ._.)?", "(.--.)", "( ?_?)",
+];
+/// v9: NPC just received word-of-mouth — shocked at the news.
+const HEARD_KAOMOJI: &[&str] = &[
+    "(O_O)!", "(0_0)!?", "(*0*)", "(0_o)!", "[!?!]",
+];
+/// v9: NPC's Alerted timer hit decay threshold — dismissive, "must be imagining".
+const DECAY_KAOMOJI: &[&str] = &[
+    "(-_-)", "( ._.)", "(=_=)", "...meh", "( -.- )",
 ];
 
 #[derive(Clone, Debug)]
@@ -526,10 +560,15 @@ fn door_between_rooms(
 // Main update
 // ---------------------------------------------------------------------------
 
-/// v9: NPC only triggers chase when player is committing the "crime" (pooping
-/// at a star location, i.e. MoveState::Pooping). Pooping in a toilet
-/// (UsingToilet) is legal and does NOT trigger. Once chase is active, NPC
-/// continues pursuing on LoS regardless of player's MoveState.
+/// v9 DFA: 3-state alert ladder per NPC (Patrol / Alerted / Chasing).
+///   • Patrol → Alerted: NPC sees player Pooping (crime), OR receives
+///     word-of-mouth from another alerted NPC nearby.
+///   • Alerted → Chasing: NPC has LoS to player (any MoveState).
+///   • Chasing → Alerted: existing end_chase path (LoS lost + linger expired).
+///   • Alerted → Patrol: ALERT_DECAY_S without new trigger.
+///   • chase_enabled OFF / map regen: forced reset to Patrol.
+/// `force_chase_los` (debug): treat plain LoS as crime trigger — bypasses
+/// the pooping-only gate for testing.
 pub fn update_chase(
     npcs: &mut [Npc],
     config: &ChaseConfig,
@@ -542,14 +581,63 @@ pub fn update_chase(
     rooms: &[Room],
     tile_to_room: &[usize],
     player_pooping: bool,
+    force_chase_los: bool,
+    // v9.5: active fart auras for suspicion accumulation.
+    farts: &[crate::game::state::Fart],
+    // v9.5: current sim time (for fart age calculations).
+    now_s: f32,
 ) {
     if !config.enabled {
+        // v9.5: master toggle OFF → wipe all NPC suspicion + tags.
         for npc in npcs.iter_mut() {
             if npc.chase.active {
                 end_chase(npc, map, map_w, map_h);
             }
+            npc.alert_state = AlertState::Patrol;
+            npc.suspicion = 0.0;
+            npc.last_smell_pos = None;
+            npc.seen_crime = false;
+            npc.director_target = None;
         }
         return;
+    }
+
+    // v9.5 Pre-pass: fart smell detection + suspicion decay + threshold
+    // promotion. Must run before alert-state DFA transitions so suspicion
+    // ≥ threshold can immediately push the NPC into Alerted.
+    for npc in npcs.iter_mut() {
+        // Decay
+        npc.suspicion = (npc.suspicion - SUSPICION_DECAY_RATE * tick_s).max(0.0);
+        // Smell check — accumulate +SUSPICION_GAIN_FART per active fart that
+        // contains this NPC. Only trigger ONCE per fart per tick (handled by
+        // fart age + radius check).
+        for fart in farts {
+            let age = now_s - fart.spawn_t;
+            if age < 0.0 || age > fart.lifetime { continue; }
+            // Aura grows in first 1s, then holds.
+            let radius = age.min(1.0) * fart.max_radius;
+            let dx = npc.pos.0 - fart.pos.0;
+            let dy = npc.pos.1 - fart.pos.1;
+            if dx * dx + dy * dy <= radius * radius {
+                // Constant rate gain — encounters of any length matter.
+                let per_tick = SUSPICION_GAIN_RATE_IN_FART * tick_s;
+                npc.suspicion = (npc.suspicion + per_tick).min(SUSPICION_CEILING);
+                npc.last_smell_pos = Some(fart.pos);
+            }
+        }
+        // v9.5 promotion: suspicion → Alerted ONLY for NPCs that have
+        // personally witnessed the player's crime at least once.
+        // Never-witnessed NPCs stay Patrol regardless of suspicion (they
+        // only express "curious" via the yellow `?` bubble at susp ≥ 1.0).
+        if npc.alert_state == AlertState::Patrol
+            && npc.seen_crime
+            && npc.suspicion >= SUSPICION_ALERTED_THRESHOLD
+        {
+            npc.alert_state = AlertState::Alerted;
+            npc.chase.set_expression(ANGRY_KAOMOJI, 1.5);
+            clog!("ALERT_FROM_SUSPICION_TAGGED npc_pos=({:.2},{:.2}) susp={:.2}",
+                  npc.pos.0, npc.pos.1, npc.suspicion);
+        }
     }
 
     log_room_topology(rooms);
@@ -563,13 +651,74 @@ pub fn update_chase(
         usize::MAX
     };
 
+    // === v9.5 Pre-pass: word-of-mouth → suspicion gain (no separate timer) ===
+    // Patrol NPC near Alerted/Chasing NPC with LoS → suspicion grows
+    // continuously. Same accumulation model as fart aura. Promotion to
+    // Alerted still gated on `seen_crime` (handled below in suspicion pass).
+    let snapshots: Vec<((f32, f32), AlertState)> = npcs.iter()
+        .map(|n| (n.pos, n.alert_state))
+        .collect();
+    for (i, npc) in npcs.iter_mut().enumerate() {
+        if npc.alert_state != AlertState::Patrol { continue; }
+        let mut nearby_alerted = false;
+        for (j, &((jx, jy), j_alert)) in snapshots.iter().enumerate() {
+            if i == j { continue; }
+            if j_alert == AlertState::Patrol { continue; }
+            let dx = jx - npc.pos.0;
+            let dy = jy - npc.pos.1;
+            if dx * dx + dy * dy > WORD_OF_MOUTH_RANGE * WORD_OF_MOUTH_RANGE {
+                continue;
+            }
+            let a = (npc.pos.0.floor() as i32, npc.pos.1.floor() as i32);
+            let b = (jx.floor() as i32, jy.floor() as i32);
+            if line_of_sight_vision(map, map_w, map_h, a, b, true) {
+                nearby_alerted = true;
+                break;
+            }
+        }
+        if nearby_alerted {
+            // Continuous suspicion gain while in contact — no 1s threshold.
+            let gain = SUSPICION_GAIN_RATE_WORD_OF_MOUTH * tick_s;
+            npc.suspicion = (npc.suspicion + gain).min(SUSPICION_CEILING);
+        }
+    }
+
     for (i, npc) in npcs.iter_mut().enumerate() {
         let los_to_player = can_see_player(npc, player_pos, config.fov_dot, map, map_w, map_h, config.door_blocks_vision);
-        // v9 trigger gate: only consider player "seen" for chase purposes when
-        // they're committing the crime (pooping outside toilet). Once chase is
-        // active, regular LoS keeps it alive — player can't escape just by
-        // standing up.
-        let sees_player = los_to_player && (player_pooping || npc.chase.active);
+
+        // === v9.5 DFA: Patrol → Alerted on direct crime LoS ===
+        // Bumps suspicion to ceiling (full alert) and sets the permanent
+        // seen_crime tag. From now on, this NPC's own suspicion suffices
+        // to re-promote — no fresh visual needed.
+        if npc.alert_state == AlertState::Patrol
+            && los_to_player
+            && (player_pooping || force_chase_los)
+        {
+            npc.alert_state = AlertState::Alerted;
+            npc.suspicion = SUSPICION_CEILING;
+            npc.seen_crime = true;
+            npc.chase.set_expression(ANGRY_KAOMOJI, 1.5);
+            clog!("ALERT_TRIGGER npc={} (saw crime, seen_crime tag set)", i);
+        }
+
+        // === v9.5 DFA: Alerted → Patrol via suspicion hysteresis ===
+        // No separate timer — natural suspicion decay drives forgetting.
+        // Hysteresis (1.5 < 2.0 promotion threshold) prevents bouncing.
+        if npc.alert_state == AlertState::Alerted
+            && !npc.chase.active
+            && npc.suspicion < SUSPICION_DEMOTE_THRESHOLD
+        {
+            npc.alert_state = AlertState::Patrol;
+            npc.chase.set_expression(DECAY_KAOMOJI, 2.0);
+            clog!("ALERT_DECAY npc={} (susp={:.2} < {:.2})",
+                  i, npc.suspicion, SUSPICION_DEMOTE_THRESHOLD);
+        }
+
+        // === v9 sees_player gate ===
+        // Alerted/Chasing + LoS → treated as "seen" by chase machinery.
+        // Patrol stays out of chase no matter what (already handled above —
+        // crime sighting upgrades to Alerted first, then this lets chase fire).
+        let sees_player = los_to_player && npc.alert_state != AlertState::Patrol;
 
         // --- Catch check ---
         let dx_p = player_pos.0 - npc.pos.0;
@@ -592,6 +741,10 @@ pub fn update_chase(
             if !npc.chase.active {
                 // Start chase.
                 npc.chase.active = true;
+                // v9 DFA: Alerted → Chasing. Invariant: alert == Chasing ↔ chase.active.
+                npc.alert_state = AlertState::Chasing;
+                // v9.5: clear any Director task on chase start.
+                npc.director_target = None;
                 npc.chase.target_tile = None;
                 npc.chase.caught = false;
                 npc.chase.chase_dir = npc.facing;
@@ -1293,6 +1446,9 @@ fn expand_subgoal_path(
 
 fn end_chase(npc: &mut Npc, map: &[Cell], map_w: i32, map_h: i32) {
     npc.chase.active = false;
+    // v9.5 DFA: Chasing → Alerted. No alert_timer reset (suspicion handles
+    // forgetting now). Suspicion remains high (was bumped on crime LoS).
+    npc.alert_state = AlertState::Alerted;
     npc.chase.timer = 0.0;
     npc.chase.target_tile = None;
     npc.chase.caught = false;
