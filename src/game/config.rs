@@ -103,7 +103,7 @@ impl Default for PlayerSettings {
             acceleration: 13.33,
             friction: 0.85,
             stop_friction: 0.5,
-            radius: 0.35,
+            radius: 0.20,    // Phase 5.5: see NPC_RADIUS_DEFAULT in npc.rs for rationale
             repulsion_power: 2.0,
             repulsion_range: 0.5,
             repulsion_push: 0.15,

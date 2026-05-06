@@ -24,17 +24,21 @@ const TILE_SIZE: f32 = 32.0;
 // ---------------------------------------------------------------------------
 
 /// Half-height of an isometric tile diamond (screen pixels).
-const ISO_HH: f32 = 32.0;
+/// Phase 5.5: doubled from 32 → 64 (camera zoom 2× for immersion).
+const ISO_HH: f32 = 64.0;
 /// Half-width of an isometric tile diamond (screen pixels).
 /// ISO_HW = ISO_HH * √3 for true isometric (regular hexagon).
-const ISO_HW: f32 = 55.4;
+/// Phase 5.5: doubled from 55.4 → 110.8.
+const ISO_HW: f32 = 110.8;
 /// Wall extrusion height for one tile (screen pixels).
 /// Equals 2 × ISO_HH so that the three visible faces form a regular hexagon.
-const WALL_ISO_H: f32 = 64.0;
+/// Phase 5.5: doubled from 64 → 128.
+const WALL_ISO_H: f32 = 128.0;
 /// Door frame height when closed (screen pixels).
-const DOOR_CLOSED_H: f32 = 56.0;
+/// Phase 5.5: doubled from 56 → 112.
+const DOOR_CLOSED_H: f32 = 112.0;
 /// Door frame height when open (screen pixels) — just the low frame.
-const DOOR_OPEN_H: f32 = 10.0;
+const DOOR_OPEN_H: f32 = 20.0;    // Phase 5.5: doubled from 10 to scale with ISO_HH
 /// Inner wall height as fraction of outer wall height.
 const INNER_WALL_H_RATIO: f32 = 0.6;
 

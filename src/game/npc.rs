@@ -15,7 +15,11 @@ use crate::game::BASELINE_TICK_MS;
 pub const STEER_SLOTS: usize = 16;
 
 /// Default NPC collision radius (grid units). Must match config default.
-const NPC_RADIUS_DEFAULT: f32 = 0.35;
+/// Phase 5.5: shrunk from 0.35 to 0.20 so two NPCs (or player + NPC) can pass
+/// each other in a 1-cell-wide corridor without collision. Geometric constraint:
+/// for clean passing in a 1-cell corridor, 2*r < 1 - 2*r, i.e. r < 0.25 strict.
+/// 0.20 leaves 0.2-cell perpendicular margin between body edges at narrowest pass.
+const NPC_RADIUS_DEFAULT: f32 = 0.20;
 
 // ---------------------------------------------------------------------------
 // Auto-tune PID reference physics (must match config.rs PlayerConfig defaults)
@@ -43,11 +47,11 @@ const PID_MAX_BLEND: f32 = 0.7;
 // Waypoint advance — multipliers applied to NPC radius
 // ---------------------------------------------------------------------------
 /// Intermediate waypoint: advance when within radius * this.
-const WP_ARRIVE_RADIUS_MULT: f32 = 1.7;    // ≈0.60 at radius=0.35
+const WP_ARRIVE_RADIUS_MULT: f32 = 1.7;    // ≈0.34 at radius=0.20
 /// Final waypoint: tighter arrival for precise stop.
-const WP_FINAL_ARRIVE_MULT: f32 = 0.57;    // ≈0.20 at radius=0.35
+const WP_FINAL_ARRIVE_MULT: f32 = 0.57;    // ≈0.11 at radius=0.20
 /// Projection-based advance: only trigger within radius * this.
-const WP_PROJ_RANGE_MULT: f32 = 4.0;       // ≈1.40 at radius=0.35
+const WP_PROJ_RANGE_MULT: f32 = 4.0;       // ≈0.80 at radius=0.20
 
 // ---------------------------------------------------------------------------
 // Context steering parameters
