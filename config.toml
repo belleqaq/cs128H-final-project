@@ -13,10 +13,11 @@ max_speed = 1.0
 acceleration = 13.33   # grid/s²
 friction = 0.85
 stop_friction = 0.5
-radius = 0.35
+radius = 0.20          # Phase 5.5: shrunk from 0.35 (1-cell-corridor passing)
 repulsion_power = 2.0
-repulsion_range = 0.5
-repulsion_push = 0.15
+repulsion_range = 0.30 # Phase 7-prereq: scaled from 0.5 (linear with radius shrink)
+repulsion_push = 0.09  # Phase 7-prereq: scaled from 0.15
+max_turn_rate = 3.14159265 # Phase 7-prereq: π rad/s = half-rotation per second
 
 [gameplay]
 urgency_rate = 0.002

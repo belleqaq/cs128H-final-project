@@ -94,6 +94,14 @@ pub struct PlayerSettings {
     pub repulsion_power: f32,
     pub repulsion_range: f32,
     pub repulsion_push: f32,
+    /// Phase 7-prereq: max angular rotation rate of velocity vector (rad/s).
+    /// Above this rate, velocity direction is clamped — gives "vehicle-like"
+    /// turn dynamics for 2nd-order character control. Below threshold speed
+    /// (handled in apply_movement), free turning is allowed.
+    /// Default π = half-rotation per second; 180° reverse takes ~1 second.
+    /// Optional in TOML (defaults applied when missing).
+    #[serde(default = "default_max_turn_rate")]
+    pub max_turn_rate: f32,
 }
 
 impl Default for PlayerSettings {
@@ -104,11 +112,19 @@ impl Default for PlayerSettings {
             friction: 0.85,
             stop_friction: 0.5,
             radius: 0.20,    // Phase 5.5: see NPC_RADIUS_DEFAULT in npc.rs for rationale
+            // Phase 7-prereq: repulsion params scaled linearly with radius
+            // (was 0.5 / 0.15 at radius 0.35 → ratio 0.571 → new values).
+            // _power stays dimensionless.
             repulsion_power: 2.0,
-            repulsion_range: 0.5,
-            repulsion_push: 0.15,
+            repulsion_range: 0.30,
+            repulsion_push: 0.09,
+            max_turn_rate: default_max_turn_rate(),
         }
     }
+}
+
+fn default_max_turn_rate() -> f32 {
+    std::f32::consts::PI
 }
 
 /// Resolve config.toml path next to the executable (immune to working-dir changes).

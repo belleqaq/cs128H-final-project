@@ -24,7 +24,16 @@ pub struct PhysicsParams {
     pub repulsion_power: f32,
     pub repulsion_range: f32,
     pub repulsion_push: f32,
+    /// Phase 7-prereq: max angular rotation rate of velocity vector (rad/s).
+    /// 0 disables clamp. Active only when both old and new velocities exceed
+    /// `MIN_TURN_CLAMP_SPEED` (otherwise free turning when slow / stationary).
+    pub max_turn_rate: f32,
 }
+
+/// Below this speed (grid units / s), max_turn_rate clamp is bypassed —
+/// player/NPC can pivot freely when slow or stopped, avoiding sluggish
+/// cold-start steering.
+const MIN_TURN_CLAMP_SPEED: f32 = 0.2;
 
 /// Mutable body state that the physics step reads and writes.
 pub struct Body<'a> {
@@ -76,8 +85,44 @@ pub fn apply_movement(
     let accel = if running { eff_accel * run_accel_mult } else { eff_accel };
     let accel_scaled = accel * input_accel;
 
-    body.velocity.0 = body.velocity.0 * friction + accel_scaled * input_dir.0;
-    body.velocity.1 = body.velocity.1 * friction + accel_scaled * input_dir.1;
+    let old_vx = body.velocity.0;
+    let old_vy = body.velocity.1;
+
+    body.velocity.0 = old_vx * friction + accel_scaled * input_dir.0;
+    body.velocity.1 = old_vy * friction + accel_scaled * input_dir.1;
+
+    // 1.5. Max turn rate clamp (Phase 7-prereq).
+    // If the velocity vector rotated by more than max_turn_rate * dt this
+    // tick, clamp it. Bypassed when either old or new speed is below
+    // MIN_TURN_CLAMP_SPEED (free pivot when slow/stationary).
+    if params.max_turn_rate > 0.0 {
+        let old_speed_sq = old_vx * old_vx + old_vy * old_vy;
+        let new_speed_sq = body.velocity.0 * body.velocity.0
+                          + body.velocity.1 * body.velocity.1;
+        let min_sq = MIN_TURN_CLAMP_SPEED * MIN_TURN_CLAMP_SPEED;
+        if old_speed_sq > min_sq && new_speed_sq > min_sq {
+            let old_speed = old_speed_sq.sqrt();
+            let new_speed = new_speed_sq.sqrt();
+            let cos_angle = ((old_vx * body.velocity.0 + old_vy * body.velocity.1)
+                            / (old_speed * new_speed))
+                            .clamp(-1.0, 1.0);
+            let angle = cos_angle.acos();
+            let max_angle = params.max_turn_rate * dt;
+            if angle > max_angle {
+                // Rotate old direction by max_angle toward new direction.
+                let cross = old_vx * body.velocity.1 - old_vy * body.velocity.0;
+                let sign = if cross >= 0.0 { 1.0 } else { -1.0 };
+                let cos_a = max_angle.cos();
+                let sin_a = max_angle.sin() * sign;
+                let nx = old_vx / old_speed;
+                let ny = old_vy / old_speed;
+                let rotated_x = nx * cos_a - ny * sin_a;
+                let rotated_y = nx * sin_a + ny * cos_a;
+                body.velocity.0 = rotated_x * new_speed;
+                body.velocity.1 = rotated_y * new_speed;
+            }
+        }
+    }
 
     // Clamp speed.
     let eff_max = if running { eff_max_speed * run_speed_mult } else { eff_max_speed };

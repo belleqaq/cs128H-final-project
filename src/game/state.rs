@@ -224,6 +224,7 @@ pub struct State {
     pub repulsion_power: f32,
     pub repulsion_range: f32,
     pub repulsion_push: f32,
+    pub max_turn_rate: f32,
     pub tick_ms: u64,
     // Input state.
     input_x: i32,
@@ -364,6 +365,7 @@ impl State {
             repulsion_power: config.player.repulsion_power,
             repulsion_range: config.player.repulsion_range,
             repulsion_push: config.player.repulsion_push,
+            max_turn_rate: config.player.max_turn_rate,
             tick_ms: config.tick_ms,
             input_x: 0,
             input_y: 0,
@@ -423,6 +425,7 @@ impl State {
         self.repulsion_power = config.player.repulsion_power;
         self.repulsion_range = config.player.repulsion_range;
         self.repulsion_push = config.player.repulsion_push;
+        self.max_turn_rate = config.player.max_turn_rate;
         self.tick_ms = config.tick_ms;
         // Gameplay.
         self.urgency_rate = config.gameplay.urgency_rate;
@@ -782,6 +785,7 @@ impl State {
             repulsion_power: self.repulsion_power,
             repulsion_range: self.repulsion_range,
             repulsion_push: self.repulsion_push,
+            max_turn_rate: self.max_turn_rate,
         };
         // Auto-tune PID gains from current physics so they stay stable
         // when friction/accel are changed via debug panel.
@@ -936,6 +940,7 @@ impl State {
             repulsion_power: self.repulsion_power,
             repulsion_range: self.repulsion_range,
             repulsion_push: self.repulsion_push,
+            max_turn_rate: self.max_turn_rate,
         };
 
         let mut body = physics::Body {
