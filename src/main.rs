@@ -1146,7 +1146,8 @@ struct DebugPanel {
     mg_void_seal: bool,
     mg_merge: bool,
     mg_doors: bool,
-    mg_shield_density: f32,
+    mg_seed_count: usize,
+    mg_growth_limit: usize,
     /// Whether the pipeline toggles sub-section is expanded.
     mg_toggles_open: bool,
     // --- ISO Rendering ---
@@ -1197,7 +1198,8 @@ impl DebugPanel {
             mg_void_seal: true,
             mg_merge: true,
             mg_doors: true,
-            mg_shield_density: 0.5,
+            mg_seed_count: 4,
+            mg_growth_limit: 30,
             mg_toggles_open: false,
             iso_open: false,
             iso_wall_h: WALL_ISO_H,
@@ -1707,7 +1709,8 @@ async fn main() {
                 debug_void_seal: debug.mg_void_seal,
                 debug_merge: debug.mg_merge,
                 debug_doors: debug.mg_doors,
-                shield_density: debug.mg_shield_density,
+                seed_count: debug.mg_seed_count,
+                growth_limit: debug.mg_growth_limit,
             };
             if let Some(gen) = run_map_gen(&mg_cfg) {
                 state = State::new(&config, gen.cells, gen.width, gen.height, &gen.cell_kinds, &gen.requested_rooms);
@@ -2973,11 +2976,18 @@ async fn main() {
                         }
                         py += cb_h + 2.0;
                     }
-                    // Row 3: Shield density slider
+                    // Row 3: Seed count slider (cluster count per room)
                     {
-                        let mut v = debug.mg_shield_density;
-                        debug.slider(57, panel_x, py, pw, "shield_density", &mut v, 0.0, 1.0);
-                        debug.mg_shield_density = v;
+                        let mut v = debug.mg_seed_count as f32;
+                        debug.slider(57, panel_x, py, pw, "seed_count", &mut v, 0.0, 10.0);
+                        debug.mg_seed_count = v.round() as usize;
+                        py += 20.0;
+                    }
+                    // Row 4: Growth limit slider (max cells per cluster)
+                    {
+                        let mut v = debug.mg_growth_limit as f32;
+                        debug.slider(58, panel_x, py, pw, "growth_limit", &mut v, 0.0, 60.0);
+                        debug.mg_growth_limit = v.round() as usize;
                         py += 20.0;
                     }
                 }
