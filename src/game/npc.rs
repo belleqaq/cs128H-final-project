@@ -22,6 +22,109 @@ pub const STEER_SLOTS: usize = 16;
 const NPC_RADIUS_DEFAULT: f32 = 0.20;
 
 // ---------------------------------------------------------------------------
+// Phase 7a-LATE: per-NPC adaptive corner-drift calibration
+// ---------------------------------------------------------------------------
+//
+// The constant `MAX_CORNER_DRIFT` in compute_speed_profile() controls how
+// aggressively NPCs take corners (corner_speed = MAX * max_turn_rate / θ).
+// 0.5 cells is a reasonable default; in practice the actual drift NPC
+// experiences depends on friction, sub-tick integration, body radius, etc.
+// This calibration learns the "fudge factor" online from corner traversal
+// observations so each NPC's effective corner speed matches a target drift.
+//
+// Algorithm: Adam-style EWMA of mean + variance, gated on n_samples and
+// coefficient-of-variation thresholds. See LOWGAP_DESIGN-style notes:
+//   - mean (1st moment) tracks observed/predicted drift ratio
+//   - variance (2nd central moment) tracks noise level
+//   - update only when n_samples >= MIN_SAMPLES AND CV < MAX_CV
+//
+// Sample triggering uses event-based detection at waypoint advance (no
+// window tracking, robust to re-entry / repath / multi-advance events).
+
+/// EWMA decay rate for both mean and variance updates. α=0.15 gives ~96%
+/// convergence in 20 samples (Σ_{k=0..19} α(1-α)^k ≈ 0.96).
+const CALIB_EMA_ALPHA: f32 = 0.15;
+/// Min sample count before we trust the calibration enough to update
+/// MAX_CORNER_DRIFT. Below this, fall back to TARGET_DRIFT default.
+const CALIB_MIN_SAMPLES: u32 = 10;
+/// Coefficient of variation threshold (stddev/|mean|) above which we don't
+/// trust the calibration (data too noisy). Standard SPC threshold.
+const CALIB_MAX_CV: f32 = 0.3;
+/// Target drift (cells). MAX_CORNER_DRIFT after calibration aims for the
+/// *actual* drift to settle at this value (assuming ratio model is right).
+const CALIB_TARGET_DRIFT: f32 = 0.5;
+/// Anomaly clamp on the per-sample ratio (prevents single outliers like
+/// "NPC bounces off wall" from skewing the EMA).
+const CALIB_RATIO_CLAMP_MIN: f32 = 0.1;
+const CALIB_RATIO_CLAMP_MAX: f32 = 10.0;
+/// Safety bounds on calibrated MAX_CORNER_DRIFT (cells). Prevents the
+/// parameter from runaway in edge cases.
+const CALIB_DRIFT_CLAMP_MIN: f32 = 0.2;
+const CALIB_DRIFT_CLAMP_MAX: f32 = 1.5;
+/// Don't sample when corner angle is below this (radians). 30°.
+const CALIB_CORNER_ANGLE_MIN: f32 = 0.5236;   // π/6
+/// Don't sample when speed at corner is below this (grid/s).
+const CALIB_CORNER_SPEED_MIN: f32 = 0.1;
+/// Default fallback drift when calibration not yet converged.
+pub const DEFAULT_MAX_CORNER_DRIFT: f32 = 0.5;
+
+/// Per-NPC online corner-drift calibration state. Tracks running mean and
+/// variance of the (observed_drift / predicted_drift) ratio across waypoint
+/// traversals; produces an adapted MAX_CORNER_DRIFT for compute_speed_profile.
+#[derive(Debug, Default)]
+pub struct CornerCalibration {
+    /// EWMA of observed/predicted drift ratio. Starts at 1.0 (no calibration).
+    pub ema_mean_ratio: f32,
+    /// EWMA of squared deviation (used for variance estimation, Adam-style).
+    pub ema_var_ratio: f32,
+    /// Total observation count. Drives MIN_SAMPLES gating + warmup.
+    pub n_samples: u32,
+}
+
+impl CornerCalibration {
+    pub fn new() -> Self {
+        Self {
+            ema_mean_ratio: 1.0,    // Start at "model is correct" prior.
+            ema_var_ratio: 0.0,
+            n_samples: 0,
+        }
+    }
+
+    /// Record one corner traversal sample. Called at waypoint advance after
+    /// all 6 filters pass.
+    pub fn record(&mut self, observed_drift: f32, speed: f32, theta: f32, max_turn_rate: f32) {
+        let predicted = speed * theta / max_turn_rate.max(1e-4);
+        if predicted < 1e-3 { return; }
+        let ratio = (observed_drift / predicted).clamp(CALIB_RATIO_CLAMP_MIN, CALIB_RATIO_CLAMP_MAX);
+        let delta = ratio - self.ema_mean_ratio;
+        self.ema_mean_ratio += CALIB_EMA_ALPHA * delta;
+        // Adam-style variance update: var ← (1-α)(var + α·δ²)
+        self.ema_var_ratio = (1.0 - CALIB_EMA_ALPHA)
+                             * (self.ema_var_ratio + CALIB_EMA_ALPHA * delta * delta);
+        self.n_samples = self.n_samples.saturating_add(1);
+    }
+
+    /// Calibrated MAX_CORNER_DRIFT, or TARGET_DRIFT default if not enough
+    /// data / data too noisy. Read once before each path build.
+    pub fn calibrated_drift(&self) -> f32 {
+        if self.n_samples < CALIB_MIN_SAMPLES { return CALIB_TARGET_DRIFT; }
+        let stddev = self.ema_var_ratio.sqrt();
+        let cv = stddev / self.ema_mean_ratio.abs().max(1e-3);
+        if cv > CALIB_MAX_CV { return CALIB_TARGET_DRIFT; }
+        // If ratio > 1, NPC drifts more than predicted → reduce MAX (be more
+        // conservative on speed). If ratio < 1, drifts less → can be more
+        // aggressive.
+        (CALIB_TARGET_DRIFT * self.ema_mean_ratio)
+            .clamp(CALIB_DRIFT_CLAMP_MIN, CALIB_DRIFT_CLAMP_MAX)
+    }
+
+    /// For debug logs / panel display.
+    pub fn stats_summary(&self) -> (f32, f32, u32) {
+        (self.ema_mean_ratio, self.ema_var_ratio.sqrt(), self.n_samples)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Auto-tune PID reference physics (must match config.rs PlayerConfig defaults)
 // ---------------------------------------------------------------------------
 const REF_FRICTION: f32 = 0.85;
@@ -295,6 +398,13 @@ pub struct Npc {
     /// should be at when arriving at waypoint i, accounting for upcoming
     /// corner sharpness and brake distance.
     pub target_speeds: Vec<f32>,
+    /// Phase 7a-LATE: online calibration of per-NPC MAX_CORNER_DRIFT.
+    /// Updated at waypoint advance events; read before each path rebuild.
+    pub corner_calib: CornerCalibration,
+    /// Phase 7a-LATE: filter flag — set to true on path rebuild this tick,
+    /// cleared at end of tick. Prevents corner sample from being recorded
+    /// against a stale waypoint reference.
+    pub path_rebuilt_this_tick: bool,
     /// Per-slot scores from last context steering evaluation (for debug vis).
     pub steer_scores: [f32; STEER_SLOTS],
     /// Final chosen steering direction (for debug vis).
@@ -325,6 +435,8 @@ impl Npc {
             path: Vec::new(),
             path_idx: 0,
             target_speeds: Vec::new(),
+            corner_calib: CornerCalibration::new(),
+            path_rebuilt_this_tick: false,
             steer_scores: [0.0; STEER_SLOTS],
             steer_chosen: (0.0, 0.0),
             pid_integral: 0.0,
@@ -355,6 +467,9 @@ impl Npc {
         let tick_s = tick_ms as f32 / 1000.0;
 
         self.prev_pos = self.pos;
+        // Phase 7a-LATE: clear repath flag at start of tick. Set true within
+        // tick if path is rebuilt; consulted by corner-calibration sampler.
+        self.path_rebuilt_this_tick = false;
 
         // v9.5: Director-target arrival check. When NPC reaches the dispatched
         // target, clear it and "look around" briefly (2s Performing). Next
@@ -438,13 +553,17 @@ impl Npc {
                 }
             });
             // Phase 7a: compute target speed profile for the new path.
+            // Phase 7a-LATE: read calibrated MAX_CORNER_DRIFT from per-NPC
+            // EWMA stats; falls back to default until enough samples.
             let cur_speed = (self.velocity.0 * self.velocity.0
                            + self.velocity.1 * self.velocity.1).sqrt();
+            let max_drift = self.corner_calib.calibrated_drift();
             self.target_speeds = compute_speed_profile(
                 &p, cur_speed, params.max_speed,
-                params.max_turn_rate, params.accel,
+                params.max_turn_rate, params.accel, max_drift,
             );
             self.path = p;
+            self.path_rebuilt_this_tick = true;
             self.path_idx = 0;
             self.pid_integral = 0.0;
             self.pid_prev_error = 0.0;
@@ -549,6 +668,39 @@ impl Npc {
                 self.enter_performing(rng);
                 return;
             }
+            // ─── Phase 7a-LATE: corner traversal calibration sample ────
+            // Triggered by waypoint advance (path_idx i → i+1, non-terminal).
+            // Filters: see CornerCalibration::record() + the angle/speed
+            // checks inline below. path_rebuilt_this_tick filter prevents
+            // stale waypoint references on repath frames.
+            {
+                let i = self.path_idx;
+                if !self.path_rebuilt_this_tick && i > 0 && i + 1 < self.path.len() {
+                    let prev = self.path[i - 1];
+                    let cur = self.path[i];
+                    let nxt = self.path[i + 1];
+                    let in_dx = cur.0 as f32 - prev.0 as f32;
+                    let in_dy = cur.1 as f32 - prev.1 as f32;
+                    let out_dx = nxt.0 as f32 - cur.0 as f32;
+                    let out_dy = nxt.1 as f32 - cur.1 as f32;
+                    let in_len = (in_dx * in_dx + in_dy * in_dy).sqrt();
+                    let out_len = (out_dx * out_dx + out_dy * out_dy).sqrt();
+                    if in_len > 1e-3 && out_len > 1e-3 {
+                        let cos_theta = ((in_dx * out_dx + in_dy * out_dy)
+                                        / (in_len * out_len))
+                                        .clamp(-1.0, 1.0);
+                        let theta = cos_theta.acos();
+                        let speed = (self.velocity.0 * self.velocity.0
+                                   + self.velocity.1 * self.velocity.1).sqrt();
+                        if theta >= CALIB_CORNER_ANGLE_MIN
+                        && speed >= CALIB_CORNER_SPEED_MIN {
+                            self.corner_calib.record(
+                                dist, speed, theta, params.max_turn_rate,
+                            );
+                        }
+                    }
+                }
+            }
             self.path_idx += 1;
             if self.path_idx >= self.path.len() {
                 if self.routine.phase == ActivityPhase::Chasing {
@@ -580,14 +732,16 @@ impl Npc {
                     (self.velocity.0 / vel_spd, self.velocity.1 / vel_spd)
                 } else { (0.0, 0.0) };
                 let p = build_path(raw, self.radius, dir, map, map_w, map_h);
+                let max_drift = self.corner_calib.calibrated_drift();
                 self.target_speeds = compute_speed_profile(
                     &p, vel_spd, params.max_speed,
-                    params.max_turn_rate, params.accel,
+                    params.max_turn_rate, params.accel, max_drift,
                 );
                 self.path = p;
                 self.path_idx = 0;
                 self.pid_integral = 0.0;
                 self.pid_prev_error = 0.0;
+                self.path_rebuilt_this_tick = true;
             }
             // Use recomputed path for this tick.
             if self.path_idx >= self.path.len() {
@@ -1525,30 +1679,23 @@ pub(crate) fn build_path(
 //   - Brake model is symmetric with accel (no separate decel cap). Friction
 //     in `apply_movement` provides additional natural deceleration.
 
-/// Geometric tolerance for corner traversal (grid cells). When entering a
-/// corner of angle θ at speed v, the NPC will drift up to
-/// `v * (θ / max_turn_rate)` perpendicular to the path during the turn.
-/// We require this drift ≤ `MAX_CORNER_DRIFT`, giving:
-///     corner_speed = min(max_speed, MAX_CORNER_DRIFT * max_turn_rate / θ)
-///
-/// 0.5 cell = generous (fast corners, more drift)
-/// 0.2 cell = tight (slow corners, precise)
-/// TODO Phase 7a-LATE: replace with adaptive value driven by per-NPC
-/// corner-traversal statistics (track actual drift, EMA-update tolerance).
-const MAX_CORNER_DRIFT: f32 = 0.5;
-
 /// Compute per-waypoint target speeds for a path using forward-backward speed
 /// planning. `path` is in grid coordinates (cell centers); returned vec is
 /// the same length.
 ///
-/// `start_speed` is the NPC's current velocity magnitude — clamps the speed
-/// at index 0 (NPC can't teleport to higher speed instantly).
+/// `start_speed`     — current NPC velocity magnitude (clamps speeds[0])
+/// `max_corner_drift` — per-NPC calibrated drift tolerance (cells). Higher =
+///                      faster corners + more drift. Use
+///                      `npc.corner_calib.calibrated_drift()` to get the
+///                      value, falling back to `DEFAULT_MAX_CORNER_DRIFT`
+///                      when calibration hasn't converged.
 pub fn compute_speed_profile(
     path: &[(i32, i32)],
     start_speed: f32,
     max_speed: f32,
     max_turn_rate: f32,
     max_accel: f32,
+    max_corner_drift: f32,
 ) -> Vec<f32> {
     let n = path.len();
     if n == 0 {
@@ -1589,8 +1736,8 @@ pub fn compute_speed_profile(
                         .clamp(-1.0, 1.0);
         let theta = cos_theta.acos();   // [0, π]
         if theta > 1e-4 {
-            // Drift = v * (θ / max_turn_rate); require ≤ MAX_CORNER_DRIFT.
-            let v_corner = MAX_CORNER_DRIFT * max_turn_rate / theta;
+            // Drift = v * (θ / max_turn_rate); require ≤ max_corner_drift.
+            let v_corner = max_corner_drift * max_turn_rate / theta;
             speeds[i] = speeds[i].min(v_corner);
         }
     }
