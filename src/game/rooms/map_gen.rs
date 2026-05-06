@@ -1677,8 +1677,13 @@ fn generate_ca_cover(
                     // (d) no dead-end created
                     if ca_would_create_deadend(map, i, j, map_w, map_h) { continue; }
 
-                    // (e) door margin
+                    // (e) door margin (Chebyshev — full 8-neighbour ring of any door)
                     if door_within_margin(map, i, j, CA_DOOR_MARGIN, map_w, map_h) { continue; }
+
+                    // (f) no diagonal cross-cluster contact (8-neighbour different-cluster wall)
+                    // Prevents asymmetric pinch where two clusters touch at corners
+                    // (cardinal-disconnected, but player physics squeezes through).
+                    if ca_diagonal_other_cluster(map, &cluster_of, i, j, own_cid, map_w, map_h) { continue; }
 
                     // Probabilistic birth roll (degree-bias)
                     let p = CA_DEGREE_BIAS[deg];
@@ -1715,6 +1720,9 @@ fn generate_ca_cover(
                 if recheck_cid != cid { continue; }
                 if ca_would_create_2x2(map, i, j, map_w, map_h) { continue; }
                 if ca_would_create_deadend(map, i, j, map_w, map_h) { continue; }
+                if ca_diagonal_other_cluster(map, &cluster_of, i, j, cid, map_w, map_h) { continue; }
+                // Door margin still holds — already checked in snapshot phase using same map state;
+                // no parallel placement can introduce a door in the meantime.
 
                 // Tentative commit
                 map[idx].terrain = Terrain::Wall;
@@ -1879,7 +1887,12 @@ fn ca_would_create_deadend(
     false
 }
 
-/// Returns true if any cell within Manhattan `margin` of (i, j) is a Door.
+/// Returns true if any cell within Chebyshev `margin` of (i, j) is a Door.
+/// Chebyshev (vs the previous Manhattan) means the full square ring around
+/// (i, j) is considered — including diagonal-adjacent cells. This prevents
+/// cover walls from being placed at the door's 8-neighbour ring, which
+/// (under continuous physics + iso projection) visually constrains the
+/// player's approach to the door even if it's not cardinal-adjacent.
 fn door_within_margin(
     map: &[Cell],
     i: usize, j: usize, margin: i32,
@@ -1887,7 +1900,8 @@ fn door_within_margin(
 ) -> bool {
     for dy in -margin..=margin {
         for dx in -margin..=margin {
-            if dx.abs() + dy.abs() > margin { continue; }
+            // Chebyshev: every (dx, dy) inside the [-margin, margin] square
+            // qualifies. (Previously had a Manhattan filter; removed.)
             let nx = i as i32 + dx;
             let ny = j as i32 + dy;
             if nx < 0 || nx >= map_w as i32 || ny < 0 || ny >= map_h as i32 { continue; }
@@ -1895,6 +1909,35 @@ fn door_within_margin(
             if matches!(t, Terrain::DoorOpen | Terrain::DoorClosed) {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// Returns true if any cell in the 8-neighbour of (i, j) is a Wall belonging
+/// to a DIFFERENT cluster than `own_cluster`. Used to prevent diagonal
+/// cross-cluster contact, which creates an asymmetric pinch (player can
+/// squeeze through diagonally, NPC cannot — cardinal-only pathfinding).
+/// Same-cluster diagonal walls are allowed (they're part of intentional
+/// cluster geometry); BSP walls (cluster_id < 0) are also allowed (they're
+/// part of the room outline, not interior cluster boundaries).
+fn ca_diagonal_other_cluster(
+    map: &[Cell],
+    cluster_of: &[i32],
+    i: usize, j: usize,
+    own_cluster: i32,
+    map_w: usize, map_h: usize,
+) -> bool {
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            if dx == 0 && dy == 0 { continue; }
+            let nx = i as i32 + dx;
+            let ny = j as i32 + dy;
+            if nx < 0 || nx >= map_w as i32 || ny < 0 || ny >= map_h as i32 { continue; }
+            let n_idx = ny as usize * map_w + nx as usize;
+            if map[n_idx].terrain != Terrain::Wall { continue; }
+            let cid = cluster_of[n_idx];
+            if cid >= 0 && cid != own_cluster { return true; }
         }
     }
     false

@@ -104,3 +104,77 @@ With CA cover gen handling no-dead-end inherently, LowGap placement is
 2. Player-NPC asymmetry is "nice to have" but not blocking gameplay.
 3. Phase 7 (NPC movement coordination) is the bottleneck for game feel right
    now. Better to land that first, then revisit LowGap when needed.
+
+---
+
+## Long-term direction (locked in for future): use LowGap as auto-emerging
+## "asymmetric shortcut" placement during CA tight-config resolution
+
+**Replaces the original Phase 6 "L-pocket dead-end repair" plan entirely.**
+
+### Motivation
+
+CA cover gen produces two kinds of "tight configurations" that we currently
+reject in placement (Option A in design discussion):
+
+1. **Diagonal cross-cluster contact**: two cluster walls touching at a
+   single grid corner. NPC pathfinding (cardinal-only adjacency) sees them
+   as separate; player physics (continuous) can squeeze through the
+   geometric pinch. Asymmetric path emerges unintentionally.
+
+2. **Door-front adjacency**: cover wall placed in the 8-neighbour ring of
+   a Door cell, blocking or constraining the player's approach.
+
+Currently (Option A) we reject these placements (lower density). The
+LowGap-augmented version **accepts** them but **substitutes the
+problematic Wall placement with LowGap**, turning the asymmetry into an
+intentional gameplay feature: player gets a shortcut NPC cannot take.
+
+### Mechanism (when implemented)
+
+During CA's apply phase:
+
+1. Tentatively place Wall as usual.
+2. Run the existing constraint checks:
+   - (a) cluster-id (single-cluster cardinal walls)
+   - (c) no 2×2
+   - (d) no NPC dead-end
+   - (e) global NPC connectivity (flood-fill on `is_npc_walkable`)
+   - **NEW (g)**: no diagonal cross-cluster wall in 8-neighbour
+   - **NEW (h)**: Chebyshev > 1 distance from any Door
+3. If all pass → keep as Wall (common case).
+4. If ONLY (g) or (h) fail → substitute LowGap:
+   - LowGap blocks NPC (preserves NPC topology constraints)
+   - LowGap allows player (player squeezes through)
+   - Re-run (e) NPC connectivity on the LowGap-placed map; if still fails,
+     revert entirely. Otherwise accept as LowGap.
+5. If any other constraint fails → revert.
+
+Result: the map naturally seeds a small number of LowGap cells at exactly
+the points where the player benefits from a NPC-blocked shortcut, without
+any hand-authored tagging.
+
+### Topological invariants
+
+- NPC graph: 2-edge-connected (LowGap blocks NPC same as Wall)
+- Player graph: connected (LowGap is floor for player, superset of NPC)
+- 1-thick walls: LowGap participates in no-2×2 rule
+
+### Density expectation
+
+Slightly higher than Option A's strict reject (some rejected cells become
+LowGaps instead of being dropped). Probably ~20-22% interior fill.
+
+### Implementation prerequisites
+
+- Phase 5a-LATE: Terrain::LowGap variant + walkability split + Body field
+- Phase 5c-LATE: half-wall renderer
+- Phase 5d-LATE: physics wiring (is_blocked / dist_to_tile / nearest_wall)
+- Modified CA: 2-tier placement (Wall first, LowGap fallback for g/h fails)
+- `cluster_of` map accepts LowGap cells (LowGap belongs to placing cluster)
+
+### When to revisit
+
+- After Phase 7 (NPC movement) is stable
+- When designing intentional asymmetric stealth gameplay
+- The bug-fix urgency was solved by Option A (shipped) — no immediate need
