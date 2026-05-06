@@ -289,6 +289,12 @@ pub struct Npc {
     pub chase: ChaseState,
     pub path: Vec<(i32, i32)>,
     pub path_idx: usize,
+    /// Phase 7a: per-waypoint target speed (grid units / s), aligned with `path`.
+    /// Computed once when path is built (forward-backward pass), used during
+    /// tick to set throttle. `target_speeds[i]` is the max speed the NPC
+    /// should be at when arriving at waypoint i, accounting for upcoming
+    /// corner sharpness and brake distance.
+    pub target_speeds: Vec<f32>,
     /// Per-slot scores from last context steering evaluation (for debug vis).
     pub steer_scores: [f32; STEER_SLOTS],
     /// Final chosen steering direction (for debug vis).
@@ -318,6 +324,7 @@ impl Npc {
             chase: ChaseState::default(),
             path: Vec::new(),
             path_idx: 0,
+            target_speeds: Vec::new(),
             steer_scores: [0.0; STEER_SLOTS],
             steer_chosen: (0.0, 0.0),
             pid_integral: 0.0,
@@ -378,7 +385,7 @@ impl Npc {
                     &mut body, params, (0.0, 0.0), 0.0,
                     false, 1.0, 1.0, tick_ms, map, map_w, map_h,
                 );
-                self.timer_tick(tick_s, map, map_w, map_h, rng);
+                self.timer_tick(params, tick_s, map, map_w, map_h, rng);
             }
             ActivityPhase::Traveling | ActivityPhase::Chasing => {
                 self.follow_path(params, weights, map, map_w, map_h, tick_ms, rng);
@@ -389,6 +396,7 @@ impl Npc {
     /// Count down the perform timer; advance activity when done.
     fn timer_tick(
         &mut self,
+        params: &PhysicsParams,
         tick_s: f32,
         map: &[Cell],
         map_w: i32,
@@ -397,13 +405,14 @@ impl Npc {
     ) {
         self.routine.timer -= tick_s;
         if self.routine.timer <= 0.0 {
-            self.advance_activity(map, map_w, map_h, rng);
+            self.advance_activity(params, map, map_w, map_h, rng);
         }
     }
 
     /// Move to the next activity in the routine (wrapping), compute path.
     fn advance_activity(
         &mut self,
+        params: &PhysicsParams,
         map: &[Cell],
         map_w: i32,
         map_h: i32,
@@ -428,6 +437,13 @@ impl Npc {
                     );
                 }
             });
+            // Phase 7a: compute target speed profile for the new path.
+            let cur_speed = (self.velocity.0 * self.velocity.0
+                           + self.velocity.1 * self.velocity.1).sqrt();
+            self.target_speeds = compute_speed_profile(
+                &p, cur_speed, params.max_speed,
+                params.max_turn_rate, params.accel,
+            );
             self.path = p;
             self.path_idx = 0;
             self.pid_integral = 0.0;
@@ -563,7 +579,12 @@ impl Npc {
                 let dir = if vel_spd > 1e-4 {
                     (self.velocity.0 / vel_spd, self.velocity.1 / vel_spd)
                 } else { (0.0, 0.0) };
-                self.path = build_path(raw, self.radius, dir, map, map_w, map_h);
+                let p = build_path(raw, self.radius, dir, map, map_w, map_h);
+                self.target_speeds = compute_speed_profile(
+                    &p, vel_spd, params.max_speed,
+                    params.max_turn_rate, params.accel,
+                );
+                self.path = p;
                 self.path_idx = 0;
                 self.pid_integral = 0.0;
                 self.pid_prev_error = 0.0;
@@ -766,14 +787,26 @@ impl Npc {
         self.steer_scores = scores;
         self.steer_chosen = (steer_dx, steer_dy);
 
-        // --- Throttle ---
+        // --- Throttle (Phase 7a: target-speed-based bang-bang) ---
+        // PROVISIONAL policy: bang-bang. cur_speed >= target → throttle=0
+        // (let friction brake), else throttle=1. May switch to proportional
+        // when catch-penalty design is finalized — see TODO Phase 7a-LATE.
+        //
+        // target_speed comes from forward-backward speed profile computed
+        // at path-build time. It accounts for upcoming corner sharpness +
+        // brake distance. If profile is empty (new NPC, no path yet), fall
+        // back to old behavior (throttle=1.0, ease at final waypoint only).
         let throttle_ease_dist = self.radius * THROTTLE_EASE_RADIUS_MULT
             + brake_dist * THROTTLE_EASE_BRAKE_MULT;
-        let throttle = if is_last && dist < throttle_ease_dist {
-            (dist / throttle_ease_dist).clamp(THROTTLE_MIN, 1.0)
-        } else {
-            1.0
-        };
+        let target_speed = self.target_speeds.get(self.path_idx).copied()
+            .unwrap_or(params.max_speed);
+        let mut throttle: f32 = if cur_speed >= target_speed { 0.0 } else { 1.0 };
+        // Final-waypoint smooth ease (preserved from pre-7a behavior so the
+        // NPC eases to a stop on arrival rather than abruptly cutting accel).
+        if is_last && dist < throttle_ease_dist {
+            let ease = (dist / throttle_ease_dist).clamp(THROTTLE_MIN, 1.0);
+            throttle = throttle.min(ease);
+        }
 
         // --- Debug log ---
         NPC_LOG.with(|log| {
@@ -1471,4 +1504,115 @@ pub(crate) fn build_path(
         p.remove(0);
     }
     p
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7a: speed profile (forward-backward racing-line speed planning)
+// ---------------------------------------------------------------------------
+//
+// Approach: standard 2-pass dynamic programming used by racing game AIs (Forza,
+// GT, etc.). For a given path, compute per-waypoint target speeds such that
+// the NPC can both (a) brake in time for upcoming sharp corners, and (b)
+// accelerate up to that speed coming out of preceding corners, given finite
+// max acceleration. Final speed = min(corner_limit, brake_limit, accel_limit).
+//
+// Limitations of this implementation (acknowledged):
+//   - Static — recomputed only when path changes; doesn't react to dynamic
+//     obstacles like other NPCs (Phase 7b will add reactive deviation on top
+//     of this static base).
+//   - Corner speed estimate is heuristic from MAX_CORNER_DRIFT; doesn't
+//     account for actual NPC collision radius or path curvature continuously.
+//   - Brake model is symmetric with accel (no separate decel cap). Friction
+//     in `apply_movement` provides additional natural deceleration.
+
+/// Geometric tolerance for corner traversal (grid cells). When entering a
+/// corner of angle θ at speed v, the NPC will drift up to
+/// `v * (θ / max_turn_rate)` perpendicular to the path during the turn.
+/// We require this drift ≤ `MAX_CORNER_DRIFT`, giving:
+///     corner_speed = min(max_speed, MAX_CORNER_DRIFT * max_turn_rate / θ)
+///
+/// 0.5 cell = generous (fast corners, more drift)
+/// 0.2 cell = tight (slow corners, precise)
+/// TODO Phase 7a-LATE: replace with adaptive value driven by per-NPC
+/// corner-traversal statistics (track actual drift, EMA-update tolerance).
+const MAX_CORNER_DRIFT: f32 = 0.5;
+
+/// Compute per-waypoint target speeds for a path using forward-backward speed
+/// planning. `path` is in grid coordinates (cell centers); returned vec is
+/// the same length.
+///
+/// `start_speed` is the NPC's current velocity magnitude — clamps the speed
+/// at index 0 (NPC can't teleport to higher speed instantly).
+pub fn compute_speed_profile(
+    path: &[(i32, i32)],
+    start_speed: f32,
+    max_speed: f32,
+    max_turn_rate: f32,
+    max_accel: f32,
+) -> Vec<f32> {
+    let n = path.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0.0];   // single endpoint = stop
+    }
+
+    // World coords (cell center).
+    let wp = |i: usize| -> (f32, f32) {
+        (path[i].0 as f32 + 0.5, path[i].1 as f32 + 0.5)
+    };
+
+    // Distance between consecutive waypoints.
+    let mut dist = vec![0.0f32; n];
+    for i in 1..n {
+        let dx = wp(i).0 - wp(i - 1).0;
+        let dy = wp(i).1 - wp(i - 1).1;
+        dist[i] = (dx * dx + dy * dy).sqrt();
+    }
+
+    // 1. Corner speed limit per waypoint (from corner angle vs max_turn_rate).
+    let mut speeds = vec![max_speed; n];
+    speeds[n - 1] = 0.0;   // final waypoint = full stop
+    for i in 1..(n - 1) {
+        let p_prev = wp(i - 1);
+        let p_cur = wp(i);
+        let p_next = wp(i + 1);
+        let in_dx = p_cur.0 - p_prev.0;
+        let in_dy = p_cur.1 - p_prev.1;
+        let out_dx = p_next.0 - p_cur.0;
+        let out_dy = p_next.1 - p_cur.1;
+        let in_len = (in_dx * in_dx + in_dy * in_dy).sqrt();
+        let out_len = (out_dx * out_dx + out_dy * out_dy).sqrt();
+        if in_len < 1e-4 || out_len < 1e-4 { continue; }
+        let cos_theta = ((in_dx * out_dx + in_dy * out_dy) / (in_len * out_len))
+                        .clamp(-1.0, 1.0);
+        let theta = cos_theta.acos();   // [0, π]
+        if theta > 1e-4 {
+            // Drift = v * (θ / max_turn_rate); require ≤ MAX_CORNER_DRIFT.
+            let v_corner = MAX_CORNER_DRIFT * max_turn_rate / theta;
+            speeds[i] = speeds[i].min(v_corner);
+        }
+    }
+
+    // 2. Backward pass: each speed[i] must allow braking down to speed[i+1]
+    //    over dist[i+1]. v_i² = v_{i+1}² + 2*decel*d → v_i = sqrt(...)
+    for i in (0..(n - 1)).rev() {
+        let max_brake = (speeds[i + 1] * speeds[i + 1]
+                       + 2.0 * max_accel * dist[i + 1]).sqrt();
+        speeds[i] = speeds[i].min(max_brake);
+    }
+
+    // 3. Forward pass: each speed[i] must be reachable from speed[i-1] given
+    //    finite accel over dist[i]. v_i² = v_{i-1}² + 2*accel*d → v_i ≤ sqrt(...)
+    speeds[0] = speeds[0].min(start_speed.max(max_speed * 0.1));
+    // ↑ At first waypoint, can't be faster than current velocity (with floor
+    // at 10% max_speed so a stopped NPC doesn't lock at 0 forever).
+    for i in 1..n {
+        let max_accel_speed = (speeds[i - 1] * speeds[i - 1]
+                             + 2.0 * max_accel * dist[i]).sqrt();
+        speeds[i] = speeds[i].min(max_accel_speed);
+    }
+
+    speeds
 }
