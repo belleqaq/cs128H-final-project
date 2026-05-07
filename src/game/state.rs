@@ -824,6 +824,18 @@ impl State {
         self.tick_director(tick_s);
         Self::tick_npcs(&mut self.npcs, &npc_params, &self.steer_weights, &self.map, self.map_w, self.map_h, self.tick_ms, &mut self.rng_state);
 
+        // Catch = lose. `chase.caught` is set in chase.rs when a chasing NPC
+        // closes within CATCH_DIST of the player. We mirror it into Phase::Lose
+        // here so the existing lose-screen / R-to-restart flow handles it just
+        // like a urgency=1.0 timeout.
+        if self.phase == Phase::Playing
+            && self.npcs.iter().any(|n| n.chase.caught)
+        {
+            self.phase = Phase::Lose;
+            self.director.pooping_failures =
+                self.director.pooping_failures.saturating_add(1);
+        }
+
         // ========================================================
         // State machine: frozen states return early, others fall
         // through to the shared urgency + movement-physics tail.

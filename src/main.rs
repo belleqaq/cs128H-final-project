@@ -2785,11 +2785,24 @@ async fn main() {
                     &mut state.chase_config.linger_s, 0.0, 5.0,
                 );
                 py += row_h;
-                debug.slider(
-                    41, panel_x, py, pw, "fov_dot",
-                    &mut state.chase_config.fov_dot, -1.0, 1.0,
-                );
-                py += row_h;
+                {
+                    // Display the FOV cone as a full angle in degrees so the
+                    // user doesn't have to think in cosines. fov_dot is the
+                    // cosine of the cone HALF-angle (used by `can_see_player`
+                    // for the dot-product gate), so:
+                    //     full_deg = 2 * acos(fov_dot) * 180/pi
+                    //     fov_dot  = cos(full_deg/2 * pi/180)
+                    // Mapping: 0 deg = blind, 180 deg = panoramic, 360 deg = omniscient.
+                    let mut fov_deg = 2.0
+                        * state.chase_config.fov_dot.clamp(-1.0, 1.0).acos().to_degrees();
+                    debug.slider(
+                        41, panel_x, py, pw, "fov (deg)",
+                        &mut fov_deg, 0.0, 360.0,
+                    );
+                    state.chase_config.fov_dot =
+                        (fov_deg.to_radians() * 0.5).cos();
+                    py += row_h;
+                }
                 {
                     let door_label = if state.chase_config.door_blocks_vision {
                         "Door blocks vision: ON"
