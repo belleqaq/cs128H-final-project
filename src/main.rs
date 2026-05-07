@@ -2277,14 +2277,25 @@ async fn main() {
             }
         }
 
-        // --- HUD ---
-        // Urgency bar (bottom-left).
+        // --- HUD (top-left) ---
         {
-            let bar_x = 10.0;
-            let bar_y = screen_height() - 40.0;
-            let bar_w = 200.0;
+            let hud_x = 10.0;
+            let hud_y = 10.0;
+            let bar_w = 210.0;
             let bar_h = 20.0;
-            draw_rectangle(bar_x, bar_y, bar_w, bar_h, color_u8!(30, 30, 40, 200));
+
+            // Objectives row.
+            draw_text(
+                &format!("{} / {} objectives", state.completed, state.goal_count),
+                hud_x,
+                hud_y + 16.0,
+                18.0,
+                color_u8!(210, 210, 225, 255),
+            );
+
+            // Urgency bar.
+            let bar_y = hud_y + 24.0;
+            draw_rectangle(hud_x, bar_y, bar_w, bar_h, color_u8!(30, 30, 40, 200));
             let urg_frac = state.urgency.clamp(0.0, 1.0);
             let urg_color = if urg_frac > 0.7 {
                 color_u8!(220, 50, 50, 255)
@@ -2293,50 +2304,61 @@ async fn main() {
             } else {
                 color_u8!(50, 180, 80, 255)
             };
-            draw_rectangle(bar_x, bar_y, bar_w * urg_frac, bar_h, urg_color);
-            draw_rectangle_lines(bar_x, bar_y, bar_w, bar_h, 1.0, color_u8!(100, 100, 110, 200));
+            draw_rectangle(hud_x, bar_y, bar_w * urg_frac, bar_h, urg_color);
+            draw_rectangle_lines(hud_x, bar_y, bar_w, bar_h, 1.0, color_u8!(100, 100, 110, 200));
             draw_text(
                 &format!("Urgency {:.0}%", urg_frac * 100.0),
-                bar_x + 4.0,
+                hud_x + 4.0,
                 bar_y + 15.0,
                 16.0,
                 WHITE,
             );
+
+            // State indicator.
+            let state_text = match &state.move_state {
+                MoveState::Walking => "Walking",
+                MoveState::Running => "Running",
+                MoveState::Preparing => "Preparing...",
+                MoveState::Pooping(_) => "Pooping...",
+                MoveState::UsingToilet(_) => "Using toilet...",
+                MoveState::StandingUp(_) => "Standing up...",
+            };
+            draw_text(
+                state_text,
+                hud_x,
+                bar_y + bar_h + 16.0,
+                16.0,
+                color_u8!(180, 180, 180, 255),
+            );
         }
 
-        // Progress counter.
-        draw_text(
-            &format!("{} / {} objectives", state.completed, state.goal_count),
-            10.0,
-            screen_height() - 50.0,
-            18.0,
-            color_u8!(200, 200, 200, 255),
-        );
-
-        // State indicator.
-        let state_text = match &state.move_state {
-            MoveState::Walking => "Walking",
-            MoveState::Running => "Running",
-            MoveState::Preparing => "Preparing...",
-            MoveState::Pooping(_) => "Pooping...",
-            MoveState::UsingToilet(_) => "Using toilet...",
-            MoveState::StandingUp(_) => "Standing up...",
-        };
-        draw_text(
-            state_text,
-            220.0,
-            screen_height() - 24.0,
-            16.0,
-            color_u8!(180, 180, 180, 255),
-        );
-
-        draw_text(
-            "WASD move | Shift run | Hold E to poop | Tab debug",
-            10.0,
-            screen_height() - 6.0,
-            14.0,
-            color_u8!(120, 120, 130, 255),
-        );
+        {
+            let hint_main = "WASD move | Shift run | Hold E to poop | Tab debug";
+            let hint_fart = "Dial: move in green arc to suppress fart — farts raise NPC suspicion";
+            let show_fart = state.fart_qte.is_some() || state.urgency >= 0.25;
+            let pad_x = 8.0;
+            let pad_y = 5.0;
+            let line_h = 18.0;
+            let box_h = if show_fart { pad_y * 2.0 + line_h * 2.0 } else { pad_y * 2.0 + line_h };
+            let box_y = screen_height() - box_h - 4.0;
+            draw_rectangle(6.0, box_y, 490.0, box_h, color_u8!(12, 12, 20, 200));
+            draw_text(
+                hint_main,
+                6.0 + pad_x,
+                box_y + pad_y + line_h - 3.0,
+                16.0,
+                color_u8!(210, 210, 225, 255),
+            );
+            if show_fart {
+                draw_text(
+                    hint_fart,
+                    6.0 + pad_x,
+                    box_y + pad_y + line_h * 2.0 - 1.0,
+                    13.0,
+                    color_u8!(220, 190, 110, 235),
+                );
+            }
+        }
 
         // --- E hold progress bar (near player) ---
         if state.interact_hold > 0.0 && preparing {

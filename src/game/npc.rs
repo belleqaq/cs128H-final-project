@@ -258,6 +258,7 @@ pub struct NpcRoutine {
 pub struct Npc {
     pub pos: (f32, f32),
     pub prev_pos: (f32, f32),
+    pub spawn_pos: (f32, f32),
     pub velocity: (f32, f32),
     pub facing: (f32, f32),
     pub radius: f32,
@@ -302,6 +303,7 @@ impl Npc {
         Self {
             pos,
             prev_pos: pos,
+            spawn_pos: pos,
             velocity: (0.0, 0.0),
             facing: (0.0, 1.0),
             radius: NPC_RADIUS_DEFAULT,
@@ -320,6 +322,30 @@ impl Npc {
             pid_prev_error: 0.0,
             pid_cross_track: 0.0,
         }
+    }
+
+    /// Reset to spawn state — call on game restart so NPCs return home calm.
+    pub fn reset(&mut self) {
+        self.pos = self.spawn_pos;
+        self.prev_pos = self.spawn_pos;
+        self.velocity = (0.0, 0.0);
+        self.facing = (0.0, 1.0);
+        self.alert_state = AlertState::Patrol;
+        self.suspicion = 0.0;
+        self.last_smell_pos = None;
+        self.seen_crime = false;
+        self.director_target = None;
+        self.chase = ChaseState::default();
+        self.path.clear();
+        self.path_idx = 0;
+        self.steer_scores = [0.0; STEER_SLOTS];
+        self.steer_chosen = (0.0, 0.0);
+        self.pid_integral = 0.0;
+        self.pid_prev_error = 0.0;
+        self.pid_cross_track = 0.0;
+        self.routine.current = 0;
+        self.routine.timer = 0.0;
+        self.routine.phase = ActivityPhase::Performing;
     }
 
     /// Target grid position for the current activity.

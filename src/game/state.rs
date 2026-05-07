@@ -1010,6 +1010,12 @@ impl State {
         self.toast = None;
         self.bubbles.clear();
         self.bubble_timer = 0.0;
+        self.farts.clear();
+        self.fart_qte = None;
+        self.director = AdaptiveDirector::default();
+        for npc in &mut self.npcs {
+            npc.reset();
+        }
         self.spawn_star();
     }
 
