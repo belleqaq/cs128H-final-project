@@ -1,5 +1,6 @@
 # Brownshock
 Group: Hajimi-south-north-green-pretty much group
+
 A Rust + macroquad isometric stealth game. CS 128 Honors Session, UIUC.
 
 You wake up in a shared apartment with a relentlessly building urgency to relieve yourself. Sneak across the floor, use the toilets when you can, and as a last resort, befoul a designated star spot — but stay out of sight, because the AI residents will hunt anyone they catch in the act.
